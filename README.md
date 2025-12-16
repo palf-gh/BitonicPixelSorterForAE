@@ -2,6 +2,8 @@
 
 GPU-accelerated pixel sorter with bitonic sorting for Unity.
 
+[Live Demo (WebGPU port)](https://ruccho.com/bps-webgpu/)
+
 The screenshot below shows it running on an NVIDIA GeForce RTX 4070 and it keeps over 1000 FPS at FHD resolution.
 
 <img width="1920" height="1032" alt="Image" src="https://github.com/user-attachments/assets/8330a931-a737-4239-a60a-4bf2bf637961" />
