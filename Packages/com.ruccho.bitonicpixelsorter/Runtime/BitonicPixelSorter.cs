@@ -78,7 +78,7 @@ namespace Ruccho.Utilities
                 return;
             }
 
-            EnsureBufferTextureSize(ref metaTex, metaWidth, metaHeight, RenderTextureFormat.RInt);
+            EnsureBufferTextureSize(ref metaTex, metaWidth, metaHeight, RenderTextureFormat.RGInt);
             EnsureBufferTextureSize(ref sortTex, width, height, RenderTextureFormat.ARGB32);
 
             shader.SetBool(k_direction, direction);
@@ -95,8 +95,7 @@ namespace Ruccho.Utilities
 
             shader.Dispatch(metaPassIndex, metaDispatchCount, 1, 1);
 
-            Graphics.Blit(src, sortTex);
-
+            shader.SetTexture(sortPassIndex, k_srcTex, src);
             shader.SetTexture(sortPassIndex, k_srcMetaTex, metaTex);
             shader.SetTexture(sortPassIndex, k_sortTex, sortTex);
             shader.SetBool(k_ordering, ascending);

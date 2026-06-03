@@ -88,7 +88,7 @@ namespace Ruccho.Utilities
                 var renderer = renderingData.cameraData.renderer;
                 var src = renderer.cameraColorTargetHandle;
 
-                cmd.GetTemporaryRT(PropMetaTex, metaWidth, metaHeight, 0, FilterMode.Point, RenderTextureFormat.RInt,
+                cmd.GetTemporaryRT(PropMetaTex, metaWidth, metaHeight, 0, FilterMode.Point, RenderTextureFormat.RGInt,
                     RenderTextureReadWrite.Default, 1, true);
                 cmd.GetTemporaryRT(PropSortTex, width, height, 0, FilterMode.Point, RenderTextureFormat.ARGB32,
                     RenderTextureReadWrite.Default, 1, true);
@@ -107,8 +107,7 @@ namespace Ruccho.Utilities
 
                 cmd.DispatchCompute(Shader, metaPassIndex, metaDispatchCount, 1, 1);
 
-                cmd.Blit(src, new RenderTargetIdentifier(PropSortTex));
-
+                cmd.SetComputeTextureParam(Shader, sortPassIndex, PropSrcTex, src);
                 cmd.SetComputeTextureParam(Shader, sortPassIndex, PropSrcMetaTex,
                     new RenderTargetIdentifier(PropMetaTex));
                 cmd.SetComputeTextureParam(Shader, sortPassIndex, PropSortTex, new RenderTargetIdentifier(PropSortTex));
@@ -153,7 +152,7 @@ namespace Ruccho.Utilities
                 }
 
                 var metaTex = UniversalRenderer.CreateRenderGraphTexture(renderGraph,
-                    new RenderTextureDescriptor(metaWidth, metaHeight, RenderTextureFormat.RInt)
+                    new RenderTextureDescriptor(metaWidth, metaHeight, RenderTextureFormat.RGInt)
                     {
                         enableRandomWrite = true
                     },
@@ -212,26 +211,12 @@ namespace Ruccho.Utilities
                 }
 
                 using (var builder =
-                       renderGraph.AddRasterRenderPass<BlitPassData>("BitonicPixelSorter Source Blit", out var passData,
-                           profilingSampler))
-                {
-                    builder.UseTexture(source);
-                    builder.SetRenderAttachment(sortTex, 0, AccessFlags.WriteAll);
-
-                    passData.Source = source;
-
-                    builder.SetRenderFunc<BlitPassData>(static (passData, context) =>
-                    {
-                        Blitter.BlitTexture(context.cmd, passData.Source, new Vector4(1f, 1f, 0f, 0f), 0f, false);
-                    });
-                }
-
-                using (var builder =
                        renderGraph.AddComputePass<SortPassData>("BitonicPixelSorter SortPass", out var passData,
                            profilingSampler))
                 {
                     builder.UseTexture(metaTex);
-                    builder.UseTexture(sortTex, AccessFlags.ReadWrite);
+                    builder.UseTexture(sortTex, AccessFlags.WriteAll);
+                    builder.UseTexture(source);
 
                     passData.Shader = Shader;
                     passData.Ascending = Ascending;
@@ -242,6 +227,7 @@ namespace Ruccho.Utilities
                     passData.ThresholdMin = ThresholdMin;
                     passData.MetaTex = metaTex;
                     passData.SortTex = sortTex;
+                    passData.SrcTex = source;
 
                     builder.SetRenderFunc<SortPassData>(static (passData, context) =>
                     {
@@ -260,6 +246,7 @@ namespace Ruccho.Utilities
                         cmd.SetComputeFloatParam(shader, PropThresholdMin, thresholdMin);
                         cmd.SetComputeFloatParam(shader, PropThresholdMax, thresholdMax);
 
+                        cmd.SetComputeTextureParam(shader, sortPassIndex, PropSrcTex, passData.SrcTex);
                         cmd.SetComputeTextureParam(shader, sortPassIndex, PropSrcMetaTex, passData.MetaTex);
                         cmd.SetComputeTextureParam(shader, sortPassIndex, PropSortTex, passData.SortTex);
 
@@ -308,6 +295,7 @@ namespace Ruccho.Utilities
                 public bool Direction;
                 public int Lines;
 
+                public TextureHandle SrcTex;
                 public TextureHandle MetaTex;
                 public ComputeShader Shader;
                 public int Size;
