@@ -1,6 +1,6 @@
 # BitonicPixelSorter
 
-GPU-accelerated pixel sorter with bitonic sorting for Unity.
+True realtime pixel sort effect for Unity with GPU-accelerated bitonic sorting.
 
 [Live Demo (WebGPU port)](https://ruccho.com/bps-webgpu/)
 
@@ -20,6 +20,7 @@ Use UPM git dependencies.
 ## BitonicPixelSorter Component
 
 ![image](https://user-images.githubusercontent.com/16096562/125492519-6a363ad6-87b3-451b-a6a3-37b859821db5.png)
+
 |Property|Type|Description|
 |-|-|-|
 |Use As Image Effect|`bool`|It works as an image effect when attached to the camera. This is only active when you are using builtin render pipeline.|
