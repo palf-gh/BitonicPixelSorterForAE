@@ -1,12 +1,12 @@
 {
     "name": "com.ruccho.bitonicpixelsorter",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "displayName": "Bitonic Pixel Sorter",
     "description": "Realtime pixel sorting effect",
     "unity": "2020.3",
     "dependencies": {},
     "author": {
         "name": "ruccho",
-        "url": "https://ruccho.github.io"
+        "url": "https://ruccho.com"
     }
 }
