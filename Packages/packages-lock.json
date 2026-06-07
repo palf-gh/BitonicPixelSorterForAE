@@ -11,7 +11,7 @@
       "depth": 0,
       "source": "embedded",
       "dependencies": {
-        "com.ruccho.bitonicpixelsorter": "1.0.0",
+        "com.ruccho.bitonicpixelsorter": "1.2.0",
         "com.unity.render-pipelines.universal": "12.1.6"
       }
     },

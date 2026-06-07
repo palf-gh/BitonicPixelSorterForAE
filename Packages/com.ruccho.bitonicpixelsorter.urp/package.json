@@ -1,15 +1,14 @@
 {
-    "name": "com.ruccho.bitonicpixelsorter.urp",
-    "version": "1.1.0",
-    "displayName": "Bitonic Pixel Sorter - Universal RP Extension",
-    "description": "",
-    "unity": "2020.3",
-    "dependencies": {
-        "com.ruccho.bitonicpixelsorter": "1.1.0",
-        "com.unity.render-pipelines.universal": "12.1.6"
-    },
-    "author": {
-        "name": "ruccho",
-        "url": "https://ruccho.com"
-    }
+  "name": "com.ruccho.bitonicpixelsorter.urp",
+  "version": "1.2.0",
+  "displayName": "Bitonic Pixel Sorter - Universal RP Extension",
+  "unity": "2022.3",
+  "dependencies": {
+    "com.ruccho.bitonicpixelsorter": "1.2.0",
+    "com.unity.render-pipelines.universal": "12.1.6"
+  },
+  "author": {
+    "name": "ruccho",
+    "url": "https://ruccho.com"
+  }
 }
