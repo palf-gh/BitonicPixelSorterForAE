@@ -8,6 +8,10 @@ The screenshot below shows it running on an NVIDIA GeForce RTX 4070 and it keeps
 
 <img width="1920" height="1032" alt="Image" src="https://github.com/user-attachments/assets/8330a931-a737-4239-a60a-4bf2bf637961" />
 
+The processing time on the GPU is approximately 340μs using an NVIDIA GeForce RTX 4070 at FHD resolution.
+
+<img width="1206" height="455" alt="Image" src="https://github.com/user-attachments/assets/681fb12c-5c6b-4cc3-9c9d-b68af5aac160" />
+
 ## Installation
 
 Use UPM git dependencies.
