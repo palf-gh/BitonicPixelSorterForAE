@@ -1,6 +1,6 @@
 ﻿#pragma kernel MetaPass
 #pragma kernel SortPass
-#pragma enable_d3d11_debug_symbols
+// #pragma enable_d3d11_debug_symbols
 // #pragma use_dxc // for nsight compatibility (D3D12 required)
 
 #define MAX_TGSM 8192 // 32KiB / 32bit
@@ -189,15 +189,15 @@ void MetaPass(uint3 groupId : SV_GroupID,
 void SortPass(uint3 gid_l : SV_GroupID,
               uint3 gtid_l : SV_GroupThreadID)
 {
-    min16int gid = gid_l.x;
-    min16int gtid = gtid_l.x;
-    min16int ops;
+    min16uint gid = gid_l.x;
+    min16uint gtid = gtid_l.x;
+    min16uint ops;
     {
-        uint width, height;
+        min16uint width, height;
         sortTex.GetDimensions(width, height);
 
-        uint size = direction ? width : height;
-        uint reducedSize = ceil((float)size / 2);
+        min16uint size = direction ? width : height;
+        min16uint reducedSize = ceil((float)size / 2);
 
         ops = ceil((float)reducedSize / MAX_THREADS);
     }
@@ -205,13 +205,13 @@ void SortPass(uint3 gid_l : SV_GroupID,
     uint preMeta[MAX_OPS];
 
     {
-        for (min16int t = 0; t < ops; t++)
+        for (uint t = 0; t < ops; t++)
         {
-            min16int xMeta = (MAX_THREADS * t + gtid);
-            min16int y = gid;
+            min16uint xMeta = (MAX_THREADS * t + gtid);
+            min16uint y = gid;
 
-            min16int xL = xMeta * 2;
-            min16int xR = xL + 1;
+            min16uint xL = xMeta * 2;
+            min16uint xR = xL + 1;
 
             uint2 id = uint2(xMeta, y);
 
@@ -222,18 +222,18 @@ void SortPass(uint3 gid_l : SV_GroupID,
             //get meta
             uint2 meta = srcMetaTex[pos];
             uint meta0 = meta.x;
-            min16int startL = (meta0 >> 12) & 0x0FFF;
-            min16int startR = meta0 & 0x0FFF;
-            bool useR = (startL & 1) > 0;
+            min16uint startL = (meta0 >> 12) & 0x0FFF;
+            min16uint startR = meta0 & 0x0FFF;
+            min16uint useR = (startL & 1) > 0;
 
-            min16int x = useR ? xR : xL;
+            min16uint x = useR ? xR : xL;
 
             bool isInRange = (startR - startL > 1) && (x <= startR);
 
             startL = isInRange ? startL : x;
             startR = isInRange ? startR : x;
 
-            preMeta[t] = ((uint)startL << 16) | startR;
+            preMeta[(uint)t] = ((uint)startL << 16) | startR;
 
             // high 16bit for index, low 16bit for brightness  
             groupCache[xL] = (meta.y >> 16) | ((uint)xL << 16);
@@ -247,31 +247,31 @@ void SortPass(uint3 gid_l : SV_GroupID,
         {
             GroupMemoryBarrierWithGroupSync();
 
-            for (min16int t = 0; t < ops; t++)
+            for (uint t = 0; t < ops; t++)
             {
                 uint metaPacked = preMeta[t];
-                min16int rangeStart = metaPacked >> 16;
-                min16int rangeEnd = metaPacked & 0xFFFF;
+                min16uint rangeStart = metaPacked >> 16;
+                min16uint rangeEnd = metaPacked & 0xFFFF;
 
                 // avoid unnecessary unpacking to reduce register usage
                 // int comparatorRank = phase >> 16;
 
-                min16int x = (MAX_THREADS * t + gtid) << 1;
+                min16uint x = (MAX_THREADS * t + gtid) << 1;
 
-                min16int useR = rangeStart & 1;
-                min16int posInRange = x - rangeStart + useR;
-                min16int swapIndex = posInRange >> 1;
-                min16int comparatorSize = 1 << (phase >> 16);
-                min16int a = rangeStart + (swapIndex & (comparatorSize - 1)) + floor(swapIndex >> (phase >> 16))
+                min16uint useR = rangeStart & 1;
+                min16uint posInRange = x - rangeStart + useR;
+                min16uint swapIndex = posInRange >> 1;
+                min16uint comparatorSize = 1 << (phase >> 16);
+                min16uint a = rangeStart + (swapIndex & (comparatorSize - 1)) + floor(swapIndex >> (phase >> 16))
                     * (comparatorSize << 1);
 
-                min16int b = a + comparatorSize;
+                min16uint b = a + comparatorSize;
 
                 b = b <= rangeEnd ? b : a;
 
-                min16int block = posInRange >> 1 >> phase;
-                min16int n = rangeEnd - rangeStart + 1;
-                min16int endBlock = n >> (phase + 1);
+                min16uint block = posInRange >> 1 >> phase;
+                min16uint n = rangeEnd - rangeStart + 1;
+                min16uint endBlock = n >> (phase + 1);
                 bool ascPattern = ((endBlock & 1) == 0) == ordering;
                 bool asc = ((block & 1) == 0) == ascPattern;
 
@@ -294,13 +294,13 @@ void SortPass(uint3 gid_l : SV_GroupID,
         }
     }
 
-    for (min16int t = 0; t < ops; t++)
+    for (uint t = 0; t < ops; t++)
     {
-        min16int xMeta = (MAX_THREADS * t + gtid);
-        min16int y = gid;
+        min16uint xMeta = (MAX_THREADS * t + gtid);
+        min16uint y = gid;
 
-        min16int xL = xMeta * 2;
-        min16int xR = xL + 1;
+        min16uint xL = xMeta * 2;
+        min16uint xR = xL + 1;
 
         uint2 pos_a;
         pos_a.x = direction ? xL : y;
