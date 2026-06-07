@@ -13,27 +13,20 @@ namespace Ruccho.Utilities
         [SerializeField] [Range(0f, 1f)] private float thresholdMax = 0.6f;
 
         private readonly int k_direction = Shader.PropertyToID("direction");
-        private readonly int k_MaxLevels = Shader.PropertyToID("maxLevels");
-        private readonly int k_metaTex = Shader.PropertyToID("metaTex");
         private readonly int k_ordering = Shader.PropertyToID("ordering");
         private readonly int k_sortTex = Shader.PropertyToID("sortTex");
-        private readonly int k_srcMetaTex = Shader.PropertyToID("srcMetaTex");
         private readonly int k_srcTex = Shader.PropertyToID("srcTex");
         private readonly int k_thresholdMax = Shader.PropertyToID("thresholdMax");
         private readonly int k_thresholdMin = Shader.PropertyToID("thresholdMin");
 
         private bool isInitialized;
 
-        private int metaPassIndex;
-
-        private RenderTexture metaTex;
         private int sortPassIndex;
         private RenderTexture sortTex;
 
         private void OnDisable()
         {
             EnsureDestroyed(ref sortTex);
-            EnsureDestroyed(ref metaTex);
         }
 
         private void OnRenderImage(RenderTexture src, RenderTexture dest)
@@ -49,7 +42,6 @@ namespace Ruccho.Utilities
             if (isInitialized) return;
             isInitialized = true;
 
-            metaPassIndex = shader.FindKernel("MetaPass");
             sortPassIndex = shader.FindKernel("SortPass");
         }
 
@@ -68,9 +60,6 @@ namespace Ruccho.Utilities
             var size = direction ? width : height;
             var lines = direction ? height : width;
 
-            var metaWidth = direction ? width / 2 : width;
-            var metaHeight = direction ? height : height / 2;
-
             if (size >= 2048)
             {
                 Debug.LogError("[BitonicPixelSorter] Size of source texture must be smaller than 2048.");
@@ -78,31 +67,15 @@ namespace Ruccho.Utilities
                 return;
             }
 
-            EnsureBufferTextureSize(ref metaTex, metaWidth, metaHeight, RenderTextureFormat.RGInt);
             EnsureBufferTextureSize(ref sortTex, width, height, RenderTextureFormat.ARGB32);
 
             shader.SetBool(k_direction, direction);
             shader.SetFloat(k_thresholdMin, thresholdMin);
             shader.SetFloat(k_thresholdMax, thresholdMax);
 
-            shader.SetTexture(metaPassIndex, k_srcTex, src);
-            shader.SetTexture(metaPassIndex, k_metaTex, metaTex);
-
-            shader.GetKernelThreadGroupSizes(metaPassIndex, out var metaGroupX, out var metaGroupY,
-                out var metaGroupZ);
-            var metaGroupSize = metaGroupX * metaGroupY * metaGroupZ;
-            var metaDispatchCount = Mathf.CeilToInt((float)lines * 2 / metaGroupSize);
-
-            shader.Dispatch(metaPassIndex, metaDispatchCount, 1, 1);
-
             shader.SetTexture(sortPassIndex, k_srcTex, src);
-            shader.SetTexture(sortPassIndex, k_srcMetaTex, metaTex);
             shader.SetTexture(sortPassIndex, k_sortTex, sortTex);
             shader.SetBool(k_ordering, ascending);
-
-            var maxLevel = Mathf.CeilToInt(Mathf.Log(size, 2));
-
-            shader.SetInt(k_MaxLevels, maxLevel);
 
             shader.Dispatch(sortPassIndex, lines, 1, 1);
 
