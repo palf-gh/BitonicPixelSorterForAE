@@ -39,6 +39,7 @@ namespace Ruccho.Utilities
         private class BitonicPixelSortingPass : ScriptableRenderPass
         {
             private const string Tag = nameof(BitonicPixelSortingPass);
+            private const string KeywordSize4096 = "BPS_SIZE_4096";
 
             private static readonly int PropDirection = UnityEngine.Shader.PropertyToID("direction");
             private static readonly int PropOrdering = UnityEngine.Shader.PropertyToID("ordering");
@@ -72,11 +73,14 @@ namespace Ruccho.Utilities
                 var size = Direction ? width : height;
                 var lines = Direction ? height : width;
 
-                if (size >= 2048)
+                if (size > 4096)
                 {
-                    Debug.LogError("[BitonicPixelSorter] Size of source texture must be smaller than 2048.");
+                    Debug.LogError("[BitonicPixelSorter] Size of source texture must be 4096 or smaller.");
                     return;
                 }
+
+                if (size > 2048) Shader.EnableKeyword(KeywordSize4096);
+                else Shader.DisableKeyword(KeywordSize4096);
 
                 var renderer = renderingData.cameraData.renderer;
                 var src = renderer.cameraColorTargetHandle;
@@ -116,9 +120,9 @@ namespace Ruccho.Utilities
                 var size = Direction ? width : height;
                 var lines = Direction ? height : width;
 
-                if (size >= 2048)
+                if (size > 4096)
                 {
-                    Debug.LogError("[BitonicPixelSorter] Size of source texture must be smaller than 2048.");
+                    Debug.LogError("[BitonicPixelSorter] Size of source texture must be 4096 or smaller.");
                     return;
                 }
 
@@ -144,6 +148,7 @@ namespace Ruccho.Utilities
                     passData.Ascending = Ascending;
                     passData.Direction = Direction;
                     passData.Lines = lines;
+                    passData.Use4096 = size > 2048;
                     passData.ThresholdMax = ThresholdMax;
                     passData.ThresholdMin = ThresholdMin;
                     passData.SortTex = sortTex;
@@ -158,6 +163,9 @@ namespace Ruccho.Utilities
                         var lines = passData.Lines;
                         var thresholdMax = passData.ThresholdMax;
                         var thresholdMin = passData.ThresholdMin;
+
+                        if (passData.Use4096) shader.EnableKeyword(KeywordSize4096);
+                        else shader.DisableKeyword(KeywordSize4096);
 
                         var sortPassIndex = shader.FindKernel("SortPass");
 
@@ -196,6 +204,7 @@ namespace Ruccho.Utilities
                 public bool Ascending;
                 public bool Direction;
                 public int Lines;
+                public bool Use4096;
 
                 public TextureHandle SrcTex;
                 public ComputeShader Shader;

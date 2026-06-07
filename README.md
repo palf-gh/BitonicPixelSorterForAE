@@ -72,7 +72,7 @@ The bitonic network runs over the whole line in group shared memory. Comparator 
 
 Only the sorted *indices* are used to gather the full-color pixels from the source texture into the output — colors are never shuffled through shared memory.
 
-Because the sort runs in group shared memory (32 KiB), the sortable line length is limited to **2048 pixels**.
+Because the sort runs in group shared memory, the sortable line length is limited to **2048 pixels** by default. For sources between 2049 and **4096 pixels**, a shader variant (`BPS_SIZE_4096` keyword) that doubles the shared memory budget to 16 KiB is selected automatically at some occupancy cost.
 
 ## References
 

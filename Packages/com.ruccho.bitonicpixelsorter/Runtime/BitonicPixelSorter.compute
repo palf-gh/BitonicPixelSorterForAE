@@ -1,9 +1,16 @@
 #pragma kernel SortPass
+#pragma multi_compile __ BPS_SIZE_4096
+#pragma warning( disable : 3205 3078 )
 // #pragma enable_d3d11_debug_symbols
 // #pragma use_dxc // for nsight compatibility (D3D12 required)
 
+#ifdef BPS_SIZE_4096
+#define MAX_THREADS 256 // keeps MAX_PAIRS at 8, same as the default variant
+#define MAX_SIZE 4096 // 16KiB of group shared memory
+#else
 #define MAX_THREADS 128 // threads per SM is usually multiple of 512 (NVIDIA). It may maximize occupancy.
 #define MAX_SIZE 2048 // due to group shared memory limit
+#endif
 
 #define MAX_PAIRS (MAX_SIZE / MAX_THREADS / 2) // comparator pairs per thread
 

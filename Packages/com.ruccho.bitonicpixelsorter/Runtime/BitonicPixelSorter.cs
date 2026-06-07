@@ -5,6 +5,8 @@ namespace Ruccho.Utilities
 {
     public class BitonicPixelSorter : MonoBehaviour
     {
+        private const string KeywordSize4096 = "BPS_SIZE_4096";
+
         [SerializeField] private bool useAsImageEffect = true;
         [SerializeField] private ComputeShader shader;
         [SerializeField] private bool direction = true;
@@ -60,12 +62,15 @@ namespace Ruccho.Utilities
             var size = direction ? width : height;
             var lines = direction ? height : width;
 
-            if (size >= 2048)
+            if (size > 4096)
             {
-                Debug.LogError("[BitonicPixelSorter] Size of source texture must be smaller than 2048.");
+                Debug.LogError("[BitonicPixelSorter] Size of source texture must be 4096 or smaller.");
                 Graphics.Blit(src, dst);
                 return;
             }
+
+            if (size > 2048) shader.EnableKeyword(KeywordSize4096);
+            else shader.DisableKeyword(KeywordSize4096);
 
             EnsureBufferTextureSize(ref sortTex, width, height, RenderTextureFormat.ARGB32);
 
