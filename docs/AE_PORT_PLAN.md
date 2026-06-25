@@ -329,5 +329,19 @@ The CPU build needs none of the above.
     metadata into private locals and before the load loop overwrites the scratch.
   - All threads now read identical `spanStart`/`spanSize`/`sortSize`, so the
     per-span break and the bitonic-network barriers stay uniform.
+- 2026-06-26: GPU engagement and status-readout fix after AE testing showed GPU
+  and Mercury Software Only renders both taking CPU-path timings:
+  - The Effect Controls GPU status now reflects the last Smart Render command
+    path directly. `SmartRender` records `BPS_SetLastRenderUsedGpu(isGPU)` on
+    every render, and the UI no longer keeps a separate render-attempt latch that
+    could stay green after switching to Software Only.
+  - CUDA Smart Render now validates `GetGPUWorldData` results before launching
+    and records `BPS_RENDER_DIAG` messages for null GPU-world pointers and CUDA
+    error codes. If AE's CUDA stream pointer fails in the runtime launch path,
+    the render retries on CUDA stream 0 so failures are visible rather than being
+    indistinguishable from the CPU fallback timing.
+  - CPU fallback worker fan-out is capped at two workers per frame, or one for
+    small partial-frame renders, because AE MFR already supplies frame-level
+    parallelism.
 - Phases 5–8 (Metal, pipeline hardening, validation, robustness) pending. AE
   in-host CPU/GPU parity validation is still pending.

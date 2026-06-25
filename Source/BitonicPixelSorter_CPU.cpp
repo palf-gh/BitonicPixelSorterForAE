@@ -86,21 +86,21 @@ struct LineScratch {
 };
 
 inline unsigned int WorkerCountFor(A_long lineCount) {
-	if (lineCount <= 1) {
+	if (lineCount < 32) {
 		return 1;
 	}
 
-	unsigned int workers = std::thread::hardware_concurrency();
-	if (workers == 0) {
-		workers = 1;
+	unsigned int hw = std::thread::hardware_concurrency();
+	if (hw == 0) {
+		hw = 1;
 	}
-	// AE can already render multiple frames concurrently, so keep this per-frame
-	// fan-out modest and avoid creating workers for tiny partial-frame renders.
-	workers = static_cast<unsigned int>(MaxLong(1, static_cast<A_long>(workers / 2)));
-	workers = static_cast<unsigned int>(MinLong(static_cast<A_long>(workers), lineCount));
-	workers = static_cast<unsigned int>(MinLong(static_cast<A_long>(workers), lineCount / 16));
-	workers = static_cast<unsigned int>(MinLong(static_cast<A_long>(workers), 8));
-	return workers == 0 ? 1 : workers;
+
+	// Keep per-frame fan-out small: AE's MFR provides frame-level parallelism.
+	unsigned int workers = (hw >= 4) ? 2u : 1u;
+	if (static_cast<A_long>(workers) > lineCount) {
+		workers = static_cast<unsigned int>(lineCount);
+	}
+	return workers;
 }
 
 // Sort each contiguous in-threshold span of every line by brightness.

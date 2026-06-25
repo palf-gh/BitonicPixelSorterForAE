@@ -29,6 +29,10 @@
 #include "BitonicPixelSorter_GpuEligibility.h"
 
 #include <atomic>
+#if defined(BPS_RENDER_DIAG)
+	#include <cstdarg>
+	#include <cstdio>
+#endif
 #include <cstring>
 #include <mutex>
 #include <new>
@@ -250,6 +254,30 @@ std::string BPS_QueryDirectXDeviceName(ID3D12Device *device)
 		return std::string();
 	}
 	return BPS_WideToUtf8(desc.Description);
+}
+#endif
+
+#if defined(BPS_RENDER_DIAG)
+static void
+BPS_GpuDiagLog(const char *format, ...)
+{
+	char message[1024];
+	va_list args;
+	va_start(args, format);
+	std::vsnprintf(message, sizeof(message), format, args);
+	va_end(args);
+
+#if defined(_WIN32)
+	OutputDebugStringA("[BitonicPixelSorter] ");
+	OutputDebugStringA(message);
+	OutputDebugStringA("\n");
+#else
+	FILE *file = std::fopen("/tmp/BitonicPixelSorter_render_diag.log", "a");
+	if (file) {
+		std::fprintf(file, "[BitonicPixelSorter] %s\n", message);
+		std::fclose(file);
+	}
+#endif
 }
 #endif
 
@@ -556,6 +584,24 @@ PF_Err BPS_SmartRenderGPU(
 	void *dst_mem = 0;
 	ERR(gpu_suite->GetGPUWorldData(in_data->effect_ref, output_worldP, &dst_mem));
 
+	if (!err && (!src_mem || !dst_mem)) {
+#if defined(BPS_RENDER_DIAG)
+		BPS_GpuDiagLog(
+			"SmartRenderGPU missing GPU world data framework=%s src=%p dst=%p "
+			"frame=%ldx%ld output_origin=(%ld,%ld) output_size=%ldx%ld",
+			BPS_FrameworkName(extraP->input->what_gpu),
+			src_mem,
+			dst_mem,
+			static_cast<long>(in_data->width),
+			static_cast<long>(in_data->height),
+			static_cast<long>(output_worldP->origin_x),
+			static_cast<long>(output_worldP->origin_y),
+			static_cast<long>(output_worldP->width),
+			static_cast<long>(output_worldP->height));
+#endif
+		return PF_Err_INTERNAL_STRUCT_DAMAGED;
+	}
+
 	const int bytes_per_pixel = 16; // float4 BGRA
 	const int width    = in_data->width;
 	const int height   = in_data->height;
@@ -623,12 +669,54 @@ PF_Err BPS_SmartRenderGPU(
 
 #if defined(BPS_HAS_CUDA)
 	if (extraP->input->what_gpu == PF_GPU_Framework_CUDA) {
-		const cudaError_t cuda_result =
+		void *cuda_streamPV = device_info.command_queuePV;
+		cudaError_t cuda_result =
 			BitonicSort_CUDA(src_mem, dst_mem, srcPitch, dstPitch, width, height,
 							 inputOriginX, inputOriginY, outputOriginX, outputOriginY,
 							 outputWidth, outputHeight,
 							 direction, ordering, paramsP->thresholdMin, paramsP->thresholdMax,
-							 device_info.command_queuePV);
+							 cuda_streamPV);
+
+		// Some AE/CUDA host combinations expose a null or driver-owned stream that
+		// the CUDA runtime launch path cannot safely use. Retry on the default
+		// stream so the GPU render path either runs or reports a concrete error.
+		if (cuda_result != cudaSuccess && cuda_streamPV) {
+#if defined(BPS_RENDER_DIAG)
+			BPS_GpuDiagLog(
+				"SmartRenderGPU CUDA stream retry cuda_error=%d stream=%p "
+				"frame=%ldx%ld output_origin=(%ld,%ld) output_size=%ldx%ld",
+				static_cast<int>(cuda_result),
+				device_info.command_queuePV,
+				static_cast<long>(in_data->width),
+				static_cast<long>(in_data->height),
+				static_cast<long>(outputOriginX),
+				static_cast<long>(outputOriginY),
+				static_cast<long>(outputWidth),
+				static_cast<long>(outputHeight));
+#endif
+			(void)cudaGetLastError();
+			cuda_streamPV = 0;
+			cuda_result =
+				BitonicSort_CUDA(src_mem, dst_mem, srcPitch, dstPitch, width, height,
+								 inputOriginX, inputOriginY, outputOriginX, outputOriginY,
+								 outputWidth, outputHeight,
+								 direction, ordering, paramsP->thresholdMin, paramsP->thresholdMax,
+								 cuda_streamPV);
+		}
+
+#if defined(BPS_RENDER_DIAG)
+		BPS_GpuDiagLog(
+			"SmartRenderGPU CUDA result cuda_error=%d stream=%p frame=%ldx%ld "
+			"output_origin=(%ld,%ld) output_size=%ldx%ld",
+			static_cast<int>(cuda_result),
+			cuda_streamPV,
+			static_cast<long>(in_data->width),
+			static_cast<long>(in_data->height),
+			static_cast<long>(outputOriginX),
+			static_cast<long>(outputOriginY),
+			static_cast<long>(outputWidth),
+			static_cast<long>(outputHeight));
+#endif
 		if (cuda_result != cudaSuccess) {
 			err = PF_Err_INTERNAL_STRUCT_DAMAGED;
 		}
