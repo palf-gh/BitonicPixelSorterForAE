@@ -163,6 +163,12 @@ std::atomic<bool> &BPS_LastRenderUsedGpuStorage()
 	return value;
 }
 
+std::atomic<bool> &BPS_RenderAttemptedStorage()
+{
+	static std::atomic<bool> value(false);
+	return value;
+}
+
 const char *BPS_FrameworkName(PF_GPU_Framework framework)
 {
 	switch (framework) {
@@ -260,6 +266,7 @@ void BPS_RecordGpuDevice(PF_GPU_Framework framework, const std::string &device_n
 	BPS_GpuDeviceNameStorage() = device_name;
 	BPS_GpuDeviceReadyStorage().store(framework != PF_GPU_Framework_NONE, std::memory_order_release);
 	BPS_LastRenderUsedGpuStorage().store(false, std::memory_order_release);
+	BPS_RenderAttemptedStorage().store(false, std::memory_order_release);
 }
 
 void BPS_ClearGpuDevice()
@@ -269,6 +276,7 @@ void BPS_ClearGpuDevice()
 	BPS_GpuDeviceNameStorage().clear();
 	BPS_GpuDeviceReadyStorage().store(false, std::memory_order_release);
 	BPS_LastRenderUsedGpuStorage().store(false, std::memory_order_release);
+	BPS_RenderAttemptedStorage().store(false, std::memory_order_release);
 }
 
 } // namespace
@@ -302,6 +310,16 @@ bool BPS_LastRenderUsedGpu()
 void BPS_SetLastRenderUsedGpu(bool used_gpu)
 {
 	BPS_LastRenderUsedGpuStorage().store(used_gpu, std::memory_order_release);
+}
+
+bool BPS_HasRenderAttempted()
+{
+	return BPS_RenderAttemptedStorage().load(std::memory_order_acquire);
+}
+
+void BPS_SetRenderAttempted(bool attempted)
+{
+	BPS_RenderAttemptedStorage().store(attempted, std::memory_order_release);
 }
 
 //-----------------------------------------------------------------------------

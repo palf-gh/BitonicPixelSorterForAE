@@ -348,7 +348,7 @@ SmartRender(
 #if defined(BPS_RENDER_DIAG)
 			const auto render_start = std::chrono::steady_clock::now();
 #endif
-			BPS_SetLastRenderUsedGpu(false);
+			BPS_SetRenderAttempted(true);
 			if (isGPU) {
 				ERR(BPS_SmartRenderGPU(in_data, out_data, pixel_format,
 									   input_worldP, output_worldP, extraP, infoP));

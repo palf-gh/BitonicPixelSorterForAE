@@ -211,7 +211,9 @@ BPS_DrawGpuStatus(
 		const BpsGpuEligibility eligibility = BPS_EvaluateGpuEligibility(
 			in_data, direction, BPS_FrameRect(in_data));
 
-		const bool last_render_used_gpu = BPS_LastRenderUsedGpu();
+		const bool gpu_device_ready = BPS_IsGpuDeviceReady();
+		const bool render_attempted = BPS_HasRenderAttempted();
+		const bool gpu_render_seen = BPS_LastRenderUsedGpu();
 		bool draw_second_line = false;
 		std::string line1_text;
 		std::string line2_text;
@@ -222,7 +224,7 @@ BPS_DrawGpuStatus(
 			drawbot_colour.blue = 0.1f;
 			line1_text = AELocalise::GetStringForAE(
 				BPS_GpuStatusLocKey(eligibility.reason), in_data);
-		} else if (last_render_used_gpu) {
+		} else if (gpu_device_ready && (gpu_render_seen || !render_attempted)) {
 			drawbot_colour.red = 0.0f;
 			drawbot_colour.green = 0.8f;
 			drawbot_colour.blue = 0.0f;

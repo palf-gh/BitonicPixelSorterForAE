@@ -102,5 +102,7 @@ const char *BPS_ActiveGpuDeviceName();
 bool BPS_IsGpuDeviceReady();
 bool BPS_LastRenderUsedGpu();
 void BPS_SetLastRenderUsedGpu(bool used_gpu);
+bool BPS_HasRenderAttempted();
+void BPS_SetRenderAttempted(bool attempted);
 
 #endif // BITONIC_PIXEL_SORTER_GPU_ELIGIBILITY_H
