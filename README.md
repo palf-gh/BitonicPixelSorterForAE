@@ -1,85 +1,167 @@
-# BitonicPixelSorter
+# Bitonic Pixel Sorter for After Effects
 
-True realtime pixel sort effect for Unity with GPU-accelerated bitonic sorting.
+| Language | Name |
+| --- | --- |
+| English | Bitonic Pixel Sorter for After Effects |
+| 日本語 | After Effects 対応ビットニック・ピクセルソーター |
+| 中文 | After Effects 版双调像素排序 |
+| 한국어 | After Effects용 비토닉 픽셀 정렬 |
 
-[Live Demo (WebGPU port)](https://ruccho.com/bps-webgpu/)
+This repository is an Adobe After Effects plug-in fork of
+[ruccho/BitonicPixelSorter](https://github.com/ruccho/BitonicPixelSorter), an
+MIT-licensed Unity / URP GPU pixel sorter. The original project remains the
+algorithmic and attribution source. This fork reorganises the codebase as a
+self-contained After Effects SDK effect plug-in and removes the Unity project
+surface from the active repository layout.
 
-The screenshot below shows it running on an NVIDIA GeForce RTX 4070 and it keeps over 1000 FPS at FHD resolution.
+## Overview
 
-<img width="1920" height="1032" alt="Image" src="https://github.com/user-attachments/assets/8330a931-a737-4239-a60a-4bf2bf637961" />
+Bitonic Pixel Sorter sorts contiguous spans of pixels whose brightness falls
+inside a threshold range. Sorting can run horizontally by row or vertically by
+column, and each eligible span can be ordered ascending or descending by luma.
 
-The processing time on the GPU is approximately 340μs using an NVIDIA GeForce RTX 4070 at FHD resolution.
+The current AE port contains:
 
-<img width="1206" height="455" alt="Image" src="https://github.com/user-attachments/assets/681fb12c-5c6b-4cc3-9c9d-b68af5aac160" />
+- CPU SmartFX rendering for 8-bit, 16-bit and 32-bit float AE worlds.
+- CUDA, OpenCL and DirectX GPU build paths for AE BGRA128 GPU worlds.
+- English, Japanese, Simplified Chinese and Korean parameter strings.
+- A self-contained CMake build that references only the Adobe After Effects SDK
+  Examples tree plus vendored, header-only local helpers.
 
-## Installation
+Metal is planned but is not validated in this repository yet. macOS plug-in
+build and host validation should be performed later on real Mac hardware.
 
-Use UPM git dependencies.
-1. Open Package Manager and click `+` > `Add package from git URL...`
-2. Enter `https://github.com/ruccho/BitonicPixelSorter.git?path=/Packages/com.ruccho.bitonicpixelsorter#release`
+## Parameters
 
-3. (Optional) To use a RendererFeature for UniversalRP, also install `https://github.com/ruccho/BitonicPixelSorter.git?path=/Packages/com.ruccho.bitonicpixelsorter.urp#release`
+| English | 日本語 | 中文 | 한국어 | Meaning |
+| --- | --- | --- | --- | --- |
+| Direction | 方向 | 方向 | 방향 | Horizontal row sort or vertical column sort. |
+| Order | 並び順 | 顺序 | 정렬 순서 | Ascending or descending brightness order. |
+| Threshold Min | しきい値 Min | 阈值最小值 | 임계값 최소 | Lower luma bound for sortable pixels. |
+| Threshold Max | しきい値 Max | 阈值最大值 | 임계값 최대 | Upper luma bound for sortable pixels. |
 
+The luma key follows the upstream weights:
 
-## BitonicPixelSorter Component
-
-![image](https://user-images.githubusercontent.com/16096562/125492519-6a363ad6-87b3-451b-a6a3-37b859821db5.png)
-
-|Property|Type|Description|
-|-|-|-|
-|Use As Image Effect|`bool`|It works as an image effect when attached to the camera. This is only active when you are using builtin render pipeline.|
-|Shader|`ComputeShader`|Set `BoitonicPixelSorter.compute`.|
-|Direction|`bool`|Switches sorting direction between horizontal / vertical.|
-|Ascending|`bool`|Switches ordering.|
-|Threshold Min|`float`|Lower threshold of the brightness.|
-|Threshold Max|`float`|Upper threshold of the brightness.|
-
-### Use from code
-
-```csharp
-var sorter = GetComponent<BitonicPixelSorter>();
-
-//BitonicPixelSorter.Execute(Texture src, RenderTexture dst)
-sorter.Execute(sourceTexture, destinationTexture);
+```text
+0.298912 * R + 0.586611 * G + 0.114478 * B
 ```
 
-## Use RendererFeature for UniversalRP
+## Repository Layout
 
-In your renderer asset, add `Bitonic Pixel Sorting Feature` to the renderer feature list.
+```text
+BitonicPixelSorterForAE/
+  CMakeLists.txt              AE plug-in build definition
+  Directory.Build.props       Windows SDK/MSBuild default output property
+  Source/                     PF effect entry point, CPU path and GPU dispatch
+  GPU/                        CUDA, OpenCL and HLSL bitonic kernels
+  Localise/                   EN/JA/ZH/KO string tables
+  PiPL/                       AE PiPL resource source
+  Mac/                        macOS bundle metadata template
+  cmake/                      build helper scripts
+  vendor/palf/                copied header-only localisation shim
+  docs/                       AE port plan and implementation notes
+  dist/Win/Release/           tracked Windows release .aex package
+  dist/Mac/Release/           tracked macOS release .plugin package
+```
 
-## Algorithm
+Debug and intermediate build outputs are ignored. Release plug-in artefacts
+under `dist/Win/Release/` and `dist/Mac/Release/` are intentionally versionable
+so tested deliverables can be attached to the repository history.
 
-Pixel sorting sorts contiguous spans of pixels whose brightness falls within a threshold range, along each row (or column) of the image. BitonicPixelSorter performs this entirely on the GPU in a **single compute dispatch** — one thread group per line — using a [bitonic sorting network](https://en.wikipedia.org/wiki/Bitonic_sorter), a data-independent comparison network that maps perfectly to GPU parallelism. Everything happens in group shared memory; the source texture is read once and the result is written once.
+## Prerequisites
 
-### 1. Load
+- Adobe After Effects SDK, with this repository placed inside the SDK
+  `Examples` directory or configured with `-DAESDK_ROOT=<path-to-Examples>`.
+- CMake 3.18 or newer.
+- Windows: Visual Studio 2022 with MSVC v143.
+- Optional Windows GPU backends:
+  - CUDA Toolkit for CUDA.
+  - OpenCL headers and library. The CUDA Toolkit commonly supplies both.
+  - Windows SDK `dxc.exe`, D3D12 and `d3dcompiler` for DirectX.
+  - Python 3 for embedding the OpenCL kernel source during configure/build.
+- macOS: Xcode or Command Line Tools, including `clang` and `Rez`.
 
-Each thread loads a contiguous chunk of the line, computes the brightness of each pixel, and stores a packed sort key into group shared memory: the original pixel index in the high 16 bits and the f16 brightness in the low 16 bits, so a compare-exchange later is just a 32-bit swap. An in-threshold bitmask of the chunk is kept in registers.
+## Build
 
-### 2. Span detection — parallel scan
+Windows Release:
 
-Before sorting, each pixel pair needs to know the boundaries of the contiguous in-threshold span it belongs to. Instead of scanning the line sequentially, this is computed as a pair of parallel scans in `O(log n)` steps:
+```powershell
+cmake -S . -B build/Win -G "Visual Studio 17 2022" -A x64
+cmake --build build/Win --config Release
+```
 
-- *Span starts*: each thread finds the last out-of-threshold index in its own chunk, then a prefix-**max** scan (Hillis–Steele) across the group propagates it, and a short per-chunk walk resolves the start index for every pair.
-- *Span ends*: symmetrically, a suffix-**min** scan of the first out-of-threshold index resolves the end index for every pair.
+Windows Debug:
 
-Pixels outside the threshold range form spans of length 1, so they never move during sorting.
+```powershell
+cmake --build build/Win --config Debug
+```
 
-### 3. Adaptive phase count
+macOS Release, to be validated on Mac hardware:
 
-A parallel max-reduction finds the **longest span in the line**, and the number of bitonic phases is chosen as just enough for that length — `floor(log2(maxLen)) + 1` — instead of `ceil(log2(lineWidth))` for the whole line. Since the comparison cost grows with the square of the phase count, lines whose spans are short (the common case with thresholding) finish much earlier, and lines with no sortable span at all skip the sorting network entirely. The extra merge phase included for exact power-of-two span lengths guarantees that every span in the image is finally merged in the same direction.
+```sh
+cmake -S . -B build/Mac -G Xcode
+cmake --build build/Mac --config Release
+```
 
-### 4. Per-span bitonic sort
+Expected local outputs:
 
-The bitonic network runs over the whole line in group shared memory. Comparator indices are computed **relative to each pair's span start**, so every span in the line is sorted independently inside one shared network without any divergent control flow. Spans of arbitrary (non-power-of-two) length are handled with the odd-network technique (see References): comparators that would reach past the span end are clamped to compare an element with itself.
+| Platform | Configuration | Output |
+| --- | --- | --- |
+| Windows | Release | `dist/Win/Release/BitonicPixelSorter.aex` |
+| Windows | Debug | `dist/Win/Debug/BitonicPixelSorter_debug.aex` |
+| macOS | Release | `dist/Mac/Release/BitonicPixelSorter.plugin` |
+| macOS | Debug | `dist/Mac/Debug/BitonicPixelSorter.plugin` |
 
-### 5. Output
+When the DirectX backend is enabled, the Windows release package also includes:
 
-Only the sorted *indices* are used to gather the full-color pixels from the source texture into the output — colors are never shuffled through shared memory.
+```text
+dist/Win/Release/DirectX_Assets/BitonicSortKernel.cso
+dist/Win/Release/DirectX_Assets/BitonicSortKernel.rs
+```
 
-Because the sort runs in group shared memory, the sortable line length is limited to **2048 pixels** by default. For sources between 2049 and **4096 pixels**, a shader variant (`BPS_SIZE_4096` keyword) that doubles the shared memory budget to 16 KiB is selected automatically at some occupancy cost.
+## Installing Into After Effects
 
-## References
+Copy the generated `.aex` or `.plugin` package into an After Effects plug-ins
+folder. On Windows this is commonly:
 
-https://github.com/hiroakioishi/UnityGPUBitonicSort
+```text
+C:\Program Files\Adobe\Adobe After Effects <version>\Support Files\Plug-ins\
+```
 
-https://www.inf.hs-flensburg.de/lang/algorithmen/sortieren/bitonic/oddn.htm
+CMake can also copy the built plug-in after each build:
+
+```powershell
+cmake -S . -B build/Win -DBPS_AE_PLUGIN_DIR="C:/Program Files/Adobe/Adobe After Effects 2025/Support Files/Plug-ins"
+```
+
+The effect is registered in the `Stylize` category as `Bitonic Pixel Sorter`.
+
+## Status
+
+Validated on the current Windows workstation:
+
+- CMake configure with Visual Studio 17 2022 x64.
+- Release and Debug builds with CUDA 13.1, OpenCL and DirectX enabled.
+- Windows release `.aex` exports `EffectMain` and `PluginDataEntryFunction2`.
+- Direct OpenCL runtime compile check succeeds; NVIDIA's compiler emits only a
+  non-fatal noinline warning.
+
+Still pending:
+
+- After Effects in-host CPU/GPU visual parity validation.
+- macOS `.plugin` build and host validation on real Mac hardware.
+- Metal backend implementation.
+- Hardening for large-frame tiling and AE render banding edge cases.
+
+## Licence And Attribution
+
+Upstream project:
+
+- `ruccho/BitonicPixelSorter`
+- <https://github.com/ruccho/BitonicPixelSorter>
+- MIT licence, preserved in `LICENSE`.
+
+This fork keeps the upstream attribution explicit because the core effect,
+brightness model and bitonic sorting strategy derive from that project. The AE
+host integration, CMake build, PiPL resources, localisation files and CPU/GPU
+backend adaptation are specific to this After Effects fork.
