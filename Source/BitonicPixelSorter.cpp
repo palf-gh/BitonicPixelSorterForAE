@@ -334,6 +334,8 @@ SmartRender(
 		return PF_Err_INTERNAL_STRUCT_DAMAGED;
 	}
 
+	BPS_SetLastRenderUsedGpu(isGPU);
+
 	ERR((extraP->cb->checkout_layer_pixels(in_data->effect_ref, BPS_INPUT, &input_worldP)));
 	ERR(extraP->cb->checkout_output(in_data->effect_ref, &output_worldP));
 
@@ -348,7 +350,6 @@ SmartRender(
 #if defined(BPS_RENDER_DIAG)
 			const auto render_start = std::chrono::steady_clock::now();
 #endif
-			BPS_SetRenderAttempted(true);
 			if (isGPU) {
 				ERR(BPS_SmartRenderGPU(in_data, out_data, pixel_format,
 									   input_worldP, output_worldP, extraP, infoP));
@@ -361,8 +362,9 @@ SmartRender(
 			const double elapsed_ms =
 				std::chrono::duration<double, std::milli>(render_end - render_start).count();
 			BPS_DiagLog(
-				"SmartRender isGPU=%d pixel_format=%s frame=%ldx%ld "
+				"SmartRender path=%s isGPU=%d pixel_format=%s frame=%ldx%ld "
 				"output_origin=(%ld,%ld) output_size=%ldx%ld direction=%ld elapsed_ms=%.3f err=%ld",
+				isGPU ? "GPU" : "CPU",
 				isGPU ? 1 : 0,
 				PixelFormatName(pixel_format),
 				static_cast<long>(in_data->width),
