@@ -57,10 +57,9 @@ Key facts that shape the port:
   memory, capping the sort-axis length at 2048 (default) / 4096 (`BPS_SIZE_4096`
   variant). When the sort-axis length > 4096, the GPU path must fall back to CPU.
 - **Not pixel-independent**: `PF_OutFlag_PIX_INDEPENDENT` must stay off.
-- **Not currently threaded-render advertised**: the CPU path is origin-aware, but
-  the GPU kernels still assume a full-frame output request. Keep
-  `PF_OutFlag2_SUPPORTS_THREADED_RENDERING` off until GPU band handling is
-  explicit.
+- **MFR advertised**: render state is per-call, CPU work is split across output
+  lines, and GPU dispatch is conservatively serialised until in-host MFR GPU
+  stress testing proves every backend's shared device handles are safe.
 
 ## 3. Toolchain reality (this machine, 2026-06-26)
 
@@ -290,8 +289,45 @@ The CPU build needs none of the above.
     AE's requested output rectangle and `max_result_rect` reports the full frame.
   - Made the CPU renderer honour Smart Render world `origin_x`/`origin_y`, so
     partial output worlds map correctly back to layer coordinates.
-  - GPU rendering is now advertised only for full-frame output requests; partial
-    Smart Render requests use the origin-aware CPU path until GPU band support is
-    implemented.
+  - Superseded below: the initial safety restriction advertised GPU rendering
+    only for full-frame output requests until the GPU kernels became origin-aware.
+- 2026-06-26: Performance and MFR pass:
+  - Added shared `BPS_EvaluateGpuEligibility` logic so render and future UI code
+    report the same GPU availability reason.
+  - CPU sorting now parallelises across independent lines, caches each pixel's
+    brightness key once per line, sorts compact key/index entries, and reuses
+    per-thread scratch buffers.
+  - `PF_OutFlag2_SUPPORTS_THREADED_RENDERING` is now included through the shared
+    Target header, keeping PiPL and `GlobalSetup` outflags identical. CUDA render
+    dispatch is concurrent; OpenCL and DirectX keep narrow locks around shared
+    mutable backend handles.
+  - Optional render diagnostics can be enabled with
+    `cmake -S . -B build -DBPS_RENDER_DIAG=ON`; logs include PreRender request
+    rectangles, GPU eligibility, SmartRender path, pixel format, dimensions,
+    direction, and render-call timing.
+- 2026-06-26: Partial-frame GPU rendering fixed for CUDA, OpenCL, and DirectX;
+  `BPS_RENDER_DIAG` should now show `gpu_possible=1` in PreRender and
+  `SmartRender isGPU=1 ... elapsed_ms=...` when AE actually dispatches GPU.
+- 2026-06-26: GPU correctness fix after partial-frame rendering exposed broken
+  output:
+  - CUDA, OpenCL, and DirectX now keep the partial-output dispatch but sort each
+    contiguous in-threshold span across the full sort axis before writing only
+    pixels inside the requested output world.
+  - The kernels no longer use the previous packed half-key span network, which
+    failed to produce one continuous sorted line for full-threshold spans. They
+    now use padded per-span bitonic sorting with float brightness keys and source
+    index tie-breaking, matching the CPU oracle's stable span ordering.
+- 2026-06-26: Fixed a shared/local-memory data race in the per-span bitonic sort.
+  Thread 0 published the span metadata into the sort scratch array, which the
+  load loop then overwrote with no intervening barrier, so late warps could read
+  a corrupted `sortSize` and drive the in-loop barriers divergent.
+  - CUDA: dedicated `__shared__` scalars (`s_spanStart`/`s_spanEnd`/`s_spanSize`/
+    `s_sortSize`) hold the metadata, never colliding with the sort scratch.
+  - OpenCL and DirectX keep the metadata in `scratchIndex[0..3]` (both backends
+    are already at the 32 KB local/groupshared cap, so dedicated scalars would
+    overflow it) and add a publish/consume barrier after every thread copies the
+    metadata into private locals and before the load loop overwrites the scratch.
+  - All threads now read identical `spanStart`/`spanSize`/`sortSize`, so the
+    per-span break and the bitonic-network barriers stay uniform.
 - Phases 5–8 (Metal, pipeline hardening, validation, robustness) pending. AE
   in-host CPU/GPU parity validation is still pending.

@@ -21,6 +21,18 @@ inline const char *GetString(LocKey::Key key) {
     return "しきい値（下限）";
   case LocKey::STR_THRESHOLD_MAX:
     return "しきい値（上限）";
+  case LocKey::STR_GPU_STATUS_NAME:
+    return "GPUアクセラレーション";
+  case LocKey::STR_GPU_STATUS_ACTIVE:
+    return "GPU: 有効";
+  case LocKey::STR_GPU_STATUS_NO_BACKEND:
+    return "GPU: 利用不可（GPUバックエンドなし）";
+  case LocKey::STR_GPU_STATUS_HOST:
+    return "GPU: 利用不可（ホスト）";
+  case LocKey::STR_GPU_STATUS_AXIS_TOO_LONG:
+    return "GPU: CPUフォールバック（画像が大きすぎます）";
+  case LocKey::STR_GPU_STATUS_HOST_INACTIVE:
+    return "GPU: 無効（プロジェクト設定でMercury GPUを有効にしてください）";
   default:
     return "";
   }

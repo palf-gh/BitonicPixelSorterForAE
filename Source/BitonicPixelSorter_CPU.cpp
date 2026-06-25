@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -71,8 +73,35 @@ inline A_long MinLong(A_long a, A_long b) {
 template <typename T>
 struct Entry {
 	float	key;
-	T		pix;
+	uint32_t index;
 };
+
+template <typename T>
+struct LineScratch {
+	std::vector<T> sourceLine;
+	std::vector<T> sortedLine;
+	std::vector<float> keys;
+	std::vector<unsigned char> validLine;
+	std::vector<Entry<T>> run;
+};
+
+inline unsigned int WorkerCountFor(A_long lineCount) {
+	if (lineCount <= 1) {
+		return 1;
+	}
+
+	unsigned int workers = std::thread::hardware_concurrency();
+	if (workers == 0) {
+		workers = 1;
+	}
+	// AE can already render multiple frames concurrently, so keep this per-frame
+	// fan-out modest and avoid creating workers for tiny partial-frame renders.
+	workers = static_cast<unsigned int>(MaxLong(1, static_cast<A_long>(workers / 2)));
+	workers = static_cast<unsigned int>(MinLong(static_cast<A_long>(workers), lineCount));
+	workers = static_cast<unsigned int>(MinLong(static_cast<A_long>(workers), lineCount / 16));
+	workers = static_cast<unsigned int>(MinLong(static_cast<A_long>(workers), 8));
+	return workers == 0 ? 1 : workers;
+}
 
 // Sort each contiguous in-threshold span of every line by brightness.
 //
@@ -101,73 +130,121 @@ static void SortLines(PF_EffectWorld *inP, PF_EffectWorld *outP,
 	const A_long lineEnd = horizontal ? MinLong(frameH, outBottom)
 									  : MinLong(frameW, outRight);
 	const A_long lineLen = horizontal ? frameW : frameH;
+	const A_long writeStart = horizontal ? MaxLong(0, outLeft)
+										 : MaxLong(0, outTop);
+	const A_long writeEnd = horizontal ? MinLong(frameW, outRight)
+									   : MinLong(frameH, outBottom);
 
-	std::vector<T> sortedLine(static_cast<size_t>(lineLen));
-	std::vector<bool> validLine(static_cast<size_t>(lineLen));
-	std::vector<Entry<T>> run;
-	run.reserve(static_cast<size_t>(lineLen));
+	const A_long lineCount = lineEnd - lineStart;
+	if (lineCount <= 0 || lineLen <= 0 || writeEnd <= writeStart) {
+		return;
+	}
 
-	for (A_long line = lineStart; line < lineEnd; ++line) {
-		// Map line position k -> (x, y) for both orientations.
+	auto processLines = [&](A_long chunkStart, A_long chunkEnd) {
+		LineScratch<T> scratch;
+		scratch.sourceLine.resize(static_cast<size_t>(lineLen));
+		scratch.sortedLine.resize(static_cast<size_t>(lineLen));
+		scratch.keys.resize(static_cast<size_t>(lineLen));
+		scratch.validLine.resize(static_cast<size_t>(lineLen));
+		scratch.run.reserve(static_cast<size_t>(lineLen));
+
 		auto coord = [&](A_long k, A_long &x, A_long &y) {
-			if (horizontal) { x = k; y = line; }
-			else            { x = line; y = k; }
+			if (horizontal) { x = k; y = 0; }
+			else            { x = 0; y = k; }
 		};
 
-		// Snapshot the whole input dependency line first; spans overwrite this
-		// local line buffer before the requested output sub-rectangle is written.
-		for (A_long k = 0; k < lineLen; ++k) {
-			A_long x, y;
-			coord(k, x, y);
-			if (ContainsLayerPoint(inP, x, y)) {
-				sortedLine[static_cast<size_t>(k)] = *PixelAtLayer<T>(inP, x, y);
-				validLine[static_cast<size_t>(k)] = true;
-			} else {
-				sortedLine[static_cast<size_t>(k)] = T{};
-				validLine[static_cast<size_t>(k)] = false;
+		for (A_long line = chunkStart; line < chunkEnd; ++line) {
+			// Snapshot the dependency line once, including its brightness key.
+			for (A_long k = 0; k < lineLen; ++k) {
+				A_long x, y;
+				coord(k, x, y);
+				if (horizontal) { y = line; }
+				else            { x = line; }
+
+				const size_t index = static_cast<size_t>(k);
+				if (ContainsLayerPoint(inP, x, y)) {
+					const T pixel = *PixelAtLayer<T>(inP, x, y);
+					scratch.sourceLine[index] = pixel;
+					scratch.sortedLine[index] = pixel;
+					scratch.keys[index] = BrightnessUnit(pixel);
+					scratch.validLine[index] = 1;
+				} else {
+					scratch.sourceLine[index] = T{};
+					scratch.sortedLine[index] = T{};
+					scratch.keys[index] = -1.0f;
+					scratch.validLine[index] = 0;
+				}
 			}
-		}
 
-		A_long k = 0;
-		while (k < lineLen) {
-			const bool inBounds = validLine[static_cast<size_t>(k)];
-			float br = inBounds ? BrightnessUnit(sortedLine[static_cast<size_t>(k)]) : -1.0f;
+			A_long k = 0;
+			while (k < lineLen) {
+				const size_t keyIndex = static_cast<size_t>(k);
+				const bool inBounds = scratch.validLine[keyIndex] != 0;
+				const float br = scratch.keys[keyIndex];
 
-			if (inBounds && br >= tmin && br <= tmax) {
-				const A_long start = k;
-				run.clear();
-				while (k < lineLen) {
-					if (!validLine[static_cast<size_t>(k)]) break;
-					T src = sortedLine[static_cast<size_t>(k)];
-					float b = BrightnessUnit(src);
-					if (b < tmin || b > tmax) break;
-					run.push_back(Entry<T>{b, src});
+				if (inBounds && br >= tmin && br <= tmax) {
+					const A_long start = k;
+					scratch.run.clear();
+					while (k < lineLen) {
+						const size_t runIndex = static_cast<size_t>(k);
+						if (scratch.validLine[runIndex] == 0) break;
+						const float b = scratch.keys[runIndex];
+						if (b < tmin || b > tmax) break;
+						scratch.run.push_back(Entry<T>{b, static_cast<uint32_t>(k)});
+						++k;
+					}
+
+					if (scratch.run.size() > 1) {
+						if (ascending) {
+							std::stable_sort(scratch.run.begin(), scratch.run.end(),
+								[](const Entry<T> &a, const Entry<T> &b) { return a.key < b.key; });
+						} else {
+							std::stable_sort(scratch.run.begin(), scratch.run.end(),
+								[](const Entry<T> &a, const Entry<T> &b) { return a.key > b.key; });
+						}
+
+						for (size_t i = 0; i < scratch.run.size(); ++i) {
+							scratch.sortedLine[static_cast<size_t>(start) + i] =
+								scratch.sourceLine[static_cast<size_t>(scratch.run[i].index)];
+						}
+					}
+				} else {
 					++k;
 				}
+			}
 
-				if (ascending) {
-					std::stable_sort(run.begin(), run.end(),
-						[](const Entry<T> &a, const Entry<T> &b) { return a.key < b.key; });
-				} else {
-					std::stable_sort(run.begin(), run.end(),
-						[](const Entry<T> &a, const Entry<T> &b) { return a.key > b.key; });
+			for (A_long k = writeStart; k < writeEnd; ++k) {
+				A_long x, y;
+				coord(k, x, y);
+				if (horizontal) { y = line; }
+				else            { x = line; }
+				if (ContainsLayerPoint(outP, x, y)) {
+					*PixelAtLayer<T>(outP, x, y) = scratch.sortedLine[static_cast<size_t>(k)];
 				}
-
-				for (size_t i = 0; i < run.size(); ++i) {
-					sortedLine[static_cast<size_t>(start) + i] = run[i].pix;
-				}
-			} else {
-				++k;
 			}
 		}
+	};
 
-		for (A_long k = 0; k < lineLen; ++k) {
-			A_long x, y;
-			coord(k, x, y);
-			if (ContainsLayerPoint(outP, x, y)) {
-				*PixelAtLayer<T>(outP, x, y) = sortedLine[static_cast<size_t>(k)];
-			}
+	const unsigned int workerCount = WorkerCountFor(lineCount);
+	if (workerCount <= 1) {
+		processLines(lineStart, lineEnd);
+		return;
+	}
+
+	std::vector<std::thread> workers;
+	workers.reserve(workerCount);
+	for (unsigned int worker = 0; worker < workerCount; ++worker) {
+		const A_long chunkBegin = lineStart +
+			static_cast<A_long>((static_cast<long long>(lineCount) * worker) / workerCount);
+		const A_long chunkEnd = lineStart +
+			static_cast<A_long>((static_cast<long long>(lineCount) * (worker + 1)) / workerCount);
+		if (chunkBegin < chunkEnd) {
+			workers.emplace_back(processLines, chunkBegin, chunkEnd);
 		}
+	}
+
+	for (std::thread &worker : workers) {
+		worker.join();
 	}
 }
 

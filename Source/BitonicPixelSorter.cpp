@@ -11,7 +11,13 @@
 */
 
 #include "BitonicPixelSorter.h"
+#include "BitonicPixelSorter_GpuEligibility.h"
 
+#if defined(BPS_RENDER_DIAG)
+	#include <chrono>
+	#include <cstdarg>
+	#include <cstdio>
+#endif
 #include <new>
 #include <string>
 
@@ -26,47 +32,53 @@
 
 namespace {
 
-static A_long
-ClampLong(A_long value, A_long lo, A_long hi)
+#if defined(BPS_RENDER_DIAG)
+static const char *
+GpuBlockReasonName(BpsGpuBlockReason reason)
 {
-	return value < lo ? lo : (value > hi ? hi : value);
-}
-
-static PF_LRect
-FrameRect(const PF_InData *in_data)
-{
-	PF_LRect rect;
-	rect.left = 0;
-	rect.top = 0;
-	rect.right = in_data->width;
-	rect.bottom = in_data->height;
-	return rect;
-}
-
-static PF_LRect
-ClipRectToFrame(PF_LRect rect, const PF_InData *in_data)
-{
-	rect.left = ClampLong(rect.left, 0, in_data->width);
-	rect.right = ClampLong(rect.right, 0, in_data->width);
-	rect.top = ClampLong(rect.top, 0, in_data->height);
-	rect.bottom = ClampLong(rect.bottom, 0, in_data->height);
-	if (rect.right < rect.left) {
-		rect.right = rect.left;
+	switch (reason) {
+	case BpsGpuBlockReason::None: return "None";
+	case BpsGpuBlockReason::NoBackendCompiled: return "NoBackendCompiled";
+	case BpsGpuBlockReason::HostPremiere: return "HostPremiere";
+	case BpsGpuBlockReason::SortAxisTooLong: return "SortAxisTooLong";
+	default: return "Unknown";
 	}
-	if (rect.bottom < rect.top) {
-		rect.bottom = rect.top;
-	}
-	return rect;
 }
 
-static bool
-IsFullFrameRequest(const PF_LRect &rect, const PF_InData *in_data)
+static const char *
+PixelFormatName(PF_PixelFormat pixel_format)
 {
-	return rect.left <= 0 &&
-		   rect.top <= 0 &&
-		   rect.right >= in_data->width &&
-		   rect.bottom >= in_data->height;
+	switch (pixel_format) {
+	case PF_PixelFormat_ARGB32: return "ARGB32";
+	case PF_PixelFormat_ARGB64: return "ARGB64";
+	case PF_PixelFormat_ARGB128: return "ARGB128";
+	case PF_PixelFormat_GPU_BGRA128: return "GPU_BGRA128";
+	default: return "Unknown";
+	}
 }
+
+static void
+BPS_DiagLog(const char *format, ...)
+{
+	char message[1024];
+	va_list args;
+	va_start(args, format);
+	std::vsnprintf(message, sizeof(message), format, args);
+	va_end(args);
+
+#if defined(_WIN32)
+	OutputDebugStringA("[BitonicPixelSorter] ");
+	OutputDebugStringA(message);
+	OutputDebugStringA("\n");
+#else
+	FILE *file = std::fopen("/tmp/BitonicPixelSorter_render_diag.log", "a");
+	if (file) {
+		std::fprintf(file, "[BitonicPixelSorter] %s\n", message);
+		std::fclose(file);
+	}
+#endif
+}
+#endif
 
 } // namespace
 
@@ -109,6 +121,30 @@ ParamsSetup(
 	PF_Err		err = PF_Err_NONE;
 	PF_ParamDef	def;
 
+	// GPU acceleration status (read-only custom UI) — first user control after input.
+	AEFX_CLR_STRUCT(def);
+	{
+		std::string name =
+			AELocalise::GetStringForAE(LocKey::STR_GPU_STATUS_NAME, in_data);
+		def.ui_flags = PF_PUI_CONTROL | PF_PUI_DONT_ERASE_CONTROL;
+		def.ui_width = BPS_GPU_STATUS_UI_WIDTH;
+		def.ui_height = BPS_GPU_STATUS_UI_HEIGHT;
+
+		// Premiere Pro does not support standard param types with custom UI.
+		if (in_data->appl_id != kAppID_Premiere) {
+			PF_ADD_NULL(name.c_str(), BPS_GPU_STATUS);
+		} else {
+			PF_ADD_ARBITRARY2(name.c_str(),
+							  BPS_GPU_STATUS_UI_WIDTH,
+							  BPS_GPU_STATUS_UI_HEIGHT,
+							  0,
+							  PF_PUI_CONTROL | PF_PUI_DONT_ERASE_CONTROL,
+							  0,
+							  BPS_GPU_STATUS,
+							  0);
+		}
+	}
+
 	// Direction (Horizontal / Vertical). Copy localised strings into std::string
 	// first: AELocalise::GetStringForAE returns a pointer into a shared thread-
 	// local buffer that the next call overwrites, so we must not hold two live.
@@ -143,6 +179,27 @@ ParamsSetup(
 							 1, PF_ValueDisplayFlag_PERCENT, 0, BPS_THRESHOLD_MAX);
 	}
 
+	if (!err) {
+		PF_CustomUIInfo ci;
+		AEFX_CLR_STRUCT(ci);
+
+		ci.events = PF_CustomEFlag_EFFECT;
+
+		ci.comp_ui_width = 0;
+		ci.comp_ui_height = 0;
+		ci.comp_ui_alignment = PF_UIAlignment_NONE;
+
+		ci.layer_ui_width = 0;
+		ci.layer_ui_height = 0;
+		ci.layer_ui_alignment = PF_UIAlignment_NONE;
+
+		ci.preview_ui_width = 0;
+		ci.preview_ui_height = 0;
+		ci.preview_ui_alignment = PF_UIAlignment_NONE;
+
+		err = (*(in_data->inter.register_ui))(in_data->effect_ref, &ci);
+	}
+
 	out_data->num_params = BPS_NUM_PARAMS;
 	return err;
 }
@@ -166,8 +223,9 @@ PreRender(
 {
 	PF_Err				err = PF_Err_NONE;
 	PF_CheckoutResult	in_result;
-	PF_RenderRequest	req = extraP->input->output_request;
-	PF_LRect			output_rect = ClipRectToFrame(req.rect, in_data);
+	const PF_RenderRequest	raw_req = extraP->input->output_request;
+	PF_RenderRequest		req = raw_req;
+	PF_LRect				output_rect = BPS_ClipRectToFrame(req.rect, in_data);
 
 	BitonicSorterParams *infoP = new (std::nothrow) BitonicSorterParams();
 	if (!infoP) {
@@ -196,19 +254,29 @@ PreRender(
 						  in_data->time_step, in_data->time_scale, &cur_param));
 	infoP->thresholdMax = (float)(cur_param.u.fs_d.value / 100.0);
 
-#if defined(BPS_GPU_ENABLED)
-	{
-		// The GPU bitonic sort runs a whole line in group-shared memory, so only
-		// offer the GPU path when the sort-axis length is within the limit;
-		// otherwise After Effects falls back to the (unlimited) CPU path. The
-		// current GPU kernels also assume a full-frame output request.
-		A_long sortAxisLen = (infoP->direction == BPS_DIR_HORIZONTAL)
-								  ? in_data->width : in_data->height;
-		if (sortAxisLen <= BPS_GPU_MAX_LINE &&
-			IsFullFrameRequest(output_rect, in_data)) {
-			extraP->output->flags |= PF_RenderOutputFlag_GPU_RENDER_POSSIBLE;
-		}
+	const BpsGpuEligibility gpu_eligibility =
+		BPS_EvaluateGpuEligibility(in_data, infoP->direction, output_rect);
+	if (gpu_eligibility.render_possible) {
+		extraP->output->flags |= PF_RenderOutputFlag_GPU_RENDER_POSSIBLE;
 	}
+
+#if defined(BPS_RENDER_DIAG)
+	BPS_DiagLog(
+		"PreRender output_request=(%ld,%ld,%ld,%ld) clipped=(%ld,%ld,%ld,%ld) "
+		"gpu_possible=%d reason=%s frame=%ldx%ld direction=%ld",
+		static_cast<long>(raw_req.rect.left),
+		static_cast<long>(raw_req.rect.top),
+		static_cast<long>(raw_req.rect.right),
+		static_cast<long>(raw_req.rect.bottom),
+		static_cast<long>(output_rect.left),
+		static_cast<long>(output_rect.top),
+		static_cast<long>(output_rect.right),
+		static_cast<long>(output_rect.bottom),
+		gpu_eligibility.render_possible ? 1 : 0,
+		GpuBlockReasonName(gpu_eligibility.reason),
+		static_cast<long>(in_data->width),
+		static_cast<long>(in_data->height),
+		static_cast<long>(infoP->direction));
 #endif
 
 	// Pixel sorting needs the complete sort axis for each requested output
@@ -234,7 +302,7 @@ PreRender(
 
 	if (!err) {
 		extraP->output->result_rect = output_rect;
-		extraP->output->max_result_rect = FrameRect(in_data);
+		extraP->output->max_result_rect = BPS_FrameRect(in_data);
 
 		extraP->output->pre_render_data = infoP;
 		extraP->output->delete_pre_render_data_func = DisposePreRenderData;
@@ -277,6 +345,10 @@ SmartRender(
 		ERR(world_suite->PF_GetPixelFormat(input_worldP, &pixel_format));
 
 		if (!err) {
+#if defined(BPS_RENDER_DIAG)
+			const auto render_start = std::chrono::steady_clock::now();
+#endif
+			BPS_SetLastRenderUsedGpu(false);
 			if (isGPU) {
 				ERR(BPS_SmartRenderGPU(in_data, out_data, pixel_format,
 									   input_worldP, output_worldP, extraP, infoP));
@@ -284,6 +356,25 @@ SmartRender(
 				ERR(BPS_SortImageCPU(in_data, out_data, pixel_format,
 									 input_worldP, output_worldP, infoP));
 			}
+#if defined(BPS_RENDER_DIAG)
+			const auto render_end = std::chrono::steady_clock::now();
+			const double elapsed_ms =
+				std::chrono::duration<double, std::milli>(render_end - render_start).count();
+			BPS_DiagLog(
+				"SmartRender isGPU=%d pixel_format=%s frame=%ldx%ld "
+				"output_origin=(%ld,%ld) output_size=%ldx%ld direction=%ld elapsed_ms=%.3f err=%ld",
+				isGPU ? 1 : 0,
+				PixelFormatName(pixel_format),
+				static_cast<long>(in_data->width),
+				static_cast<long>(in_data->height),
+				static_cast<long>(output_worldP->origin_x),
+				static_cast<long>(output_worldP->origin_y),
+				static_cast<long>(output_worldP->width),
+				static_cast<long>(output_worldP->height),
+				static_cast<long>(infoP->direction),
+				elapsed_ms,
+				static_cast<long>(err));
+#endif
 		}
 	}
 
@@ -353,6 +444,13 @@ EffectMain(
 			break;
 		case PF_Cmd_SMART_RENDER_GPU:
 			err = SmartRender(in_data, out_data, reinterpret_cast<PF_SmartRenderExtra *>(extra), true);
+			break;
+		case PF_Cmd_EVENT:
+			err = BPS_HandleEvent(in_data, out_data, params, output,
+								  reinterpret_cast<PF_EventExtra *>(extra));
+			break;
+		case PF_Cmd_UPDATE_PARAMS_UI:
+			err = BPS_UpdateParamsUI(in_data, out_data, params, output);
 			break;
 		default:
 			break;

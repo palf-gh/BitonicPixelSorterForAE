@@ -50,18 +50,23 @@
 //-----------------------------------------------------------------------------
 // Literals only: PiPLtool's parser rejects '<<' and 'L'.
 //
-// OUT_FLAGS = PF_OutFlag_DEEP_COLOR_AWARE (1<<25) = 33554432.
+// OUT_FLAGS = PF_OutFlag_DEEP_COLOR_AWARE (1<<25 = 33554432)
+//   | PF_OutFlag_CUSTOM_UI (1<<15 = 32768)
+//   | PF_OutFlag_SEND_UPDATE_PARAMS_UI (1<<26 = 67108864)
+//   = 100696064.
 // NOTE: deliberately NOT PF_OutFlag_PIX_INDEPENDENT — pixel sorting moves pixels
 // along a line, so an output pixel depends on its neighbours (not independent).
-#define OUT_FLAGS		33554432
+#define OUT_FLAGS		100696064
 
 // OUT_FLAGS2 = PF_OutFlag2_SUPPORTS_SMART_RENDER (1<<10 = 1024)
-//   | PF_OutFlag2_FLOAT_COLOR_AWARE (1<<12 = 4096) = 5120.
+//   | PF_OutFlag2_FLOAT_COLOR_AWARE (1<<12 = 4096)
+//   | PF_OutFlag2_SUPPORTS_THREADED_RENDERING (1<<27 = 134217728)
+//   = 134222848.
 //
-// Do not advertise PF_OutFlag2_SUPPORTS_THREADED_RENDERING yet: both vertical
-// sorting and the current GPU kernels require whole sort-axis dependency data,
-// and AE may otherwise split Smart Render requests into bands.
-#define OUT_FLAGS2_BASE	5120
+// Threaded rendering advertises AE Multi-Frame Rendering support. PreRender and
+// SmartRender can run on non-main threads concurrently with the UI, so render
+// code must remain per-call/stateless or explicitly synchronised.
+#define OUT_FLAGS2_BASE	134222848
 
 #if defined(BPS_HAS_CUDA) || defined(BPS_HAS_OPENCL) || defined(BPS_HAS_HLSL) || defined(BPS_HAS_METAL)
 	// PF_OutFlag2_SUPPORTS_GPU_RENDER_F32 (1<<25) = 33554432.

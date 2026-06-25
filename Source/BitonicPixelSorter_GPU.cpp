@@ -26,20 +26,28 @@
 #endif
 
 #include "BitonicPixelSorter.h"
+#include "BitonicPixelSorter_GpuEligibility.h"
 
+#include <atomic>
 #include <cstring>
+#include <mutex>
 #include <new>
+#include <string>
 
 #if defined(BPS_HAS_HLSL)
 	#include "DirectXUtils.h"
+	#include <dxgi1_6.h>
 #endif
 
 #if defined(BPS_HAS_CUDA)
 	// Host launch wrapper, defined in GPU/BitonicPixelSorter_Kernel.cu.
-	extern "C" void BitonicSort_CUDA(
+	extern "C" cudaError_t BitonicSort_CUDA(
 		const void *src, void *dst,
 		int srcPitch, int dstPitch, int width, int height,
-		int direction, int ordering, float thresholdMin, float thresholdMax);
+		int inputOriginX, int inputOriginY,
+		int outputOriginX, int outputOriginY, int outputWidth, int outputHeight,
+		int direction, int ordering, float thresholdMin, float thresholdMax,
+		void *streamPV);
 #endif
 
 #if defined(BPS_HAS_OPENCL)
@@ -87,6 +95,12 @@ struct DirectXSortParams {
 	int dstPitch;
 	int width;
 	int height;
+	int inputOriginX;
+	int inputOriginY;
+	int outputOriginX;
+	int outputOriginY;
+	int outputWidth;
+	int outputHeight;
 	int direction;
 	int ordering;
 	float thresholdMin;
@@ -111,6 +125,185 @@ static void ReleaseDirectXData(DirectXGPUData *dx_dataP)
 } // namespace
 #endif
 
+namespace {
+
+std::mutex &BPS_GpuRenderMutex()
+{
+	static std::mutex mutex;
+	return mutex;
+}
+
+std::mutex &BPS_GpuDeviceStateMutex()
+{
+	static std::mutex mutex;
+	return mutex;
+}
+
+std::string &BPS_GpuFrameworkStorage()
+{
+	static std::string value;
+	return value;
+}
+
+std::string &BPS_GpuDeviceNameStorage()
+{
+	static std::string value;
+	return value;
+}
+
+std::atomic<bool> &BPS_GpuDeviceReadyStorage()
+{
+	static std::atomic<bool> value(false);
+	return value;
+}
+
+std::atomic<bool> &BPS_LastRenderUsedGpuStorage()
+{
+	static std::atomic<bool> value(false);
+	return value;
+}
+
+const char *BPS_FrameworkName(PF_GPU_Framework framework)
+{
+	switch (framework) {
+	case PF_GPU_Framework_CUDA: return "CUDA";
+	case PF_GPU_Framework_OPENCL: return "OpenCL";
+	case PF_GPU_Framework_DIRECTX: return "DirectX";
+	case PF_GPU_Framework_METAL: return "Metal";
+	default: return "";
+	}
+}
+
+#if defined(BPS_HAS_CUDA)
+std::string BPS_QueryCudaDeviceName()
+{
+	int device = 0;
+	cudaDeviceProp props;
+	if (cudaGetDevice(&device) == cudaSuccess &&
+		cudaGetDeviceProperties(&props, device) == cudaSuccess) {
+		return props.name;
+	}
+	return std::string();
+}
+#endif
+
+#if defined(BPS_HAS_OPENCL)
+std::string BPS_QueryOpenCLDeviceName(cl_device_id device)
+{
+	if (!device) {
+		return std::string();
+	}
+
+	size_t name_size = 0;
+	if (clGetDeviceInfo(device, CL_DEVICE_NAME, 0, 0, &name_size) != CL_SUCCESS ||
+		name_size == 0) {
+		return std::string();
+	}
+
+	std::string name(name_size, '\0');
+	if (clGetDeviceInfo(device, CL_DEVICE_NAME, name_size, &name[0], 0) != CL_SUCCESS) {
+		return std::string();
+	}
+	if (!name.empty() && name.back() == '\0') {
+		name.pop_back();
+	}
+	return name;
+}
+#endif
+
+#if defined(BPS_HAS_HLSL)
+std::string BPS_WideToUtf8(const wchar_t *text)
+{
+	if (!text || !text[0]) {
+		return std::string();
+	}
+
+	const int required = WideCharToMultiByte(CP_UTF8, 0, text, -1, 0, 0, 0, 0);
+	if (required <= 1) {
+		return std::string();
+	}
+
+	std::string utf8(static_cast<size_t>(required - 1), '\0');
+	WideCharToMultiByte(CP_UTF8, 0, text, -1, &utf8[0], required, 0, 0);
+	return utf8;
+}
+
+std::string BPS_QueryDirectXDeviceName(ID3D12Device *device)
+{
+	if (!device) {
+		return std::string();
+	}
+
+	Microsoft::WRL::ComPtr<IDXGIFactory6> factory;
+	if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+		return std::string();
+	}
+
+	Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+	const LUID luid = device->GetAdapterLuid();
+	if (FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter)))) {
+		return std::string();
+	}
+
+	DXGI_ADAPTER_DESC1 desc;
+	if (FAILED(adapter->GetDesc1(&desc))) {
+		return std::string();
+	}
+	return BPS_WideToUtf8(desc.Description);
+}
+#endif
+
+void BPS_RecordGpuDevice(PF_GPU_Framework framework, const std::string &device_name)
+{
+	std::lock_guard<std::mutex> lock(BPS_GpuDeviceStateMutex());
+	BPS_GpuFrameworkStorage() = BPS_FrameworkName(framework);
+	BPS_GpuDeviceNameStorage() = device_name;
+	BPS_GpuDeviceReadyStorage().store(framework != PF_GPU_Framework_NONE, std::memory_order_release);
+	BPS_LastRenderUsedGpuStorage().store(false, std::memory_order_release);
+}
+
+void BPS_ClearGpuDevice()
+{
+	std::lock_guard<std::mutex> lock(BPS_GpuDeviceStateMutex());
+	BPS_GpuFrameworkStorage().clear();
+	BPS_GpuDeviceNameStorage().clear();
+	BPS_GpuDeviceReadyStorage().store(false, std::memory_order_release);
+	BPS_LastRenderUsedGpuStorage().store(false, std::memory_order_release);
+}
+
+} // namespace
+
+const char *BPS_ActiveGpuFrameworkName()
+{
+	thread_local std::string snapshot;
+	std::lock_guard<std::mutex> lock(BPS_GpuDeviceStateMutex());
+	snapshot = BPS_GpuFrameworkStorage();
+	return snapshot.c_str();
+}
+
+const char *BPS_ActiveGpuDeviceName()
+{
+	thread_local std::string snapshot;
+	std::lock_guard<std::mutex> lock(BPS_GpuDeviceStateMutex());
+	snapshot = BPS_GpuDeviceNameStorage();
+	return snapshot.c_str();
+}
+
+bool BPS_IsGpuDeviceReady()
+{
+	return BPS_GpuDeviceReadyStorage().load(std::memory_order_acquire);
+}
+
+bool BPS_LastRenderUsedGpu()
+{
+	return BPS_LastRenderUsedGpuStorage().load(std::memory_order_acquire);
+}
+
+void BPS_SetLastRenderUsedGpu(bool used_gpu)
+{
+	BPS_LastRenderUsedGpuStorage().store(used_gpu, std::memory_order_release);
+}
+
 //-----------------------------------------------------------------------------
 PF_Err BPS_GPUDeviceSetup(
 	PF_InData				*in_dataP,
@@ -121,8 +314,21 @@ PF_Err BPS_GPUDeviceSetup(
 
 #if defined(BPS_HAS_CUDA)
 	if (extraP->input->what_gpu == PF_GPU_Framework_CUDA) {
+		AEFX_SuiteScoper<PF_GPUDeviceSuite1> gpu_suite =
+			AEFX_SuiteScoper<PF_GPUDeviceSuite1>(in_dataP, kPFGPUDeviceSuite,
+												 kPFGPUDeviceSuiteVersion1, out_dataP);
+
+		PF_GPUDeviceInfo device_info;
+		AEFX_CLR_STRUCT(device_info);
+		ERR(gpu_suite->GetDeviceInfo(in_dataP->effect_ref,
+									  extraP->input->device_index,
+									  &device_info));
+
 		// CUDA kernels are statically linked; nothing to compile here.
-		out_dataP->out_flags2 = PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
+		if (!err) {
+			out_dataP->out_flags2 = PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
+			BPS_RecordGpuDevice(device_info.device_framework, BPS_QueryCudaDeviceName());
+		}
 	}
 #endif
 
@@ -185,6 +391,7 @@ PF_Err BPS_GPUDeviceSetup(
 		if (!err) {
 			extraP->output->gpu_data = gpu_dataH;
 			out_dataP->out_flags2 = PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
+			BPS_RecordGpuDevice(device_info.device_framework, BPS_QueryOpenCLDeviceName(device));
 		} else {
 			ReleaseOpenCLData(cl_dataP);
 			if (gpu_dataH) {
@@ -245,6 +452,9 @@ PF_Err BPS_GPUDeviceSetup(
 		if (!err) {
 			extraP->output->gpu_data = gpu_dataH;
 			out_dataP->out_flags2 = PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
+			BPS_RecordGpuDevice(
+				device_info.device_framework,
+				BPS_QueryDirectXDeviceName(reinterpret_cast<ID3D12Device *>(device_info.devicePV)));
 		} else {
 			if (dx_dataP) {
 				ReleaseDirectXData(dx_dataP);
@@ -279,6 +489,7 @@ PF_Err BPS_GPUDeviceSetdown(
 			reinterpret_cast<PF_Handle>(const_cast<void *>(extraP->input->gpu_data));
 		OpenCLGPUData *cl_dataP = reinterpret_cast<OpenCLGPUData *>(*gpu_dataH);
 		ReleaseOpenCLData(cl_dataP);
+		BPS_ClearGpuDevice();
 
 		AEFX_SuiteScoper<PF_HandleSuite1> handle_suite =
 			AEFX_SuiteScoper<PF_HandleSuite1>(in_dataP, kPFHandleSuite,
@@ -293,6 +504,7 @@ PF_Err BPS_GPUDeviceSetdown(
 		DirectXGPUData *dx_dataP = reinterpret_cast<DirectXGPUData *>(*gpu_dataH);
 		ReleaseDirectXData(dx_dataP);
 		dx_dataP->~DirectXGPUData();
+		BPS_ClearGpuDevice();
 
 		AEFX_SuiteScoper<PF_HandleSuite1> handle_suite =
 			AEFX_SuiteScoper<PF_HandleSuite1>(in_dataP, kPFHandleSuite,
@@ -302,6 +514,9 @@ PF_Err BPS_GPUDeviceSetdown(
 #endif
 
 	// CUDA: nothing allocated at setup, so nothing to release.
+	if (extraP->input->what_gpu == PF_GPU_Framework_CUDA) {
+		BPS_ClearGpuDevice();
+	}
 	(void)in_dataP; (void)out_dataP; (void)extraP;
 	return err;
 }
@@ -322,6 +537,12 @@ PF_Err BPS_SmartRenderGPU(
 		return PF_Err_UNRECOGNIZED_PARAM_TYPE;
 	}
 
+	const int direction = (paramsP->direction == BPS_DIR_HORIZONTAL) ? 1 : 0;
+	const int lineCount = direction ? output_worldP->height : output_worldP->width;
+	if (lineCount <= 0) {
+		return PF_Err_NONE;
+	}
+
 	AEFX_SuiteScoper<PF_GPUDeviceSuite1> gpu_suite =
 		AEFX_SuiteScoper<PF_GPUDeviceSuite1>(in_data, kPFGPUDeviceSuite,
 											 kPFGPUDeviceSuiteVersion1, out_data);
@@ -336,24 +557,28 @@ PF_Err BPS_SmartRenderGPU(
 	ERR(gpu_suite->GetGPUWorldData(in_data->effect_ref, output_worldP, &dst_mem));
 
 	const int bytes_per_pixel = 16; // float4 BGRA
-	const int width    = input_worldP->width;
-	const int height   = input_worldP->height;
+	const int width    = in_data->width;
+	const int height   = in_data->height;
 	const int srcPitch = input_worldP->rowbytes  / bytes_per_pixel;
 	const int dstPitch = output_worldP->rowbytes / bytes_per_pixel;
-	const int direction = (paramsP->direction == BPS_DIR_HORIZONTAL) ? 1 : 0;
+	const int inputOriginX = input_worldP->origin_x;
+	const int inputOriginY = input_worldP->origin_y;
+	const int outputOriginX = output_worldP->origin_x;
+	const int outputOriginY = output_worldP->origin_y;
+	const int outputWidth = output_worldP->width;
+	const int outputHeight = output_worldP->height;
 	const int ordering  = paramsP->ascending ? 1 : 0;
-	const int lineCount = direction ? height : width;
 
 	if (err) {
 		return err;
 	}
 
-	if (lineCount <= 0) {
-		return PF_Err_NONE;
-	}
-
 #if defined(BPS_HAS_OPENCL)
 	if (extraP->input->what_gpu == PF_GPU_Framework_OPENCL) {
+		// OpenCL kernel arguments are stored on the shared cl_kernel object, so
+		// keep argument setup and enqueue serialised under MFR.
+		std::lock_guard<std::mutex> gpu_render_lock(BPS_GpuRenderMutex());
+
 		PF_Handle gpu_dataH = (PF_Handle)extraP->input->gpu_data;
 		if (!gpu_dataH) {
 			return PF_Err_INTERNAL_STRUCT_DAMAGED;
@@ -370,6 +595,12 @@ PF_Err BPS_SmartRenderGPU(
 		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &dstPitch));
 		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &width));
 		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &height));
+		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &inputOriginX));
+		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &inputOriginY));
+		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &outputOriginX));
+		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &outputOriginY));
+		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &outputWidth));
+		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &outputHeight));
 		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &direction));
 		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &ordering));
 		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &paramsP->thresholdMin));
@@ -386,16 +617,26 @@ PF_Err BPS_SmartRenderGPU(
 										  0,
 										  0,
 										  0));
+		if (!err) {
+			BPS_SetLastRenderUsedGpu(true);
+		}
 		return err;
 	}
 #endif
 
 #if defined(BPS_HAS_CUDA)
 	if (extraP->input->what_gpu == PF_GPU_Framework_CUDA) {
-		BitonicSort_CUDA(src_mem, dst_mem, srcPitch, dstPitch, width, height,
-						 direction, ordering, paramsP->thresholdMin, paramsP->thresholdMax);
-		if (cudaPeekAtLastError() != cudaSuccess) {
+		const cudaError_t cuda_result =
+			BitonicSort_CUDA(src_mem, dst_mem, srcPitch, dstPitch, width, height,
+							 inputOriginX, inputOriginY, outputOriginX, outputOriginY,
+							 outputWidth, outputHeight,
+							 direction, ordering, paramsP->thresholdMin, paramsP->thresholdMax,
+							 device_info.command_queuePV);
+		if (cuda_result != cudaSuccess) {
 			err = PF_Err_INTERNAL_STRUCT_DAMAGED;
+		}
+		if (!err) {
+			BPS_SetLastRenderUsedGpu(true);
 		}
 		return err;
 	}
@@ -403,6 +644,10 @@ PF_Err BPS_SmartRenderGPU(
 
 #if defined(BPS_HAS_HLSL)
 	if (extraP->input->what_gpu == PF_GPU_Framework_DIRECTX) {
+		// DirectXUtils owns one command list/allocator per AE gpu_data handle;
+		// serialise use of that mutable context while leaving CUDA concurrent.
+		std::lock_guard<std::mutex> gpu_render_lock(BPS_GpuRenderMutex());
+
 		PF_Handle gpu_dataH = (PF_Handle)extraP->input->gpu_data;
 		if (!gpu_dataH) {
 			return PF_Err_INTERNAL_STRUCT_DAMAGED;
@@ -414,6 +659,12 @@ PF_Err BPS_SmartRenderGPU(
 			dstPitch,
 			width,
 			height,
+			inputOriginX,
+			inputOriginY,
+			outputOriginX,
+			outputOriginY,
+			outputWidth,
+			outputHeight,
 			direction,
 			ordering,
 			paramsP->thresholdMin,
@@ -433,6 +684,9 @@ PF_Err BPS_SmartRenderGPU(
 			reinterpret_cast<ID3D12Resource *>(src_mem),
 			static_cast<UINT>(input_worldP->height * input_worldP->rowbytes)));
 		BPS_DX_ERR(shader_execution.Execute(static_cast<UINT>(lineCount), 1));
+		if (!err) {
+			BPS_SetLastRenderUsedGpu(true);
+		}
 		return err;
 	}
 #endif

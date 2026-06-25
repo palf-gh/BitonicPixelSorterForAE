@@ -53,6 +53,7 @@
 //-----------------------------------------------------------------------------
 enum {
 	BPS_INPUT = 0,
+	BPS_GPU_STATUS,			// custom UI: GPU acceleration status (read-only)
 	BPS_DIRECTION,			// popup: Horizontal / Vertical
 	BPS_ORDER,				// popup: Ascending / Descending
 	BPS_THRESHOLD_MIN,		// float slider, brightness lower bound (%)
@@ -77,6 +78,11 @@ enum {
 #define BPS_ORDER_DFLT			BPS_ORDER_ASCENDING
 #define BPS_THRESHOLD_MIN_DFLT	40.0	// percent (upstream default 0.4)
 #define BPS_THRESHOLD_MAX_DFLT	60.0	// percent (upstream default 0.6)
+
+// Effect Controls custom UI for the GPU status readout.
+#define BPS_GPU_STATUS_UI_WIDTH		280
+// Two lines at the default Drawbot font size (status label + framework/device).
+#define BPS_GPU_STATUS_UI_HEIGHT	40
 
 //-----------------------------------------------------------------------------
 // Resolved parameters, computed at PreRender and consumed at (Smart)Render.
@@ -119,6 +125,22 @@ PF_Err BPS_SmartRenderGPU(
 	PF_EffectWorld		*output_worldP,
 	PF_SmartRenderExtra	*extraP,
 	const BitonicSorterParams *paramsP);
+
+//-----------------------------------------------------------------------------
+// Custom UI (implemented in BitonicPixelSorter_UI.cpp).
+//-----------------------------------------------------------------------------
+PF_Err BPS_HandleEvent(
+	PF_InData		*in_data,
+	PF_OutData		*out_data,
+	PF_ParamDef		*params[],
+	PF_LayerDef		*output,
+	PF_EventExtra	*event_extra);
+
+PF_Err BPS_UpdateParamsUI(
+	PF_InData		*in_data,
+	PF_OutData		*out_data,
+	PF_ParamDef		*params[],
+	PF_LayerDef		*output);
 
 extern "C" {
 

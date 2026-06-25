@@ -17,6 +17,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+option(BPS_RENDER_DIAG "Enable Bitonic Pixel Sorter render diagnostics" OFF)
+
 set(BPS_DIST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/dist")
 
 #------------------------------------------------------------------------------
@@ -104,7 +106,9 @@ include_directories(
 set(SOURCES
 	Source/BitonicPixelSorter.h
 	Source/BitonicPixelSorter_Target.h
+	Source/BitonicPixelSorter_GpuEligibility.h
 	Source/BitonicPixelSorter.cpp
+	Source/BitonicPixelSorter_UI.cpp
 	Source/BitonicPixelSorter_CPU.cpp
 	Source/BitonicPixelSorter_GPU.cpp
 	vendor/palf/AELocalise.h
@@ -358,6 +362,10 @@ endif()
 #------------------------------------------------------------------------------
 # CUDA backend: define BPS_HAS_CUDA, set architectures, link the CUDA runtime.
 #------------------------------------------------------------------------------
+if(BPS_RENDER_DIAG)
+	target_compile_definitions(${PROJECT_NAME} PRIVATE BPS_RENDER_DIAG=1)
+endif()
+
 if(BPS_CUDA_AVAILABLE)
 	find_package(CUDAToolkit REQUIRED)
 	target_compile_definitions(${PROJECT_NAME} PRIVATE BPS_HAS_CUDA=1)
@@ -388,7 +396,7 @@ endif()
 if(BPS_HLSL_AVAILABLE)
 	add_dependencies(${PROJECT_NAME} ${PROJECT_NAME}_directx_shaders)
 	target_compile_definitions(${PROJECT_NAME} PRIVATE BPS_HAS_HLSL=1)
-	target_link_libraries(${PROJECT_NAME} PRIVATE d3d12 d3dcompiler)
+	target_link_libraries(${PROJECT_NAME} PRIVATE d3d12 d3dcompiler dxgi)
 	add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
 		COMMAND ${CMAKE_COMMAND} -E make_directory
 			"$<TARGET_FILE_DIR:${PROJECT_NAME}>/DirectX_Assets"

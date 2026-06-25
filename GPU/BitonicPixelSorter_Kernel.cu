@@ -17,10 +17,10 @@
 #include <cuda_fp16.h>
 
 // Single configuration covering lines up to 4096 px (the host falls back to CPU
-// beyond that). 256 threads, 16 KiB of shared sort keys.
+// beyond that). 256 threads, 32 KiB of shared sort keys and source indices.
 #define MAX_THREADS 256
 #define MAX_SIZE    4096
-#define MAX_PAIRS   (MAX_SIZE / MAX_THREADS / 2)   // = 8 comparator pairs/thread
+#define BPS_FLOAT_MAX 3.402823466e+38F
 
 __device__ __forceinline__ float bps_brightness(float4 c)
 {
@@ -28,15 +28,27 @@ __device__ __forceinline__ float bps_brightness(float4 c)
 	return __saturatef(0.298912f * c.z + 0.586611f * c.y + 0.114478f * c.x);
 }
 
-__device__ __forceinline__ unsigned int bps_packKey(unsigned int index, float bright)
+__device__ __forceinline__ unsigned int bps_next_pow2(unsigned int value)
 {
-	unsigned int h = __half_as_ushort(__float2half_rn(bright));
-	return (index << 16) | (h & 0xFFFFu);
+	if (value <= 1u) return 1u;
+	value--;
+	value |= value >> 1;
+	value |= value >> 2;
+	value |= value >> 4;
+	value |= value >> 8;
+	value |= value >> 16;
+	return value + 1u;
 }
 
-__device__ __forceinline__ float bps_unpackBrightness(unsigned int packed)
+__device__ __forceinline__ bool bps_before(
+	float keyA,
+	unsigned int indexA,
+	float keyB,
+	unsigned int indexB)
 {
-	return __half2float(__ushort_as_half((unsigned short)(packed & 0xFFFFu)));
+	if (keyA < keyB) return true;
+	if (keyA > keyB) return false;
+	return indexA < indexB;
 }
 
 __global__ void BitonicSortKernel(
@@ -46,258 +58,172 @@ __global__ void BitonicSortKernel(
 	int           dstPitch,
 	int           width,
 	int           height,
+	int           inputOriginX,
+	int           inputOriginY,
+	int           outputOriginX,
+	int           outputOriginY,
+	int           outputWidth,
+	int           outputHeight,
 	int           direction,     // 1 = horizontal (sort along X), 0 = vertical
 	int           ordering,      // 1 = ascending
 	float         thresholdMin,
 	float         thresholdMax)
 {
-	__shared__ unsigned int groupCache[MAX_SIZE];
-	__shared__ unsigned int scanCache[MAX_THREADS];
+	__shared__ float scratchKey[MAX_SIZE];
+	__shared__ unsigned int scratchIndex[MAX_SIZE];
+	// Dedicated span metadata, kept separate from the sort scratch so the load
+	// loop never overwrites it. Thread 0 writes it; a barrier publishes it to
+	// every thread, keeping spanSize/sortSize uniform across the block (the
+	// per-span break and the bitonic-network barriers must stay non-divergent).
+	__shared__ unsigned int s_spanStart;
+	__shared__ unsigned int s_spanEnd;
+	__shared__ unsigned int s_spanSize;
+	__shared__ unsigned int s_sortSize;
 
 	const unsigned int gid  = blockIdx.x;
 	const unsigned int gtid = threadIdx.x;
 
 	const unsigned int size = direction ? (unsigned int)width : (unsigned int)height;
+	const int lineLayer = direction ? (outputOriginY + (int)gid) : (outputOriginX + (int)gid);
+	const int outputAxisStart = direction ? outputOriginX : outputOriginY;
+	const int outputAxisEnd = outputAxisStart + (direction ? outputWidth : outputHeight);
 
-	const unsigned int reducedSize = (size + 1u) >> 1;
-	const unsigned int ops = (reducedSize + MAX_THREADS - 1u) / MAX_THREADS;
-	const unsigned int pairBase = gtid * ops;
+	// Map layer coordinates into AE's possibly partial GPU worlds.
+	#define BPS_SRC_INDEX(pos) ( (unsigned int)(((direction ? (int)(pos) : lineLayer) - inputOriginX) + \
+								((direction ? lineLayer : (int)(pos)) - inputOriginY) * srcPitch) )
+	#define BPS_DST_INDEX(pos) ( (unsigned int)(((direction ? (int)(pos) - outputOriginX : (int)gid)) + \
+								((direction ? (int)gid : (int)(pos) - outputOriginY) * dstPitch)) )
+	#define BPS_SHOULD_WRITE(pos) ((int)(pos) >= outputAxisStart && (int)(pos) < outputAxisEnd)
 
-	// Maps a position along the line to a linear buffer index.
-	#define BPS_SRC_INDEX(pos) ( (direction ? (gid)        : (unsigned int)(pos)) \
-								+ (direction ? (unsigned int)(pos) : (gid)) * (unsigned int)srcPitch )
-
-	// load pixels: build sort keys and an in-threshold mask for this thread's chunk
-	unsigned int rangeMask = 0;
-	{
-		for (unsigned int t = 0; t < ops; t++)
-		{
-			unsigned int xL = (pairBase + t) << 1;
-			unsigned int xR = xL + 1;
-
-			// Guard out-of-line reads: with linear buffers (unlike clamped
-			// textures) reading past the line length would touch other rows or
-			// run off the buffer. xL/xR can exceed `size` for short lines.
-			float brL = (xL < size) ? bps_brightness(srcTex[BPS_SRC_INDEX(xL)]) : 0.0f;
-			float brR = (xR < size) ? bps_brightness(srcTex[BPS_SRC_INDEX(xR)]) : 0.0f;
-
-			bool inL = xL < size && thresholdMin <= brL && brL <= thresholdMax;
-			bool inR = xR < size && thresholdMin <= brR && brR <= thresholdMax;
-
-			rangeMask |= (inL ? 1u : 0u) << (t * 2);
-			rangeMask |= (inR ? 1u : 0u) << (t * 2 + 1);
-
-			groupCache[xL] = bps_packKey(xL, brL);
-			groupCache[xR] = bps_packKey(xR, brR);
+	for (unsigned int pos = gtid; pos < size; pos += MAX_THREADS) {
+		if (BPS_SHOULD_WRITE(pos)) {
+			sortTex[BPS_DST_INDEX(pos)] = srcTex[BPS_SRC_INDEX(pos)];
 		}
 	}
-
-	unsigned int preMeta[MAX_PAIRS];
-
-	// forward pass: resolve the start index of the span containing each pair
-	{
-		unsigned int seed = 0;
-		for (unsigned int t = 0; t < ops; t++)
-		{
-			unsigned int xL = (pairBase + t) << 1;
-			if (!(rangeMask & (1u << (t * 2)))) seed = xL + 1;
-			if (!(rangeMask & (2u << (t * 2)))) seed = xL + 2;
-		}
-
-		scanCache[gtid] = seed;
-		__syncthreads();
-
-		for (unsigned int offset = 1; offset < MAX_THREADS; offset <<= 1)
-		{
-			unsigned int own = scanCache[gtid];
-			unsigned int other = scanCache[max((unsigned int)gtid, offset) - offset];
-			__syncthreads();
-			scanCache[gtid] = max(own, gtid >= offset ? other : 0u);
-			__syncthreads();
-		}
-
-		unsigned int carry = scanCache[max((unsigned int)gtid, 1u) - 1];
-		carry = gtid > 0 ? carry : 0u;
-
-		for (unsigned int t = 0; t < ops; t++)
-		{
-			unsigned int xL = (pairBase + t) << 1;
-			bool inL = (rangeMask & (1u << (t * 2))) != 0;
-			bool inR = (rangeMask & (2u << (t * 2))) != 0;
-
-			unsigned int start;
-			if (inL) {
-				start = carry;
-			} else {
-				carry = xL + 1;
-				start = inR ? carry : xL;
-			}
-			if (!inR) carry = xL + 2;
-
-			preMeta[t] = start << 16;
-		}
-
-		__syncthreads();
-	}
-
-	unsigned int lineLevels;
-
-	// backward pass: resolve the end index of each span and the longest span
-	{
-		unsigned int seed = 0xFFFF;
-		for (unsigned int t = ops; t > 0;)
-		{
-			t--;
-			unsigned int xL = (pairBase + t) << 1;
-			if (!(rangeMask & (2u << (t * 2)))) seed = xL + 1;
-			if (!(rangeMask & (1u << (t * 2)))) seed = xL;
-		}
-
-		scanCache[gtid] = seed;
-		__syncthreads();
-
-		for (unsigned int offset = 1; offset < MAX_THREADS; offset <<= 1)
-		{
-			unsigned int own = scanCache[gtid];
-			unsigned int other = scanCache[min((unsigned int)gtid + offset, (unsigned int)(MAX_THREADS - 1))];
-			__syncthreads();
-			scanCache[gtid] = min(own, (unsigned int)gtid + offset < MAX_THREADS ? other : 0xFFFFu);
-			__syncthreads();
-		}
-
-		unsigned int carry = scanCache[min((unsigned int)gtid + 1, (unsigned int)(MAX_THREADS - 1))];
-		carry = (unsigned int)gtid + 1 < MAX_THREADS ? carry : 0xFFFFu;
-
-		unsigned int maxLen = 1;
-		for (unsigned int t = ops; t > 0;)
-		{
-			t--;
-			unsigned int xL = (pairBase + t) << 1;
-			bool inL = (rangeMask & (1u << (t * 2))) != 0;
-			bool inR = (rangeMask & (2u << (t * 2))) != 0;
-
-			if (!inR) carry = xL + 1;
-
-			unsigned int start = preMeta[t] >> 16;
-			unsigned int end = (inL || inR) ? min(carry, size) - 1 : xL;
-
-			if (!inL) carry = xL;
-
-			unsigned int xSlot = xL + (start & 1);
-			bool valid = end > start && xSlot <= end;
-			start = valid ? start : xSlot;
-			end = valid ? end : xSlot;
-
-			preMeta[t] = (start << 16) | end;
-			maxLen = max(maxLen, end - start + 1);
-		}
-
-		__syncthreads();
-
-		scanCache[gtid] = maxLen;
-		__syncthreads();
-
-		for (unsigned int offset = MAX_THREADS >> 1; offset > 0; offset >>= 1)
-		{
-			if (gtid < offset) scanCache[gtid] = max(scanCache[gtid], scanCache[gtid + offset]);
-			__syncthreads();
-		}
-
-		maxLen = scanCache[0];
-
-		lineLevels = maxLen <= 1 ? 0 : (unsigned int)(31 - __clz((int)maxLen)) + 1;
-	}
-
-	for (unsigned int phase = 0; (phase & 0xFFFF) < lineLevels; phase++)
-	{
-		for (phase = (phase << 16) + (phase & 0xFFFF); (unsigned int)(phase >> 16) <= 0x7FFF; phase -= (1 << 16))
-		{
-			__syncthreads();
-
-			for (unsigned int t = 0; t < ops; t++)
-			{
-				unsigned int metaPacked = preMeta[t];
-				unsigned int rangeStart = metaPacked >> 16;
-				unsigned int rangeEnd = metaPacked & 0xFFFF;
-
-				unsigned int x = (pairBase + t) << 1;
-
-				unsigned int useR = rangeStart & 1;
-				unsigned int posInRange = x - rangeStart + useR;
-				unsigned int swapIndex = posInRange >> 1;
-				unsigned int comparatorSize = 1u << (phase >> 16);
-				unsigned int a = rangeStart + (swapIndex & (comparatorSize - 1))
-					+ (swapIndex >> (phase >> 16)) * (comparatorSize << 1);
-
-				unsigned int b = a + comparatorSize;
-
-				b = b <= rangeEnd ? b : a;
-
-				unsigned int block = posInRange >> 1 >> (phase >> 16);
-				unsigned int n = rangeEnd - rangeStart + 1;
-				unsigned int endBlock = n >> ((phase >> 16) + 1);
-				bool ascPattern = ((endBlock & 1) == 0) == (ordering != 0);
-				bool asc = ((block & 1) == 0) == ascPattern;
-
-				unsigned int val_a = groupCache[a];
-				unsigned int val_b = groupCache[b];
-
-				float br_a = bps_unpackBrightness(val_a);
-				float br_b = bps_unpackBrightness(val_b);
-
-				bool comp = br_a < br_b;
-
-				unsigned int left = (asc == comp) ? val_a : val_b;
-				unsigned int right = (asc == comp) ? val_b : val_a;
-
-				groupCache[a] = left;
-				groupCache[b] = right;
-			}
-		}
-	}
-
 	__syncthreads();
 
-	#define BPS_DST_INDEX(pos) ( (direction ? (gid)        : (unsigned int)(pos)) \
-								+ (direction ? (unsigned int)(pos) : (gid)) * (unsigned int)dstPitch )
+	unsigned int cursor = 0;
+	while (cursor < size) {
+		if (gtid == 0) {
+			unsigned int spanStart = cursor;
+			while (spanStart < size) {
+				float br = bps_brightness(srcTex[BPS_SRC_INDEX(spanStart)]);
+				if (thresholdMin <= br && br <= thresholdMax) break;
+				spanStart++;
+			}
 
-	for (unsigned int t = 0; t < ops; t++)
-	{
-		unsigned int xL = (pairBase + t) << 1;
-		unsigned int xR = xL + 1;
+			unsigned int spanEnd = spanStart;
+			while (spanEnd < size) {
+				float br = bps_brightness(srcTex[BPS_SRC_INDEX(spanEnd)]);
+				if (br < thresholdMin || br > thresholdMax) break;
+				spanEnd++;
+			}
 
-		unsigned int idx_left  = groupCache[xL] >> 16;
-		unsigned int idx_right = groupCache[xR] >> 16;
+			const unsigned int spanSize = spanEnd - spanStart;
+			s_spanStart = spanStart;
+			s_spanEnd = spanEnd;
+			s_spanSize = spanSize;
+			s_sortSize = bps_next_pow2(spanSize);
+		}
+		__syncthreads();
 
-		if (xL < size) sortTex[BPS_DST_INDEX(xL)] = srcTex[BPS_SRC_INDEX(idx_left)];
-		if (xR < size) sortTex[BPS_DST_INDEX(xR)] = srcTex[BPS_SRC_INDEX(idx_right)];
+		const unsigned int spanStart = s_spanStart;
+		const unsigned int spanEnd = s_spanEnd;
+		const unsigned int spanSize = s_spanSize;
+		const unsigned int sortSize = s_sortSize;
+
+		if (spanStart >= size || spanSize == 0u) {
+			break;
+		}
+
+		const bool ascending = ordering != 0;
+		for (unsigned int i = gtid; i < sortSize; i += MAX_THREADS) {
+			if (i < spanSize) {
+				const unsigned int pos = spanStart + i;
+				scratchKey[i] = bps_brightness(srcTex[BPS_SRC_INDEX(pos)]);
+				scratchIndex[i] = pos;
+			} else {
+				scratchKey[i] = ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX;
+				scratchIndex[i] = 0xFFFFFFFFu;
+			}
+		}
+		__syncthreads();
+
+		for (unsigned int k = 2u; k <= sortSize; k <<= 1) {
+			for (unsigned int j = k >> 1; j > 0u; j >>= 1) {
+				for (unsigned int i = gtid; i < sortSize; i += MAX_THREADS) {
+					const unsigned int partner = i ^ j;
+					if (partner > i) {
+						bool stageAscending = (i & k) == 0u;
+						if (!ascending) stageAscending = !stageAscending;
+
+						const float keyA = scratchKey[i];
+						const float keyB = scratchKey[partner];
+						const unsigned int indexA = scratchIndex[i];
+						const unsigned int indexB = scratchIndex[partner];
+						const bool before = bps_before(keyA, indexA, keyB, indexB);
+						if (before != stageAscending) {
+							scratchKey[i] = keyB;
+							scratchKey[partner] = keyA;
+							scratchIndex[i] = indexB;
+							scratchIndex[partner] = indexA;
+						}
+					}
+				}
+				__syncthreads();
+			}
+		}
+
+		for (unsigned int i = gtid; i < spanSize; i += MAX_THREADS) {
+			const unsigned int pos = spanStart + i;
+			if (BPS_SHOULD_WRITE(pos)) {
+				sortTex[BPS_DST_INDEX(pos)] = srcTex[BPS_SRC_INDEX(scratchIndex[i])];
+			}
+		}
+		__syncthreads();
+
+		cursor = spanEnd + 1u;
 	}
 
 	#undef BPS_SRC_INDEX
 	#undef BPS_DST_INDEX
+	#undef BPS_SHOULD_WRITE
 }
 
 // Host launch wrapper, called from SmartRenderGPU (BitonicPixelSorter_GPU.cpp).
 // extern "C" to keep a stable, unmangled symbol across the nvcc/MSVC boundary.
-extern "C" void BitonicSort_CUDA(
+extern "C" cudaError_t BitonicSort_CUDA(
 	const void *src,
 	void       *dst,
 	int         srcPitch,
 	int         dstPitch,
 	int         width,
 	int         height,
+	int         inputOriginX,
+	int         inputOriginY,
+	int         outputOriginX,
+	int         outputOriginY,
+	int         outputWidth,
+	int         outputHeight,
 	int         direction,
 	int         ordering,
 	float       thresholdMin,
-	float       thresholdMax)
+	float       thresholdMax,
+	void       *streamPV)
 {
-	const int lineCount = direction ? height : width;
-	if (lineCount <= 0) return;
+	const int lineCount = direction ? outputHeight : outputWidth;
+	if (lineCount <= 0) return cudaSuccess;
 
-	BitonicSortKernel<<<lineCount, MAX_THREADS>>>(
+	cudaStream_t stream = reinterpret_cast<cudaStream_t>(streamPV);
+	BitonicSortKernel<<<lineCount, MAX_THREADS, 0, stream>>>(
 		(const float4 *)src, (float4 *)dst,
 		srcPitch, dstPitch, width, height,
+		inputOriginX, inputOriginY, outputOriginX, outputOriginY, outputWidth, outputHeight,
 		direction, ordering, thresholdMin, thresholdMax);
 
-	cudaDeviceSynchronize();
+	cudaError_t launch_result = cudaPeekAtLastError();
+	if (launch_result != cudaSuccess) {
+		return launch_result;
+	}
+	return cudaStreamSynchronize(stream);
 }

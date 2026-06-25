@@ -21,6 +21,18 @@ inline const char *GetString(LocKey::Key key) {
     return "Threshold Min";
   case LocKey::STR_THRESHOLD_MAX:
     return "Threshold Max";
+  case LocKey::STR_GPU_STATUS_NAME:
+    return "GPU Acceleration";
+  case LocKey::STR_GPU_STATUS_ACTIVE:
+    return "GPU: Active";
+  case LocKey::STR_GPU_STATUS_NO_BACKEND:
+    return "GPU: Unavailable (no GPU backend)";
+  case LocKey::STR_GPU_STATUS_HOST:
+    return "GPU: Unavailable (host)";
+  case LocKey::STR_GPU_STATUS_AXIS_TOO_LONG:
+    return "GPU: CPU fallback (image too large)";
+  case LocKey::STR_GPU_STATUS_HOST_INACTIVE:
+    return "GPU: Inactive (enable Mercury GPU in Project Settings)";
   default:
     return "";
   }
