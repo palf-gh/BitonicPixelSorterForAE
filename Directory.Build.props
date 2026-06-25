@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <!--
+    This repository sits inside the After Effects SDK 'Examples' tree, whose
+    Examples/Directory.Build.targets requires AE_PLUGIN_BUILD_DIR to be set for
+    any MSBuild/.vcxproj build (including the CMake-generated projects).
+
+    We provide a self-contained default here so the project builds with no extra
+    environment setup. The actual .aex output path is controlled by CMakeLists.txt;
+    this value only satisfies the SDK guard. Override it (env var or -D) to copy
+    .aex files straight into your After Effects plug-ins folder.
+  -->
+  <PropertyGroup>
+    <AE_PLUGIN_BUILD_DIR Condition="'$(AE_PLUGIN_BUILD_DIR)' == '' and '$(Configuration)' == 'Debug'">$(MSBuildThisFileDirectory)output\Win\Debug</AE_PLUGIN_BUILD_DIR>
+    <AE_PLUGIN_BUILD_DIR Condition="'$(AE_PLUGIN_BUILD_DIR)' == '' and '$(Configuration)' == 'Release'">$(MSBuildThisFileDirectory)output\Win\Release</AE_PLUGIN_BUILD_DIR>
+    <AE_PLUGIN_BUILD_DIR Condition="'$(AE_PLUGIN_BUILD_DIR)' == ''">$(MSBuildThisFileDirectory)output\Win\Debug</AE_PLUGIN_BUILD_DIR>
+  </PropertyGroup>
+</Project>
