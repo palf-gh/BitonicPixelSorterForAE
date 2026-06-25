@@ -49,6 +49,26 @@ inline T *PixelAt(PF_EffectWorld *worldP, A_long x, A_long y) {
 }
 
 template <typename T>
+inline T *PixelAtLayer(PF_EffectWorld *worldP, A_long layerX, A_long layerY) {
+	return PixelAt<T>(worldP, layerX - worldP->origin_x, layerY - worldP->origin_y);
+}
+
+inline bool ContainsLayerPoint(const PF_EffectWorld *worldP, A_long layerX, A_long layerY) {
+	return layerX >= worldP->origin_x &&
+		   layerY >= worldP->origin_y &&
+		   layerX < worldP->origin_x + worldP->width &&
+		   layerY < worldP->origin_y + worldP->height;
+}
+
+inline A_long MaxLong(A_long a, A_long b) {
+	return a > b ? a : b;
+}
+
+inline A_long MinLong(A_long a, A_long b) {
+	return a < b ? a : b;
+}
+
+template <typename T>
 struct Entry {
 	float	key;
 	T		pix;
@@ -56,13 +76,14 @@ struct Entry {
 
 // Sort each contiguous in-threshold span of every line by brightness.
 //
-// Lines are rows when sorting horizontally and columns when sorting vertically.
-// Phase 1 assumes the input world covers the full frame and the output world is
-// the full frame aligned at the origin (PreRender requests the full input and
-// reports a full result rect). Reads are bounds-checked against the input world.
+// Lines are rows when sorting horizontally and columns when sorting vertically;
+// AE may hand Smart Render smaller worlds, so layer-coordinate origins must be
+// honoured for both input dependency data and output writes.
 template <typename T>
 static void SortLines(PF_EffectWorld *inP, PF_EffectWorld *outP,
-					  const BitonicSorterParams &prm) {
+					  const BitonicSorterParams &prm,
+					  A_long frameW,
+					  A_long frameH) {
 	const bool	horizontal = (prm.direction == BPS_DIR_HORIZONTAL);
 	const bool	ascending  = (prm.ascending != 0);
 	const float	tmin = prm.thresholdMin;
@@ -70,48 +91,57 @@ static void SortLines(PF_EffectWorld *inP, PF_EffectWorld *outP,
 
 	const A_long outW = outP->width;
 	const A_long outH = outP->height;
-	const A_long inW  = inP->width;
-	const A_long inH  = inP->height;
+	const A_long outLeft = outP->origin_x;
+	const A_long outTop = outP->origin_y;
+	const A_long outRight = outLeft + outW;
+	const A_long outBottom = outTop + outH;
 
-	const A_long lineCount = horizontal ? outH : outW;
-	const A_long lineLen   = horizontal ? outW : outH;
+	const A_long lineStart = horizontal ? MaxLong(0, outTop)
+										: MaxLong(0, outLeft);
+	const A_long lineEnd = horizontal ? MinLong(frameH, outBottom)
+									  : MinLong(frameW, outRight);
+	const A_long lineLen = horizontal ? frameW : frameH;
 
+	std::vector<T> sortedLine(static_cast<size_t>(lineLen));
+	std::vector<bool> validLine(static_cast<size_t>(lineLen));
 	std::vector<Entry<T>> run;
 	run.reserve(static_cast<size_t>(lineLen));
 
-	for (A_long line = 0; line < lineCount; ++line) {
+	for (A_long line = lineStart; line < lineEnd; ++line) {
 		// Map line position k -> (x, y) for both orientations.
 		auto coord = [&](A_long k, A_long &x, A_long &y) {
 			if (horizontal) { x = k; y = line; }
 			else            { x = line; y = k; }
 		};
 
-		// Pass-through copy first; spans overwrite with sorted order below.
+		// Snapshot the whole input dependency line first; spans overwrite this
+		// local line buffer before the requested output sub-rectangle is written.
 		for (A_long k = 0; k < lineLen; ++k) {
 			A_long x, y;
 			coord(k, x, y);
-			if (x < inW && y < inH) {
-				*PixelAt<T>(outP, x, y) = *PixelAt<T>(inP, x, y);
+			if (ContainsLayerPoint(inP, x, y)) {
+				sortedLine[static_cast<size_t>(k)] = *PixelAtLayer<T>(inP, x, y);
+				validLine[static_cast<size_t>(k)] = true;
+			} else {
+				sortedLine[static_cast<size_t>(k)] = T{};
+				validLine[static_cast<size_t>(k)] = false;
 			}
 		}
 
 		A_long k = 0;
 		while (k < lineLen) {
-			A_long x, y;
-			coord(k, x, y);
-			const bool inBounds = (x < inW && y < inH);
-			float br = inBounds ? BrightnessUnit(*PixelAt<T>(inP, x, y)) : -1.0f;
+			const bool inBounds = validLine[static_cast<size_t>(k)];
+			float br = inBounds ? BrightnessUnit(sortedLine[static_cast<size_t>(k)]) : -1.0f;
 
 			if (inBounds && br >= tmin && br <= tmax) {
 				const A_long start = k;
 				run.clear();
 				while (k < lineLen) {
-					coord(k, x, y);
-					if (!(x < inW && y < inH)) break;
-					T *src = PixelAt<T>(inP, x, y);
-					float b = BrightnessUnit(*src);
+					if (!validLine[static_cast<size_t>(k)]) break;
+					T src = sortedLine[static_cast<size_t>(k)];
+					float b = BrightnessUnit(src);
 					if (b < tmin || b > tmax) break;
-					run.push_back(Entry<T>{b, *src});
+					run.push_back(Entry<T>{b, src});
 					++k;
 				}
 
@@ -124,12 +154,18 @@ static void SortLines(PF_EffectWorld *inP, PF_EffectWorld *outP,
 				}
 
 				for (size_t i = 0; i < run.size(); ++i) {
-					A_long ox, oy;
-					coord(start + static_cast<A_long>(i), ox, oy);
-					*PixelAt<T>(outP, ox, oy) = run[i].pix;
+					sortedLine[static_cast<size_t>(start) + i] = run[i].pix;
 				}
 			} else {
 				++k;
+			}
+		}
+
+		for (A_long k = 0; k < lineLen; ++k) {
+			A_long x, y;
+			coord(k, x, y);
+			if (ContainsLayerPoint(outP, x, y)) {
+				*PixelAtLayer<T>(outP, x, y) = sortedLine[static_cast<size_t>(k)];
 			}
 		}
 	}
@@ -151,13 +187,16 @@ PF_Err BPS_SortImageCPU(
 
 	switch (pixel_format) {
 	case PF_PixelFormat_ARGB128:
-		SortLines<PF_PixelFloat>(input_worldP, output_worldP, *paramsP);
+		SortLines<PF_PixelFloat>(input_worldP, output_worldP, *paramsP,
+								  in_data->width, in_data->height);
 		break;
 	case PF_PixelFormat_ARGB64:
-		SortLines<PF_Pixel16>(input_worldP, output_worldP, *paramsP);
+		SortLines<PF_Pixel16>(input_worldP, output_worldP, *paramsP,
+							   in_data->width, in_data->height);
 		break;
 	case PF_PixelFormat_ARGB32:
-		SortLines<PF_Pixel8>(input_worldP, output_worldP, *paramsP);
+		SortLines<PF_Pixel8>(input_worldP, output_worldP, *paramsP,
+							  in_data->width, in_data->height);
 		break;
 	default:
 		return PF_Err_BAD_CALLBACK_PARAM;

@@ -24,6 +24,52 @@
 #include "Localise/Strings_ko_KR.h"
 #include "vendor/palf/AELocalise.h"
 
+namespace {
+
+static A_long
+ClampLong(A_long value, A_long lo, A_long hi)
+{
+	return value < lo ? lo : (value > hi ? hi : value);
+}
+
+static PF_LRect
+FrameRect(const PF_InData *in_data)
+{
+	PF_LRect rect;
+	rect.left = 0;
+	rect.top = 0;
+	rect.right = in_data->width;
+	rect.bottom = in_data->height;
+	return rect;
+}
+
+static PF_LRect
+ClipRectToFrame(PF_LRect rect, const PF_InData *in_data)
+{
+	rect.left = ClampLong(rect.left, 0, in_data->width);
+	rect.right = ClampLong(rect.right, 0, in_data->width);
+	rect.top = ClampLong(rect.top, 0, in_data->height);
+	rect.bottom = ClampLong(rect.bottom, 0, in_data->height);
+	if (rect.right < rect.left) {
+		rect.right = rect.left;
+	}
+	if (rect.bottom < rect.top) {
+		rect.bottom = rect.top;
+	}
+	return rect;
+}
+
+static bool
+IsFullFrameRequest(const PF_LRect &rect, const PF_InData *in_data)
+{
+	return rect.left <= 0 &&
+		   rect.top <= 0 &&
+		   rect.right >= in_data->width &&
+		   rect.bottom >= in_data->height;
+}
+
+} // namespace
+
 //-----------------------------------------------------------------------------
 static PF_Err
 About(
@@ -48,17 +94,6 @@ GlobalSetup(
 	out_data->my_version	= BPS_VERSION_PACKED;
 	out_data->out_flags		= OUT_FLAGS;
 	out_data->out_flags2	= OUT_FLAGS2;
-
-#if defined(BPS_GPU_ENABLED)
-	// Advertise GPU rendering for non-Premiere hosts (After Effects). Premiere
-	// uses its own pixel-format negotiation and is not targeted here.
-	if (in_data->appl_id != 'PrMr') {
-		out_data->out_flags2 |= PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
-	#if defined(BPS_HAS_HLSL)
-		out_data->out_flags2 |= PF_OutFlag2_SUPPORTS_DIRECTX_RENDERING;
-	#endif
-	}
-#endif
 
 	return PF_Err_NONE;
 }
@@ -132,6 +167,7 @@ PreRender(
 	PF_Err				err = PF_Err_NONE;
 	PF_CheckoutResult	in_result;
 	PF_RenderRequest	req = extraP->input->output_request;
+	PF_LRect			output_rect = ClipRectToFrame(req.rect, in_data);
 
 	BitonicSorterParams *infoP = new (std::nothrow) BitonicSorterParams();
 	if (!infoP) {
@@ -164,21 +200,28 @@ PreRender(
 	{
 		// The GPU bitonic sort runs a whole line in group-shared memory, so only
 		// offer the GPU path when the sort-axis length is within the limit;
-		// otherwise After Effects falls back to the (unlimited) CPU path.
+		// otherwise After Effects falls back to the (unlimited) CPU path. The
+		// current GPU kernels also assume a full-frame output request.
 		A_long sortAxisLen = (infoP->direction == BPS_DIR_HORIZONTAL)
 								  ? in_data->width : in_data->height;
-		if (sortAxisLen <= BPS_GPU_MAX_LINE) {
+		if (sortAxisLen <= BPS_GPU_MAX_LINE &&
+			IsFullFrameRequest(output_rect, in_data)) {
 			extraP->output->flags |= PF_RenderOutputFlag_GPU_RENDER_POSSIBLE;
 		}
 	}
 #endif
 
-	// Pixel sorting needs whole lines, so request the full input frame rather
-	// than just the requested output band.
-	req.rect.left	= 0;
-	req.rect.top	= 0;
-	req.rect.right	= in_data->width;
-	req.rect.bottom	= in_data->height;
+	// Pixel sorting needs the complete sort axis for each requested output
+	// pixel. Expand only the dependency axis, while keeping the produced result
+	// within AE's requested output rectangle.
+	req.rect = output_rect;
+	if (infoP->direction == BPS_DIR_HORIZONTAL) {
+		req.rect.left = 0;
+		req.rect.right = in_data->width;
+	} else {
+		req.rect.top = 0;
+		req.rect.bottom = in_data->height;
+	}
 
 	ERR(extraP->cb->checkout_layer(in_data->effect_ref,
 								   BPS_INPUT,
@@ -190,8 +233,8 @@ PreRender(
 								   &in_result));
 
 	if (!err) {
-		UnionLRect(&in_result.result_rect,     &extraP->output->result_rect);
-		UnionLRect(&in_result.max_result_rect, &extraP->output->max_result_rect);
+		extraP->output->result_rect = output_rect;
+		extraP->output->max_result_rect = FrameRect(in_data);
 
 		extraP->output->pre_render_data = infoP;
 		extraP->output->delete_pre_render_data_func = DisposePreRenderData;

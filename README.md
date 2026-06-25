@@ -151,7 +151,8 @@ Still pending:
 - After Effects in-host CPU/GPU visual parity validation.
 - macOS `.plugin` build and host validation on real Mac hardware.
 - Metal backend implementation.
-- Hardening for large-frame tiling and AE render banding edge cases.
+- GPU hardening for partial Smart Render output rectangles and large-frame
+  tiling edge cases.
 
 ## Licence And Attribution
 

@@ -33,14 +33,15 @@ sample).
 
 ```
 EffectMain dispatch
-├─ GLOBAL_SETUP        out_flags2 |= SMART_RENDER | FLOAT_COLOR_AWARE | THREADED
-│                      (+ for non-Premiere: SUPPORTS_GPU_RENDER_F32 [+ DIRECTX])
+├─ GLOBAL_SETUP        out_flags/out_flags2 from shared Target header
+│                      (PiPL and C++ must match exactly)
 ├─ PARAMS_SETUP        4 params, names via AELocalise (EN/JA/ZH/KO)
 ├─ GPU_DEVICE_SETUP    per-framework kernel load (CUDA: none; OpenCL/Metal: build
 │                      from embedded source; DirectX: load .cso + root signature)
 ├─ GPU_DEVICE_SETDOWN  release kernels / handles
-├─ SMART_PRE_RENDER    checkout params -> pre_render_data; request FULL input
-│                      frame; set GPU_RENDER_POSSIBLE
+├─ SMART_PRE_RENDER    checkout params -> pre_render_data; expand input
+│                      dependency along the sort axis only; result_rect stays
+│                      within AE's requested output rect
 └─ SMART_RENDER        checkout input/output; GetPixelFormat
    ├─ isGPU  -> SmartRenderGPU  (BGRA128 linear buffers; CUDA/OpenCL/Metal/DX)
    └─ else   -> SmartRenderCPU  (8/16/32-bit; std::stable_sort per span)
@@ -56,6 +57,10 @@ Key facts that shape the port:
   memory, capping the sort-axis length at 2048 (default) / 4096 (`BPS_SIZE_4096`
   variant). When the sort-axis length > 4096, the GPU path must fall back to CPU.
 - **Not pixel-independent**: `PF_OutFlag_PIX_INDEPENDENT` must stay off.
+- **Not currently threaded-render advertised**: the CPU path is origin-aware, but
+  the GPU kernels still assume a full-frame output request. Keep
+  `PF_OutFlag2_SUPPORTS_THREADED_RENDERING` off until GPU band handling is
+  explicit.
 
 ## 3. Toolchain reality (this machine, 2026-06-26)
 
@@ -83,8 +88,10 @@ Self-contained scaffold, PiPL, params + CJK/EN localisation, CPU pixel sort
    HAS_HLSL/HAS_METAL`; declare the GPU-data struct and `BitonicSorterParams`
    GPU mirror (POD with pitch/size/threshold/flags).
 2. `BitonicPixelSorter_Target.h`/`GlobalSetup`: advertise
-   `PF_OutFlag2_SUPPORTS_GPU_RENDER_F32` (and `…_DIRECTX_RENDERING` once DX lands)
-   for non-Premiere hosts.
+   `PF_OutFlag2_SUPPORTS_GPU_RENDER_F32` and `…_DIRECTX_RENDERING` through the
+   shared Target header. CMake must pass the same `BPS_HAS_*` backend defines to
+   the PiPL preprocessing step; AE rejects plug-ins whose PiPL flags differ from
+   `GlobalSetup`.
 3. `EffectMain`: handle `PF_Cmd_GPU_DEVICE_SETUP`, `…_SETDOWN`,
    `…_SMART_RENDER_GPU`.
 4. `Source/BitonicPixelSorter_GPU.cpp` (new): `GPUDeviceSetup` / `GPUDeviceSetdown`
@@ -224,7 +231,7 @@ The CPU build needs none of the above.
     `31-__clz` for `firstbithigh`; guarded out-of-line reads for buffer safety).
   - `Source/BitonicPixelSorter_GPU.cpp` — `BPS_GPUDeviceSetup/Setdown` (CUDA: no
     compile) and `BPS_SmartRenderGPU` (BGRA128, `PF_GPUDeviceSuite1`, single pass).
-  - Wired into `GlobalSetup` (advertise `SUPPORTS_GPU_RENDER_F32` for non-Premiere),
+  - Wired into `GlobalSetup` (shared Target-header outflags),
     `PreRender` (set `GPU_RENDER_POSSIBLE` only when sort axis ≤ 4096), `SmartRender`
     (GPU/CPU split) and `EffectMain` (GPU_DEVICE_SETUP/SETDOWN/SMART_RENDER_GPU).
   - CMake: optional CUDA via `check_language(CUDA)`/`enable_language(CUDA)`,
@@ -270,5 +277,21 @@ The CPU build needs none of the above.
     `--config Debug` both succeeded with CUDA + OpenCL + DirectX enabled.
     Release produced `DirectX_Assets/BitonicSortKernel.cso` and `.rs`; `dumpbin
     /exports` still shows `EffectMain` and `PluginDataEntryFunction2`.
+- 2026-06-26: AE host-load contract fixes after in-host error screenshots:
+  - Fixed PiPL / `GlobalSetup` outflags mismatch by deriving `OUT_FLAGS2` from
+    the same Target header for both C++ and PiPL preprocessing. With CUDA +
+    OpenCL + DirectX enabled, PiPL now emits `570430464` (`0x22001400`), matching
+    SmartRender + float + GPU F32 + DirectX and excluding threaded rendering.
+  - Removed runtime-only GPU flag mutation from `GlobalSetup`; backend defines
+    are now passed by CMake to Windows PiPL preprocessing and macOS Rez
+    preprocessing.
+  - Fixed `PF_Cmd_SMART_PRE_RENDER` result-rectangle contract: input checkout
+    expands only along the required sort axis, while `result_rect` remains within
+    AE's requested output rectangle and `max_result_rect` reports the full frame.
+  - Made the CPU renderer honour Smart Render world `origin_x`/`origin_y`, so
+    partial output worlds map correctly back to layer coordinates.
+  - GPU rendering is now advertised only for full-frame output requests; partial
+    Smart Render requests use the origin-aware CPU path until GPU band support is
+    implemented.
 - Phases 5–8 (Metal, pipeline hardening, validation, robustness) pending. AE
   in-host CPU/GPU parity validation is still pending.

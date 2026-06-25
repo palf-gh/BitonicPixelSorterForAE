@@ -13,6 +13,9 @@
 #   BPS_PIPL_BINARY_DIR  build dir
 # Optional:
 #   BPS_PIPL_DEBUG       if set, defines _DEBUG / BPS_DEBUG_BUILD
+#   BPS_PIPL_HAS_CUDA    if set, defines BPS_HAS_CUDA for PiPL flag parity
+#   BPS_PIPL_HAS_OPENCL  if set, defines BPS_HAS_OPENCL for PiPL flag parity
+#   BPS_PIPL_HAS_HLSL    if set, defines BPS_HAS_HLSL for PiPL flag parity
 
 if(NOT DEFINED BPS_PIPL_COMPILER OR NOT DEFINED BPS_PIPL_OUTPUT OR NOT DEFINED BPS_PIPL_SOURCE)
 	message(FATAL_ERROR "preprocess_pipl_win.cmake requires BPS_PIPL_COMPILER, BPS_PIPL_OUTPUT, BPS_PIPL_SOURCE")
@@ -32,6 +35,15 @@ set(_args
 )
 if(BPS_PIPL_DEBUG)
 	list(APPEND _args /D "_DEBUG" /D "BPS_DEBUG_BUILD=1")
+endif()
+if(BPS_PIPL_HAS_CUDA)
+	list(APPEND _args /D "BPS_HAS_CUDA=1")
+endif()
+if(BPS_PIPL_HAS_OPENCL)
+	list(APPEND _args /D "BPS_HAS_OPENCL=1")
+endif()
+if(BPS_PIPL_HAS_HLSL)
+	list(APPEND _args /D "BPS_HAS_HLSL=1")
 endif()
 list(APPEND _args "${BPS_PIPL_SOURCE}")
 
