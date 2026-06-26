@@ -220,20 +220,20 @@ BPS_DrawGpuStatus(
 			drawbot_colour.red = 0.9f;
 			drawbot_colour.green = 0.1f;
 			drawbot_colour.blue = 0.1f;
-			line1_text = AELocalise::GetStringForAE(
+			line1_text = AELocalise::GetStringUTF8(
 				BPS_GpuStatusLocKey(eligibility.reason), in_data);
 		} else if (last_render_used_gpu) {
 			drawbot_colour.red = 0.0f;
 			drawbot_colour.green = 0.8f;
 			drawbot_colour.blue = 0.0f;
-			line1_text = AELocalise::GetStringForAE(LocKey::STR_GPU_STATUS_ACTIVE, in_data);
+			line1_text = AELocalise::GetStringUTF8(LocKey::STR_GPU_STATUS_ACTIVE, in_data);
 			line2_text = BPS_BuildGpuDetailLine();
 			draw_second_line = !line2_text.empty();
 		} else {
 			drawbot_colour.red = 0.9f;
 			drawbot_colour.green = 0.1f;
 			drawbot_colour.blue = 0.1f;
-			line1_text = AELocalise::GetStringForAE(
+			line1_text = AELocalise::GetStringUTF8(
 				LocKey::STR_GPU_STATUS_HOST_INACTIVE, in_data);
 		}
 		drawbot_colour.alpha = 1.0f;

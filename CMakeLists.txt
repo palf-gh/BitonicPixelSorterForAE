@@ -10,6 +10,15 @@
 # Optionally install the built .aex/.plugin straight into an AE plug-ins folder:
 #   cmake -S . -B build -DBPS_AE_PLUGIN_DIR="C:/Program Files/Adobe/Common/Plug-ins/7.0/MediaCore"
 
+# Pin the macOS deployment target so the plugin loads on a broad range of
+# macOS versions. Without this, CMake defaults minos to the build machine's
+# current OS (e.g. macOS 26 on a beta host), which makes dyld refuse to load the
+# plugin on any older macOS — including the macOS that older After Effects
+# releases run on. 11.0 (Big Sur) is the arm64 floor and covers AE 2022+.
+if(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
+	set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS deployment version" FORCE)
+endif()
+
 cmake_minimum_required(VERSION 3.18)
 project(BitonicPixelSorter LANGUAGES C CXX)
 
@@ -18,6 +27,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(BPS_RENDER_DIAG "Enable Bitonic Pixel Sorter render diagnostics" OFF)
+# Diagnostic / compatibility switch: build a pure CPU plugin with every GPU
+# backend (CUDA/OpenCL/DirectX/Metal) disabled, so the PiPL advertises no GPU
+# support and the binary links no GPU frameworks. Useful for isolating whether a
+# host's failure to load the effect is related to GPU advertising.
+option(BPS_FORCE_CPU_ONLY "Disable all GPU backends (pure CPU build)" OFF)
 
 set(BPS_DIST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/dist")
 
@@ -205,6 +219,56 @@ if(BPS_HLSL_AVAILABLE)
 			"${BPS_DIRECTX_RS_HEADER}")
 endif()
 
+#------------------------------------------------------------------------------
+# Metal backend (macOS only). Metal.framework is always present on macOS so we
+# only need find_library to locate it; Python3 is already required by OpenCL.
+#------------------------------------------------------------------------------
+if(APPLE)
+	find_library(METAL_LIBRARY Metal)
+	find_library(FOUNDATION_LIBRARY Foundation)
+	if(METAL_LIBRARY AND FOUNDATION_LIBRARY AND Python3_Interpreter_FOUND)
+		set(BPS_METAL_AVAILABLE TRUE)
+		message(STATUS "BitonicPixelSorter: Metal enabled")
+	else()
+		set(BPS_METAL_AVAILABLE FALSE)
+		if(NOT Python3_Interpreter_FOUND)
+			message(STATUS "BitonicPixelSorter: Python3 missing — Metal disabled")
+		else()
+			message(STATUS "BitonicPixelSorter: Metal.framework not found — Metal disabled")
+		endif()
+	endif()
+else()
+	set(BPS_METAL_AVAILABLE FALSE)
+endif()
+
+if(BPS_METAL_AVAILABLE)
+	set(BPS_METAL_KERNEL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/GPU/BitonicPixelSorter_Kernel.metal")
+	set(BPS_METAL_KERNEL_HEADER "${BPS_GENERATED_DIR}/BitonicPixelSorter_Kernel.metal.h")
+	add_custom_command(
+		OUTPUT "${BPS_METAL_KERNEL_HEADER}"
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${BPS_GENERATED_DIR}"
+		COMMAND "${Python3_EXECUTABLE}"
+			"${AESDK_ROOT}/GPUUtils/CreateCString.py"
+			-i "${BPS_METAL_KERNEL_SOURCE}"
+			-o "${BPS_METAL_KERNEL_HEADER}"
+			-n kBitonicPixelSorter_Kernel_MetalString
+		DEPENDS "${BPS_METAL_KERNEL_SOURCE}" "${AESDK_ROOT}/GPUUtils/CreateCString.py"
+		COMMENT "Embedding Metal kernel source..."
+		VERBATIM)
+	list(APPEND SOURCES "${BPS_METAL_KERNEL_HEADER}")
+	list(APPEND SOURCES
+		"${CMAKE_CURRENT_SOURCE_DIR}/Source/BitonicPixelSorter_Metal.mm"
+		"${CMAKE_CURRENT_SOURCE_DIR}/Source/BPS_MetalBackend.h")
+endif()
+
+if(BPS_FORCE_CPU_ONLY)
+	set(BPS_CUDA_AVAILABLE FALSE)
+	set(BPS_OPENCL_AVAILABLE FALSE)
+	set(BPS_HLSL_AVAILABLE FALSE)
+	set(BPS_METAL_AVAILABLE FALSE)
+	message(STATUS "BitonicPixelSorter: BPS_FORCE_CPU_ONLY set — all GPU backends disabled (pure CPU build)")
+endif()
+
 set(BPS_PIPL_BACKEND_DEFINES)
 if(BPS_CUDA_AVAILABLE)
 	list(APPEND BPS_PIPL_BACKEND_DEFINES "-DBPS_HAS_CUDA=1")
@@ -214,6 +278,9 @@ if(BPS_OPENCL_AVAILABLE)
 endif()
 if(BPS_HLSL_AVAILABLE)
 	list(APPEND BPS_PIPL_BACKEND_DEFINES "-DBPS_HAS_HLSL=1")
+endif()
+if(BPS_METAL_AVAILABLE)
+	list(APPEND BPS_PIPL_BACKEND_DEFINES "-DBPS_HAS_METAL=1")
 endif()
 
 set(PIPL_R "${CMAKE_CURRENT_SOURCE_DIR}/PiPL/BitonicPixelSorterPiPL.r")
@@ -389,6 +456,13 @@ elseif(APPLE)
 			"$<IF:$<CONFIG:Debug>,${PIPL_RSRC_DEBUG},${PIPL_RSRC_RELEASE}>"
 			"$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/Contents/Resources/BitonicPixelSorterPiPL.rsrc"
 		COMMAND xattr -cr "$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>"
+		# Ad-hoc code-sign the assembled bundle. The linker only applies a minimal
+		# "linker-signed" signature to the Mach-O; it does NOT produce a
+		# Contents/_CodeSignature/CodeResources that seals the bundle's resources
+		# (Info.plist, the PiPL .rsrc). Some After Effects versions reject a bundle
+		# without that proper signature, so sign it explicitly after all resources
+		# are in place. Must be the last assembly step.
+		COMMAND codesign --force --sign - "$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>"
 		COMMENT "Assembling .plugin bundle...")
 
 	find_library(COCOA_LIBRARY Cocoa)
@@ -459,6 +533,16 @@ if(BPS_HLSL_AVAILABLE)
 	target_compile_definitions(${PROJECT_NAME} PRIVATE BPS_HAS_HLSL=1)
 	target_include_directories(${PROJECT_NAME} PRIVATE "${BPS_GENERATED_DIR}")
 	target_link_libraries(${PROJECT_NAME} PRIVATE d3d12 d3dcompiler dxgi)
+endif()
+
+if(BPS_METAL_AVAILABLE)
+	target_compile_definitions(${PROJECT_NAME} PRIVATE BPS_HAS_METAL=1)
+	target_include_directories(${PROJECT_NAME} PRIVATE "${BPS_GENERATED_DIR}")
+	target_link_libraries(${PROJECT_NAME} PRIVATE ${METAL_LIBRARY} ${FOUNDATION_LIBRARY})
+	# Enable ARC for the Objective-C++ translation unit.
+	set_source_files_properties(
+		"${CMAKE_CURRENT_SOURCE_DIR}/Source/BitonicPixelSorter_Metal.mm"
+		PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()
 
 #------------------------------------------------------------------------------

@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleExecutable</key>
-	<string>@BUNDLE_EXECUTABLE@</string>
+	<string>BitonicPixelSorter</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.palf.@BUNDLE_NAME_LOWER@</string>
+	<string>com.palf.bitonicpixelsorter</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>@BUNDLE_NAME@</string>
+	<string>BitonicPixelSorter</string>
 	<key>CFBundlePackageType</key>
 	<string>eFKT</string>
 	<key>CFBundleSignature</key>

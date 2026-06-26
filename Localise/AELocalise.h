@@ -529,8 +529,39 @@ inline const char *GetStringForAE(LocKeyType key, PF_InData *in_dataP) {
   UINT codePage = GetCodePageForLanguage(localeId);
   Internal::s_tempBuffer = ConvertUTF8ToEncoding(utf8Str, codePage);
 #else
-  Internal::s_tempBuffer = utf8Str;
+  // macOS: After Effects expects param / UI strings in the platform legacy
+  // encoding (e.g. Shift-JIS for Japanese), NOT UTF-8. Passing raw UTF-8 makes
+  // AE fail with "cannot convert Unicode character" and refuse to initialise
+  // the effect. Korean is passed through as UTF-8 because EUC-KR conversion
+  // mojibakes. This matches the working PalfLib behaviour; the conversion
+  // helpers above were present but had been left unused here.
+  if (localeId == "ko_KR") {
+    Internal::s_tempBuffer = utf8Str;
+  } else {
+    CFStringEncoding encoding = GetEncodingForLanguage(localeId);
+    Internal::s_tempBuffer = ConvertUTF8ToEncoding(utf8Str, encoding);
+  }
 #endif
+  return Internal::s_tempBuffer.c_str();
+}
+
+// Returns the raw UTF-8 localised string for the host language, WITHOUT the
+// platform legacy-encoding conversion that GetStringForAE applies. Use this for
+// plugin-side rendering paths that expect UTF-8 and do their own UTF-16
+// conversion — e.g. the Drawbot custom UI (BPS_CopyUtf8ToDrawbotUtf16). Feeding
+// a legacy-encoded (Shift-JIS) string into a UTF-8 consumer corrupts it; that is
+// why this separate accessor exists alongside GetStringForAE (which AE needs for
+// param-name fields).
+template <typename LocKeyType>
+inline const char *GetStringUTF8(LocKeyType key, PF_InData *in_dataP) {
+  std::string localeId = GetCurrentLanguage(in_dataP);
+  const char *utf8Str = GetStringByLanguage(key, localeId);
+  if (!utf8Str || strlen(utf8Str) == 0) {
+    utf8Str = EN_US::GetString(key);
+  }
+  if (!utf8Str)
+    return "";
+  Internal::s_tempBuffer = utf8Str;
   return Internal::s_tempBuffer.c_str();
 }
 } // namespace AELocalise

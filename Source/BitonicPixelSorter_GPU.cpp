@@ -44,6 +44,10 @@
 	#include <dxgi1_6.h>
 #endif
 
+#if defined(BPS_HAS_METAL)
+	#include "BPS_MetalBackend.h"
+#endif
+
 #if defined(BPS_HAS_CUDA)
 	// Host launch wrapper, defined in GPU/BitonicPixelSorter_Kernel.cu.
 	extern "C" cudaError_t BitonicSort_CUDA(
@@ -282,6 +286,11 @@ BPS_GpuDiagLog(const char *format, ...)
 }
 #endif
 
+} // namespace
+// BPS_RecordGpuDevice and BPS_ClearGpuDevice are defined at file scope (not
+// inside the anonymous namespace) so that BPS_MetalBackend.mm can link to
+// them.  They are declared in BPS_MetalBackend.h under BPS_HAS_METAL.
+
 void BPS_RecordGpuDevice(PF_GPU_Framework framework, const std::string &device_name)
 {
 	std::lock_guard<std::mutex> lock(BPS_GpuDeviceStateMutex());
@@ -299,8 +308,6 @@ void BPS_ClearGpuDevice()
 	BPS_GpuDeviceReadyStorage().store(false, std::memory_order_release);
 	BPS_LastRenderUsedGpuStorage().store(false, std::memory_order_release);
 }
-
-} // namespace
 
 const char *BPS_ActiveGpuFrameworkName()
 {
@@ -492,11 +499,16 @@ PF_Err BPS_GPUDeviceSetup(
 	}
 #endif
 
-#if !defined(BPS_HAS_CUDA) && !defined(BPS_HAS_OPENCL) && !defined(BPS_HAS_HLSL)
+#if defined(BPS_HAS_METAL)
+	if (!err && extraP->input->what_gpu == PF_GPU_Framework_METAL) {
+		err = BPS_MetalDeviceSetup(in_dataP, out_dataP, extraP);
+	}
+#endif
+
+#if !defined(BPS_HAS_CUDA) && !defined(BPS_HAS_OPENCL) && !defined(BPS_HAS_HLSL) && !defined(BPS_HAS_METAL)
 	(void)in_dataP; (void)out_dataP; (void)extraP;
 #endif
 
-	// Metal device setup is added in later phases.
 	return err;
 }
 
@@ -542,6 +554,13 @@ PF_Err BPS_GPUDeviceSetdown(
 	if (extraP->input->what_gpu == PF_GPU_Framework_CUDA) {
 		BPS_ClearGpuDevice();
 	}
+
+#if defined(BPS_HAS_METAL)
+	if (extraP->input->what_gpu == PF_GPU_Framework_METAL && extraP->input->gpu_data) {
+		err = BPS_MetalDeviceSetdown(in_dataP, out_dataP, extraP);
+	}
+#endif
+
 	(void)in_dataP; (void)out_dataP; (void)extraP;
 	return err;
 }
@@ -767,7 +786,23 @@ PF_Err BPS_SmartRenderGPU(
 	}
 #endif
 
-	// Metal dispatch is added in later phases.
+#if defined(BPS_HAS_METAL)
+	if (extraP->input->what_gpu == PF_GPU_Framework_METAL) {
+		return BPS_MetalSmartRender(
+			in_data, out_data,
+			input_worldP, output_worldP, extraP, paramsP,
+			src_mem, dst_mem,
+			srcPitch, dstPitch,
+			width, height,
+			inputOriginX, inputOriginY,
+			outputOriginX, outputOriginY,
+			outputWidth, outputHeight,
+			direction, ordering,
+			lineCount);
+	}
+#endif
+
+	// No backend matched — should not be reached when BPS_GPU_ENABLED is set.
 	(void)src_mem; (void)dst_mem; (void)srcPitch; (void)dstPitch;
 	(void)width; (void)height; (void)direction; (void)ordering;
 	return PF_Err_UNRECOGNIZED_PARAM_TYPE;
