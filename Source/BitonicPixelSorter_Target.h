@@ -28,6 +28,27 @@
 #define SUPPORT_URL		"https://x.com/PALF_MovieWorks"
 
 //-----------------------------------------------------------------------------
+// Host compatibility
+//-----------------------------------------------------------------------------
+// The SDK headers advertise the newest plug-in API supported by this SDK
+// (currently 13.29 / AE 23.5). Older AE 2023 builds can reject a PiPL that
+// declares that newer requirement before they ever call EffectMain. Keep the
+// PiPL requirement at the AE 22.0 floor used by this plug-in's feature set;
+// the runtime PluginDataEntryFunction2 still reports the SDK-mandated current
+// PF_AE_PLUG_IN_VERSION/SUBVERS pair on hosts that support it.
+#define BPS_PIPL_SPEC_VERSION			13
+#define BPS_PIPL_SPEC_SUBVERS			27
+
+// AE_Effect_Support_URL was added with API 13.28. The v2 entry point still
+// supplies it to modern hosts, but the PiPL omits it for AE 2023.0-23.3 scans.
+#define BPS_PIPL_HAS_SUPPORT_URL		0
+
+// Legacy PluginDataEntryFunction fallback for older hosts that do not use the
+// v2 entry point. Newer hosts receive the SDK's current version via v2.
+#define BPS_LEGACY_PLUGIN_API_VERSION	13
+#define BPS_LEGACY_PLUGIN_API_SUBVERS	27
+
+//-----------------------------------------------------------------------------
 // Version (stage: DEVELOP 0, PRERELEASE 1, ALPHA 2, BETA 3, RELEASE 4 in PF_VERSION;
 // PiPL uses PF_Stage_DEVELOP=0 ... RELEASE=3 numeric below)
 //-----------------------------------------------------------------------------

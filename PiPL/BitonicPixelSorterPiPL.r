@@ -38,8 +38,8 @@ resource 'PiPL' (16000) {
 		},
 		/* [7] */
 		AE_Effect_Spec_Version {
-			PF_PLUG_IN_VERSION,
-			PF_PLUG_IN_SUBVERS
+			BPS_PIPL_SPEC_VERSION,
+			BPS_PIPL_SPEC_SUBVERS
 		},
 		/* [8] */
 		AE_Effect_Version {
@@ -64,9 +64,11 @@ resource 'PiPL' (16000) {
 		AE_Reserved_Info {
 			0
 		},
+#if BPS_PIPL_HAS_SUPPORT_URL
 		/* [13] */
 		AE_Effect_Support_URL {
 			SUPPORT_URL
 		}
+#endif
 	}
 };

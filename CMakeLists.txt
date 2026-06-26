@@ -442,7 +442,7 @@ elseif(APPLE)
 		XCODE_ATTRIBUTE_GCC_SYMBOLS_PRIVATE_EXTERN "NO")
 
 	set(_exports "${CMAKE_CURRENT_BINARY_DIR}/exported_symbols.txt")
-	file(WRITE "${_exports}" "_EffectMain\n_PluginDataEntryFunction2\n")
+	file(WRITE "${_exports}" "_EffectMain\n_PluginDataEntryFunction\n_PluginDataEntryFunction2\n")
 	target_link_options(${PROJECT_NAME} PRIVATE
 		-Wl,-exported_symbols_list,${_exports}
 		-Wl,-sectcreate,__TEXT,__plgin,$<IF:$<CONFIG:Debug>,${PIPL_RSRC_DEBUG},${PIPL_RSRC_RELEASE}>)

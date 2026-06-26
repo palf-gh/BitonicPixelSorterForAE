@@ -18,6 +18,7 @@
 	#include <cstdarg>
 	#include <cstdio>
 #endif
+#include <cstdlib>
 #include <new>
 #include <string>
 
@@ -79,6 +80,50 @@ BPS_DiagLog(const char *format, ...)
 #endif
 }
 #endif
+
+static bool
+BPS_HostVersionAtLeast(const char *version, long required_major, long required_minor)
+{
+	if (!version || !*version) {
+		return false;
+	}
+
+	char *end = nullptr;
+	const long major = std::strtol(version, &end, 10);
+	if (end == version) {
+		return false;
+	}
+
+	long minor = 0;
+	if (*end == '.') {
+		char *minor_end = nullptr;
+		const long parsed_minor = std::strtol(end + 1, &minor_end, 10);
+		if (minor_end != end + 1) {
+			minor = parsed_minor;
+		}
+	}
+
+	return (major > required_major) ||
+		   (major == required_major && minor >= required_minor);
+}
+
+static void
+BPS_SelectPluginDataApiForHost(
+	const char *host_version,
+	A_long *api_versionP,
+	A_long *api_subversP)
+{
+	// AE 23.4 added the v2 plug-in data entry point. If a newer host still asks
+	// for v1, keep the SDK-mandated current API pair. Older AE 2023 builds get
+	// the compatibility floor that matches the PiPL scan requirement.
+	if (BPS_HostVersionAtLeast(host_version, 23, 4)) {
+		*api_versionP = PF_AE_PLUG_IN_VERSION;
+		*api_subversP = PF_AE_PLUG_IN_SUBVERS;
+	} else {
+		*api_versionP = BPS_LEGACY_PLUGIN_API_VERSION;
+		*api_subversP = BPS_LEGACY_PLUGIN_API_SUBVERS;
+	}
+}
 
 } // namespace
 
@@ -395,16 +440,64 @@ PluginDataEntryFunction2(
 	const char				*inHostVersion)
 {
 	PF_Err result = PF_Err_INVALID_CALLBACK;
+	A_long api_version = PF_AE_PLUG_IN_VERSION;
+	A_long api_subvers = PF_AE_PLUG_IN_SUBVERS;
 
-	result = PF_REGISTER_EFFECT_EXT2(
+	(void)inSPBasicSuitePtr;
+	(void)inHostName;
+	BPS_SelectPluginDataApiForHost(inHostVersion, &api_version, &api_subvers);
+
+	result = (*inPluginDataCallBackPtr)(
 		inPtr,
-		inPluginDataCallBackPtr,
-		NAME,				// Name
-		MATCHNAME,			// Match Name
-		CATEGORY,			// Category
-		0,					// Reserved Info
-		"EffectMain",		// Entry point
-		SUPPORT_URL);		// Support URL
+		reinterpret_cast<const A_u_char*>(NAME),
+		reinterpret_cast<const A_u_char*>(MATCHNAME),
+		reinterpret_cast<const A_u_char*>(CATEGORY),
+		reinterpret_cast<const A_u_char*>(AE_ENTRY_POINT),
+		'eFKT',
+		api_version,
+		api_subvers,
+		0,
+		reinterpret_cast<const A_u_char*>(SUPPORT_URL));
+
+	if (result == A_Err_NONE) {
+		result = PF_Err_NONE;
+	}
+
+	return result;
+}
+
+//-----------------------------------------------------------------------------
+extern "C" DllExport
+PF_Err
+PluginDataEntryFunction(
+	PF_PluginDataPtr		inPtr,
+	PF_PluginDataCB			inPluginDataCallBackPtr,
+	SPBasicSuite			*inSPBasicSuitePtr,
+	const char				*inHostName,
+	const char				*inHostVersion)
+{
+	PF_Err result = PF_Err_INVALID_CALLBACK;
+	A_long api_version = PF_AE_PLUG_IN_VERSION;
+	A_long api_subvers = PF_AE_PLUG_IN_SUBVERS;
+
+	(void)inSPBasicSuitePtr;
+	(void)inHostName;
+	BPS_SelectPluginDataApiForHost(inHostVersion, &api_version, &api_subvers);
+
+	result = (*inPluginDataCallBackPtr)(
+		inPtr,
+		reinterpret_cast<const A_u_char*>(NAME),
+		reinterpret_cast<const A_u_char*>(MATCHNAME),
+		reinterpret_cast<const A_u_char*>(CATEGORY),
+		reinterpret_cast<const A_u_char*>(AE_ENTRY_POINT),
+		'eFKT',
+		api_version,
+		api_subvers,
+		0);
+
+	if (result == A_Err_NONE) {
+		result = PF_Err_NONE;
+	}
 
 	return result;
 }
