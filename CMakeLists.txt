@@ -36,9 +36,9 @@ option(BPS_FORCE_CPU_ONLY "Disable all GPU backends (pure CPU build)" OFF)
 # its toolchain is not detected and the corresponding code/PiPL flags are omitted.
 option(BPS_ENABLE_CUDA "Build the CUDA backend when the toolkit is present" ON)
 option(BPS_ENABLE_OPENCL "Build the OpenCL backend when the SDK is present" ON)
-# DirectX is opt-in: shipping Windows builds keep CUDA/OpenCL GPU paths without
-# advertising SUPPORTS_DIRECTX_RENDERING or linking d3dcompiler/dxgi.
-option(BPS_ENABLE_DIRECTX "Build the DirectX/HLSL backend when dxc is present" OFF)
+# DirectX is enabled by default and built whenever dxc is present; shipping
+# Windows builds then advertise SUPPORTS_DIRECTX_RENDERING alongside CUDA/OpenCL.
+option(BPS_ENABLE_DIRECTX "Build the DirectX/HLSL backend when dxc is present" ON)
 option(BPS_ENABLE_METAL "Build the Metal backend on macOS when Python3 is present" ON)
 
 set(BPS_DIST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/dist")

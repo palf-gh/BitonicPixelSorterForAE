@@ -138,7 +138,12 @@ Tested in the After Effects host:
 | Platform | After Effects versions |
 | --- | --- |
 | macOS (Apple Silicon) | 2023, 2024, 2025, 2026 |
-| Windows | 2025, 2026 |
+| Windows | 2023, 2024, 2025, 2026 |
+
+GPU backend coverage on Windows: the CUDA backend is verified (it applies and
+renders on After Effects 2023 and 2024). The OpenCL and DirectX backends are
+built and advertised but have not yet been verified in the host, so treat them
+as experimental.
 
 ### Status
 
@@ -306,7 +311,11 @@ After Effects ホスト内で動作確認済み:
 | プラットフォーム | After Effects バージョン |
 | --- | --- |
 | macOS（Apple Silicon） | 2023, 2024, 2025, 2026 |
-| Windows | 2025, 2026 |
+| Windows | 2023, 2024, 2025, 2026 |
+
+Windows の GPU バックエンドの検証状況: CUDA は検証済みです（After Effects 2023 /
+2024 で適用とレンダリングを確認）。OpenCL と DirectX はビルド・広告されますが、
+ホスト内では未検証のため experimental（試験的）として扱ってください。
 
 ### ステータス
 
@@ -467,7 +476,11 @@ cmake -S . -B build/Win -DBPS_AE_PLUGIN_DIR="C:/Program Files/Adobe/Adobe After 
 | 平台 | After Effects 版本 |
 | --- | --- |
 | macOS（Apple Silicon） | 2023, 2024, 2025, 2026 |
-| Windows | 2025, 2026 |
+| Windows | 2023, 2024, 2025, 2026 |
+
+Windows 上的 GPU 后端验证情况：CUDA 后端已验证（已在 After Effects 2023 与 2024
+上确认应用与渲染）。OpenCL 与 DirectX 后端可构建并对外声明，但尚未在宿主中验证，
+请将其视为实验性（experimental）。
 
 ### 状态
 
@@ -631,7 +644,11 @@ After Effects 호스트에서 테스트 완료:
 | 플랫폼 | After Effects 버전 |
 | --- | --- |
 | macOS(Apple Silicon) | 2023, 2024, 2025, 2026 |
-| Windows | 2025, 2026 |
+| Windows | 2023, 2024, 2025, 2026 |
+
+Windows의 GPU 백엔드 검증 상황: CUDA 백엔드는 검증되었습니다(After Effects 2023
+및 2024에서 적용과 렌더링 확인). OpenCL과 DirectX 백엔드는 빌드되어 광고되지만
+아직 호스트에서 검증되지 않았으므로 실험적(experimental)으로 취급하십시오.
 
 ### 상태
 

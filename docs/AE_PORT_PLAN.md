@@ -431,3 +431,13 @@ The CPU build needs none of the above.
   implemented and compile, but remain unvalidated in-host and should be treated as
   experimental until tested. (DirectX is opt-in via `BPS_ENABLE_DIRECTX`; the
   default Windows ship build advertises CUDA + OpenCL.)
+- 2026-06-27: DirectX enabled by default (`BPS_ENABLE_DIRECTX=ON`) per user
+  request; the default Windows ship build now advertises CUDA + OpenCL + DirectX
+  (DirectX built whenever `dxc` is present). The DirectX-enabled Release builds
+  clean (no `LNK4098`); `.aex` ~294 KB; exports `EffectMain`,
+  `PluginDataEntryFunction`, `PluginDataEntryFunction2`. README updated (EN/JA/ZH/KO):
+  Windows verified host versions now list 2023, 2024, 2025, 2026, with a per-language
+  note that only the CUDA backend is verified on Windows while OpenCL and DirectX are
+  built/advertised but remain experimental (unverified in-host). NOTE: enabling
+  DirectX changes the shipped binary's OutFlags2 (adds DIRECTX_RENDERING); the user
+  should re-confirm AE 2023/2024 still loads and renders via CUDA on this build.
