@@ -67,6 +67,14 @@ inline bool BPS_IsFullFrameRequest(const PF_LRect &rect, const PF_InData *in_dat
 		   rect.bottom >= in_data->height;
 }
 
+void BPS_RecordHostVersion(const char *host_version);
+long BPS_HostMajorVersion();
+long BPS_HostMinorVersion();
+bool BPS_IsGpuFrameworkCompiled(PF_GPU_Framework framework);
+bool BPS_ShouldAcceptGpuDeviceSetup(
+	const PF_InData *in_data,
+	PF_GPU_Framework framework);
+
 inline BpsGpuEligibility BPS_EvaluateGpuEligibility(
 	const PF_InData *in_data,
 	A_long direction,

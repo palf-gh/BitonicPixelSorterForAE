@@ -192,6 +192,10 @@ __global__ void BitonicSortKernel(
 
 // Host launch wrapper, called from SmartRenderGPU (BitonicPixelSorter_GPU.cpp).
 // extern "C" to keep a stable, unmangled symbol across the nvcc/MSVC boundary.
+//
+// Follow SDK_Invert_ProcAmp: launch on the default stream and synchronise with
+// cudaDeviceSynchronize(). The host-provided CUstream in command_queuePV is not
+// passed through the CUDA runtime launch API in the Adobe sample.
 extern "C" cudaError_t BitonicSort_CUDA(
 	const void *src,
 	void       *dst,
@@ -208,14 +212,14 @@ extern "C" cudaError_t BitonicSort_CUDA(
 	int         direction,
 	int         ordering,
 	float       thresholdMin,
-	float       thresholdMax,
-	void       *streamPV)
+	float       thresholdMax)
 {
 	const int lineCount = direction ? outputHeight : outputWidth;
-	if (lineCount <= 0) return cudaSuccess;
+	if (lineCount <= 0) {
+		return cudaSuccess;
+	}
 
-	cudaStream_t stream = reinterpret_cast<cudaStream_t>(streamPV);
-	BitonicSortKernel<<<lineCount, MAX_THREADS, 0, stream>>>(
+	BitonicSortKernel<<<lineCount, MAX_THREADS, 0>>>(
 		(const float4 *)src, (float4 *)dst,
 		srcPitch, dstPitch, width, height,
 		inputOriginX, inputOriginY, outputOriginX, outputOriginY, outputWidth, outputHeight,
@@ -225,5 +229,6 @@ extern "C" cudaError_t BitonicSort_CUDA(
 	if (launch_result != cudaSuccess) {
 		return launch_result;
 	}
-	return cudaStreamSynchronize(stream);
+
+	return cudaDeviceSynchronize();
 }

@@ -14,6 +14,7 @@
 
 #if defined(BPS_HAS_CUDA)
 	#include <cuda_runtime.h>
+	#include <cuda.h>
 #endif
 
 #if defined(BPS_HAS_OPENCL)
@@ -55,8 +56,7 @@
 		int srcPitch, int dstPitch, int width, int height,
 		int inputOriginX, int inputOriginY,
 		int outputOriginX, int outputOriginY, int outputWidth, int outputHeight,
-		int direction, int ordering, float thresholdMin, float thresholdMax,
-		void *streamPV);
+		int direction, int ordering, float thresholdMin, float thresholdMax);
 #endif
 
 #if defined(BPS_HAS_OPENCL)
@@ -182,19 +182,6 @@ const char *BPS_FrameworkName(PF_GPU_Framework framework)
 	default: return "";
 	}
 }
-
-#if defined(BPS_HAS_CUDA)
-std::string BPS_QueryCudaDeviceName()
-{
-	int device = 0;
-	cudaDeviceProp props;
-	if (cudaGetDevice(&device) == cudaSuccess &&
-		cudaGetDeviceProperties(&props, device) == cudaSuccess) {
-		return props.name;
-	}
-	return std::string();
-}
-#endif
 
 #if defined(BPS_HAS_OPENCL)
 std::string BPS_QueryOpenCLDeviceName(cl_device_id device)
@@ -348,6 +335,16 @@ PF_Err BPS_GPUDeviceSetup(
 {
 	PF_Err err = PF_Err_NONE;
 
+	if (!extraP || !extraP->input) {
+		return PF_Err_BAD_CALLBACK_PARAM;
+	}
+
+	// SDK opt-out: do not confirm GPU for this device/framework. The host falls
+	// back to CPU rendering without changing GlobalSetup/PiPL outflags.
+	if (!BPS_ShouldAcceptGpuDeviceSetup(in_dataP, extraP->input->what_gpu)) {
+		return PF_Err_NONE;
+	}
+
 #if defined(BPS_HAS_CUDA)
 	if (extraP->input->what_gpu == PF_GPU_Framework_CUDA) {
 		AEFX_SuiteScoper<PF_GPUDeviceSuite1> gpu_suite =
@@ -360,10 +357,13 @@ PF_Err BPS_GPUDeviceSetup(
 									  extraP->input->device_index,
 									  &device_info));
 
-		// CUDA kernels are statically linked; nothing to compile here.
+		// CUDA kernels are statically linked; nothing to compile here. Do not call
+		// the CUDA runtime during device setup — the SDK sample does not, and
+		// cudaGetDevice on a host-owned context has been observed to crash Release
+		// builds on older After Effects versions.
 		if (!err) {
 			out_dataP->out_flags2 = PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
-			BPS_RecordGpuDevice(device_info.device_framework, BPS_QueryCudaDeviceName());
+			BPS_RecordGpuDevice(device_info.device_framework, std::string());
 		}
 	}
 #endif
@@ -685,47 +685,35 @@ PF_Err BPS_SmartRenderGPU(
 
 #if defined(BPS_HAS_CUDA)
 	if (extraP->input->what_gpu == PF_GPU_Framework_CUDA) {
-		void *cuda_streamPV = device_info.command_queuePV;
+		// Full GPU plugins launch CUDA work on AE's MFR render threads. AE's CUDA
+		// context is not reliably current on those threads on older hosts (AE 23/24),
+		// so make it current explicitly with the Driver API before launching — the
+		// runtime kernel launch then uses this context, where AE's GPU buffers are
+		// valid. This mirrors the OpenCL path, which already targets AE's context and
+		// command queue explicitly. Balanced push/pop is safe even when AE already
+		// made the context current.
+		CUcontext ae_cuda_ctx = reinterpret_cast<CUcontext>(device_info.contextPV);
+		bool cuda_ctx_pushed = false;
+		if (ae_cuda_ctx) {
+			cuda_ctx_pushed = (cuCtxPushCurrent(ae_cuda_ctx) == CUDA_SUCCESS);
+		}
+
 		cudaError_t cuda_result =
 			BitonicSort_CUDA(src_mem, dst_mem, srcPitch, dstPitch, width, height,
 							 inputOriginX, inputOriginY, outputOriginX, outputOriginY,
 							 outputWidth, outputHeight,
-							 direction, ordering, paramsP->thresholdMin, paramsP->thresholdMax,
-							 cuda_streamPV);
+							 direction, ordering, paramsP->thresholdMin, paramsP->thresholdMax);
 
-		// Some AE/CUDA host combinations expose a null or driver-owned stream that
-		// the CUDA runtime launch path cannot safely use. Retry on the default
-		// stream so the GPU render path either runs or reports a concrete error.
-		if (cuda_result != cudaSuccess && cuda_streamPV) {
-#if defined(BPS_RENDER_DIAG)
-			BPS_GpuDiagLog(
-				"SmartRenderGPU CUDA stream retry cuda_error=%d stream=%p "
-				"frame=%ldx%ld output_origin=(%ld,%ld) output_size=%ldx%ld",
-				static_cast<int>(cuda_result),
-				device_info.command_queuePV,
-				static_cast<long>(in_data->width),
-				static_cast<long>(in_data->height),
-				static_cast<long>(outputOriginX),
-				static_cast<long>(outputOriginY),
-				static_cast<long>(outputWidth),
-				static_cast<long>(outputHeight));
-#endif
+		if (cuda_result != cudaSuccess) {
 			(void)cudaGetLastError();
-			cuda_streamPV = 0;
-			cuda_result =
-				BitonicSort_CUDA(src_mem, dst_mem, srcPitch, dstPitch, width, height,
-								 inputOriginX, inputOriginY, outputOriginX, outputOriginY,
-								 outputWidth, outputHeight,
-								 direction, ordering, paramsP->thresholdMin, paramsP->thresholdMax,
-								 cuda_streamPV);
+			err = PF_Err_INTERNAL_STRUCT_DAMAGED;
 		}
 
 #if defined(BPS_RENDER_DIAG)
 		BPS_GpuDiagLog(
-			"SmartRenderGPU CUDA result cuda_error=%d stream=%p frame=%ldx%ld "
+			"SmartRenderGPU CUDA result cuda_error=%d frame=%ldx%ld "
 			"output_origin=(%ld,%ld) output_size=%ldx%ld",
 			static_cast<int>(cuda_result),
-			cuda_streamPV,
 			static_cast<long>(in_data->width),
 			static_cast<long>(in_data->height),
 			static_cast<long>(outputOriginX),
@@ -733,9 +721,12 @@ PF_Err BPS_SmartRenderGPU(
 			static_cast<long>(outputWidth),
 			static_cast<long>(outputHeight));
 #endif
-		if (cuda_result != cudaSuccess) {
-			err = PF_Err_INTERNAL_STRUCT_DAMAGED;
+
+		if (cuda_ctx_pushed) {
+			CUcontext popped_ctx = nullptr;
+			(void)cuCtxPopCurrent(&popped_ctx);
 		}
+
 		return err;
 	}
 #endif

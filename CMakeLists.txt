@@ -32,30 +32,81 @@ option(BPS_RENDER_DIAG "Enable Bitonic Pixel Sorter render diagnostics" OFF)
 # support and the binary links no GPU frameworks. Useful for isolating whether a
 # host's failure to load the effect is related to GPU advertising.
 option(BPS_FORCE_CPU_ONLY "Disable all GPU backends (pure CPU build)" OFF)
+# Per-backend toggles for shipping and bisection builds. When a backend is OFF,
+# its toolchain is not detected and the corresponding code/PiPL flags are omitted.
+option(BPS_ENABLE_CUDA "Build the CUDA backend when the toolkit is present" ON)
+option(BPS_ENABLE_OPENCL "Build the OpenCL backend when the SDK is present" ON)
+# DirectX is opt-in: shipping Windows builds keep CUDA/OpenCL GPU paths without
+# advertising SUPPORTS_DIRECTX_RENDERING or linking d3dcompiler/dxgi.
+option(BPS_ENABLE_DIRECTX "Build the DirectX/HLSL backend when dxc is present" OFF)
+option(BPS_ENABLE_METAL "Build the Metal backend on macOS when Python3 is present" ON)
 
 set(BPS_DIST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/dist")
 
+set(BPS_CUDA_AVAILABLE FALSE)
+set(BPS_OPENCL_AVAILABLE FALSE)
+set(BPS_HLSL_AVAILABLE FALSE)
+set(BPS_METAL_AVAILABLE FALSE)
+
 #------------------------------------------------------------------------------
-# Optional GPU backends. Each is enabled only when its toolchain is present, so
-# the CPU-only build always works. CUDA and OpenCL are wired up here; DirectX /
-# Metal are added in later phases.
+# Optional GPU backends. Each is enabled only when its toolchain is present and
+# the corresponding BPS_ENABLE_* option is ON. The CPU-only build always works.
 #------------------------------------------------------------------------------
-include(CheckLanguage)
-check_language(CUDA)
-if(CMAKE_CUDA_COMPILER)
-	if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-		if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.23")
-			set(CMAKE_CUDA_ARCHITECTURES all-major)
-		else()
-			set(CMAKE_CUDA_ARCHITECTURES 52 60 70 75 80 86)
-		endif()
-	endif()
-	enable_language(CUDA)
-	set(BPS_CUDA_AVAILABLE TRUE)
-	message(STATUS "BitonicPixelSorter: CUDA enabled (architectures: ${CMAKE_CUDA_ARCHITECTURES})")
+if(BPS_FORCE_CPU_ONLY)
+	message(STATUS "BitonicPixelSorter: BPS_FORCE_CPU_ONLY set - GPU backend detection skipped (pure CPU build)")
 else()
-	set(BPS_CUDA_AVAILABLE FALSE)
-	message(STATUS "BitonicPixelSorter: CUDA toolkit not found — building CPU-only")
+	find_package(Python3 COMPONENTS Interpreter QUIET)
+
+	if(BPS_ENABLE_CUDA)
+		include(CheckLanguage)
+		check_language(CUDA)
+		if(CMAKE_CUDA_COMPILER)
+			if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+				if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.23")
+					set(CMAKE_CUDA_ARCHITECTURES all-major)
+				else()
+					set(CMAKE_CUDA_ARCHITECTURES 52 60 70 75 80 86)
+				endif()
+			endif()
+			enable_language(CUDA)
+			set(BPS_CUDA_AVAILABLE TRUE)
+			message(STATUS "BitonicPixelSorter: CUDA enabled (architectures: ${CMAKE_CUDA_ARCHITECTURES})")
+		else()
+			message(STATUS "BitonicPixelSorter: CUDA toolkit not found - building without CUDA")
+		endif()
+	else()
+		message(STATUS "BitonicPixelSorter: CUDA disabled by BPS_ENABLE_CUDA=OFF")
+	endif()
+
+	if(BPS_ENABLE_OPENCL)
+		find_package(OpenCL QUIET)
+		if(OpenCL_FOUND AND Python3_Interpreter_FOUND)
+			set(BPS_OPENCL_AVAILABLE TRUE)
+			message(STATUS "BitonicPixelSorter: OpenCL enabled")
+		elseif(OpenCL_FOUND AND NOT Python3_Interpreter_FOUND)
+			message(STATUS "BitonicPixelSorter: OpenCL found but Python3 is missing - OpenCL disabled")
+		else()
+			message(STATUS "BitonicPixelSorter: OpenCL not found")
+		endif()
+	else()
+		message(STATUS "BitonicPixelSorter: OpenCL disabled by BPS_ENABLE_OPENCL=OFF")
+	endif()
+
+	if(BPS_ENABLE_DIRECTX AND WIN32)
+		find_program(BPS_DXC_EXECUTABLE NAMES dxc)
+		if(BPS_DXC_EXECUTABLE AND Python3_Interpreter_FOUND)
+			set(BPS_HLSL_AVAILABLE TRUE)
+			message(STATUS "BitonicPixelSorter: DirectX/HLSL enabled (${BPS_DXC_EXECUTABLE})")
+		elseif(BPS_DXC_EXECUTABLE AND NOT Python3_Interpreter_FOUND)
+			message(STATUS "BitonicPixelSorter: dxc found but Python3 is missing - DirectX disabled")
+		else()
+			message(STATUS "BitonicPixelSorter: dxc not found - DirectX disabled")
+		endif()
+	elseif(BPS_ENABLE_DIRECTX)
+		message(STATUS "BitonicPixelSorter: DirectX requested but this is not a Windows build")
+	else()
+		message(STATUS "BitonicPixelSorter: DirectX disabled by BPS_ENABLE_DIRECTX=OFF")
+	endif()
 endif()
 
 #------------------------------------------------------------------------------
@@ -76,37 +127,6 @@ if(NOT EXISTS "${AESDK_ROOT}/Headers")
 endif()
 
 message(STATUS "BitonicPixelSorter: AESDK_ROOT = ${AESDK_ROOT}")
-
-# OpenCL is optional. The SDK sample embeds OpenCL source as a C string; follow
-# that model so the plugin remains a single self-contained binary.
-find_package(OpenCL QUIET)
-find_package(Python3 COMPONENTS Interpreter QUIET)
-if(OpenCL_FOUND AND Python3_Interpreter_FOUND)
-	set(BPS_OPENCL_AVAILABLE TRUE)
-	message(STATUS "BitonicPixelSorter: OpenCL enabled")
-elseif(OpenCL_FOUND AND NOT Python3_Interpreter_FOUND)
-	set(BPS_OPENCL_AVAILABLE FALSE)
-	message(STATUS "BitonicPixelSorter: OpenCL found but Python3 is missing — OpenCL disabled")
-else()
-	set(BPS_OPENCL_AVAILABLE FALSE)
-	message(STATUS "BitonicPixelSorter: OpenCL not found")
-endif()
-
-if(WIN32)
-	find_program(BPS_DXC_EXECUTABLE NAMES dxc)
-	if(BPS_DXC_EXECUTABLE AND Python3_Interpreter_FOUND)
-		set(BPS_HLSL_AVAILABLE TRUE)
-		message(STATUS "BitonicPixelSorter: DirectX/HLSL enabled (${BPS_DXC_EXECUTABLE})")
-	elseif(BPS_DXC_EXECUTABLE AND NOT Python3_Interpreter_FOUND)
-		set(BPS_HLSL_AVAILABLE FALSE)
-		message(STATUS "BitonicPixelSorter: dxc found but Python3 is missing — DirectX disabled")
-	else()
-		set(BPS_HLSL_AVAILABLE FALSE)
-		message(STATUS "BitonicPixelSorter: dxc not found — DirectX disabled")
-	endif()
-else()
-	set(BPS_HLSL_AVAILABLE FALSE)
-endif()
 
 set(BPS_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
@@ -130,6 +150,7 @@ set(SOURCES
 	Source/BitonicPixelSorter_UI.cpp
 	Source/BitonicPixelSorter_CPU.cpp
 	Source/BitonicPixelSorter_GPU.cpp
+	Source/BitonicPixelSorter_GpuHost.cpp
 	Localise/AELocalise.h
 	Localise/AE_SDK.h
 	Localise/LocKeys.h
@@ -223,7 +244,7 @@ endif()
 # Metal backend (macOS only). Metal.framework is always present on macOS so we
 # only need find_library to locate it; Python3 is already required by OpenCL.
 #------------------------------------------------------------------------------
-if(APPLE)
+if(NOT BPS_FORCE_CPU_ONLY AND BPS_ENABLE_METAL AND APPLE)
 	find_library(METAL_LIBRARY Metal)
 	find_library(FOUNDATION_LIBRARY Foundation)
 	if(METAL_LIBRARY AND FOUNDATION_LIBRARY AND Python3_Interpreter_FOUND)
@@ -259,14 +280,6 @@ if(BPS_METAL_AVAILABLE)
 	list(APPEND SOURCES
 		"${CMAKE_CURRENT_SOURCE_DIR}/Source/BitonicPixelSorter_Metal.mm"
 		"${CMAKE_CURRENT_SOURCE_DIR}/Source/BPS_MetalBackend.h")
-endif()
-
-if(BPS_FORCE_CPU_ONLY)
-	set(BPS_CUDA_AVAILABLE FALSE)
-	set(BPS_OPENCL_AVAILABLE FALSE)
-	set(BPS_HLSL_AVAILABLE FALSE)
-	set(BPS_METAL_AVAILABLE FALSE)
-	message(STATUS "BitonicPixelSorter: BPS_FORCE_CPU_ONLY set — all GPU backends disabled (pure CPU build)")
 endif()
 
 set(BPS_PIPL_BACKEND_DEFINES)
@@ -474,6 +487,12 @@ endif()
 target_compile_definitions(${PROJECT_NAME} PRIVATE
 	$<$<CONFIG:Debug>:BPS_DEBUG_BUILD=1>)
 
+# Microsoft-recommended compatibility shim: revert std::mutex to its pre-VS16.10
+# constructor so a plugin built with a newer MSVC STL still works when loaded
+# against the older msvcp140.dll bundled with older After Effects hosts.
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+	$<$<COMPILE_LANGUAGE:C,CXX>:_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR>)
+
 if(WIN32)
 	set(BPS_DIST_PLATFORM_DIR "${BPS_DIST_ROOT}/Win")
 elseif(APPLE)
@@ -509,9 +528,26 @@ if(BPS_CUDA_AVAILABLE)
 		CUDA_RUNTIME_LIBRARY None
 		CUDA_SEPARABLE_COMPILATION OFF)
 	if(MSVC)
-		target_compile_options(${PROJECT_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+		# Force nvcc's host compiler to use the same dynamic CRT (/MD, /MDd) as the
+		# rest of the plugin. nvcc otherwise defaults the .cu host object to the static
+		# CRT (/MT, LIBCMT), which mixes with the plugin's dynamic MSVCRT (LNK4098) and
+		# corrupts the std::mutex runtime — std::mutex::lock() then null-derefs against
+		# the older msvcp140.dll bundled with After Effects 23/24, crashing the host in
+		# GPU_DEVICE_SETUP. OpenCL-only builds (no .cu, pure /MD) are unaffected.
+		target_compile_options(${PROJECT_NAME} PRIVATE
+			$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
+			$<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:-Xcompiler=/MDd>
+			$<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CONFIG:Debug>>>:-Xcompiler=/MD>)
 	endif()
-	target_link_libraries(${PROJECT_NAME} PRIVATE CUDA::cudart)
+	target_link_libraries(${PROJECT_NAME} PRIVATE CUDA::cudart CUDA::cuda_driver)
+	if(MSVC)
+		# cuda.lib (CUDA::cuda_driver) embeds /DEFAULTLIB:LIBCMT in its object directives
+		# even when the plugin itself uses the dynamic CRT (/MD). Suppress LIBCMT so the
+		# linker resolves all CRT symbols from MSVCRT only and the LNK4098 warning is
+		# eliminated. /NODEFAULTLIB:LIBCMT is the standard linker remedy for third-party
+		# static libs that bake in static-CRT default-lib directives.
+		target_link_options(${PROJECT_NAME} PRIVATE /NODEFAULTLIB:LIBCMT)
+	endif()
 endif()
 
 if(BPS_OPENCL_AVAILABLE)
@@ -543,6 +579,26 @@ if(BPS_METAL_AVAILABLE)
 	set_source_files_properties(
 		"${CMAKE_CURRENT_SOURCE_DIR}/Source/BitonicPixelSorter_Metal.mm"
 		PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+endif()
+
+# Delay-load optional GPU frameworks on Windows so a missing DLL does not abort
+# plug-in load; uninitialised GPU paths fall back to CPU at device setup time.
+if(WIN32 AND MSVC)
+	set(_bps_delay_load_dlls)
+	if(BPS_OPENCL_AVAILABLE)
+		list(APPEND _bps_delay_load_dlls "OpenCL.dll")
+	endif()
+	if(BPS_HLSL_AVAILABLE)
+		list(APPEND _bps_delay_load_dlls "d3dcompiler_47.dll" "dxgi.dll")
+	endif()
+	foreach(_bps_delay_dll IN LISTS _bps_delay_load_dlls)
+		target_link_options(${PROJECT_NAME} PRIVATE "/DELAYLOAD:${_bps_delay_dll}")
+	endforeach()
+	if(_bps_delay_load_dlls)
+		target_link_libraries(${PROJECT_NAME} PRIVATE delayimp.lib)
+	endif()
+	unset(_bps_delay_load_dlls)
+	unset(_bps_delay_dll)
 endif()
 
 #------------------------------------------------------------------------------

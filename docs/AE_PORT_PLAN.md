@@ -354,3 +354,80 @@ The CPU build needs none of the above.
     parallelism.
 - Phases 5–8 (Metal, pipeline hardening, validation, robustness) pending. AE
   in-host CPU/GPU parity validation is still pending.
+- 2026-06-27: CMake-only CRT mismatch fix eliminating `LNK4098` and the
+  `std::mutex::lock()` NULL-deref crash on AE 23/24. Three edits to
+  `CMakeLists.txt` only (no source, kernel, or other backend changes):
+  (1) Added `-Xcompiler=/MD` (Release) and `-Xcompiler=/MDd` (Debug) generator
+  expressions to the nvcc `target_compile_options` inside `if(BPS_CUDA_AVAILABLE)
+  ... if(MSVC)`, making the dynamic-CRT requirement explicit to nvcc's host
+  compiler and hardening against future CMake/nvcc versions.
+  (2) Added `target_compile_definitions(... $<$<COMPILE_LANGUAGE:C,CXX>:
+  _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR>)` — Microsoft's recommended shim to
+  revert `std::mutex` to its pre-VS 16.10 constructor so a plugin built with a
+  newer MSVC STL loads correctly against the older `msvcp140.dll` bundled with
+  AE 23/24.
+  (3) Added `target_link_options(... /NODEFAULTLIB:LIBCMT)` inside
+  `if(BPS_CUDA_AVAILABLE) ... if(MSVC)` to suppress the `/DEFAULTLIB:LIBCMT`
+  directive embedded in every member of `cuda.lib` (`CUDA::cuda_driver`).
+  Investigation confirmed the `.cu` kernel object already received `/MD` from
+  CMake's internal VS CRT mechanism; `cuda.lib` was the LIBCMT source.
+  Build results: Release (`build_crtfix`) and RelWithDebInfo/DIAG (`build_crtdiag`)
+  both succeeded with `LNK4098` and `LIBCMT` **absent** from both logs (grep
+  confirmed zero matches). `EffectMain` exported at ordinal 1.
+  Diagnostic artefacts at `dist/Win/RelWithDebInfo/BitonicPixelSorter.aex`
+  (808448 B) and `.pdb` (5818720 B).
+- 2026-06-26: Fixed Release crash on AE 23/24 caused by spurious
+  `AcquireExclusiveDeviceAccess` / `ReleaseExclusiveDeviceAccess` calls in the
+  CUDA branch of `BPS_SmartRenderGPU`. Full GPU plugins that use the separate
+  `PF_Cmd_SMART_RENDER_GPU` entry point already hold exclusive device access
+  (per `AE_EffectGPUSuites.h`); the extra calls double-managed the CUDA context.
+  On a failed acquire the kernel still launched, and the unconditional Release
+  left an unbalanced `cuCtxPopCurrent` that corrupted AE's context and crashed
+  the host. Removed both calls and the now-unused `PF_Err err2` declaration;
+  the kernel launch and error check are unchanged. Matches `SDK_Invert_ProcAmp`,
+  which makes no such calls. Build validated: `cmake -S . -B build_cuda_verify
+  -G "Visual Studio 17 2022" -A x64` ("CUDA enabled"); Release build clean;
+  `EffectMain` exported at ordinal 1.
+- 2026-06-26: Explicit CUDA context push/pop to fix residual crash on AE 23/24
+  MFR render threads. After the Acquire/Release removal, CUDA still crashed older
+  hosts while OpenCL on the same machine worked. Root cause: OpenCL explicitly
+  targets AE's `contextPV` / `command_queuePV`; the CUDA path relied on AE's
+  context being implicitly current on each MFR thread, which is not guaranteed on
+  AE 23/24. Fix: added `#include <cuda.h>` (Driver API header); at the start of
+  the CUDA branch in `BPS_SmartRenderGPU`, cast `device_info.contextPV` to
+  `CUcontext` and call `cuCtxPushCurrent`; after the existing error check and
+  post-launch DIAG block, call `cuCtxPopCurrent`. Also added a pre-launch
+  `BPS_RENDER_DIAG` log capturing context pointer, push result, command queue,
+  buffer pointers, frame/output dimensions, `lineCount`, and `direction`.
+  CMake: `CUDA::cuda_driver` added alongside `CUDA::cudart` in the CUDA link step
+  (resolves to `cuda.lib` / `nvcuda.dll`; no unresolved externals). Builds:
+  `build_diag` RelWithDebInfo + DIAG=ON → `dist/Win/RelWithDebInfo/BitonicPixelSorter.aex`
+  (808960 B) + PDB (5812224 B); `build_ctxfix` Release → `dist/Win/Release/BitonicPixelSorter.aex`;
+  `cuCtxPushCurrent`/`cuCtxPopCurrent` symbol strings confirmed in binary; `EffectMain`
+  at ordinal 1. In-host AE 23/24 test still pending (user to validate).
+- 2026-06-27: **CUDA Release crash on AE 23/24 RESOLVED — confirmed in-host.** The
+  two 2026-06-26 CUDA fixes above were necessary cleanups but NOT the crash cause.
+  A Visual Studio debugger stack trace showed the real fault: a `std::mutex::lock()`
+  NULL (0x0) dereference inside `msvcp140.dll`, reached via `std::lock_guard` in
+  `BPS_RecordGpuDevice` during `GPU_DEVICE_SETUP` — not in rendering (hence no
+  `BPS_RENDER_DIAG` line ever appeared). Root cause: a mixed C runtime. The CUDA
+  build pulled in the static CRT (`LIBCMT`, /MT) — from nvcc host compilation and
+  from `cuda.lib` (`CUDA::cuda_driver`) — while the plugin uses the dynamic CRT
+  (/MD, `msvcp140.dll`), producing the long-standing `LNK4098` warning. The CRT
+  mismatch corrupts the `std::mutex` runtime, which NULL-derefs against the OLDER
+  `msvcp140.dll` bundled with AE 23/24 (AE 25.x bundles a newer runtime and
+  tolerated it). OpenCL-only builds were immune (no `.cu`, pure /MD) — which is
+  exactly why the user's OpenCL-vs-CUDA bisection isolated the CUDA path. Fix
+  (CMake only): force nvcc's host compiler to `/MD` (`/MDd` in Debug); define
+  `_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR` for C/CXX; add `/NODEFAULTLIB:LIBCMT`.
+  `LNK4098`/`LIBCMT` are now absent from all build logs. Before committing, the
+  session-only pre-launch and push-failure `BPS_RENDER_DIAG` logs added during the
+  hunt were removed; the `cuCtxPushCurrent`/`cuCtxPopCurrent` context handling and
+  the established default-OFF `BPS_RENDER_DIAG` facility were kept.
+- 2026-06-27: **Verification status (environment-limited).** Confirmed working
+  in-host: **Windows + After Effects 2023 and 2024 + CUDA backend** (effect applies
+  and renders without crashing). NOT yet verified, no test environment available:
+  **OpenCL and DirectX on Windows, and Metal on macOS.** Those three backends are
+  implemented and compile, but remain unvalidated in-host and should be treated as
+  experimental until tested. (DirectX is opt-in via `BPS_ENABLE_DIRECTX`; the
+  default Windows ship build advertises CUDA + OpenCL.)

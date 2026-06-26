@@ -445,6 +445,7 @@ PluginDataEntryFunction2(
 
 	(void)inSPBasicSuitePtr;
 	(void)inHostName;
+	BPS_RecordHostVersion(inHostVersion);
 	BPS_SelectPluginDataApiForHost(inHostVersion, &api_version, &api_subvers);
 
 	result = (*inPluginDataCallBackPtr)(
@@ -482,6 +483,7 @@ PluginDataEntryFunction(
 
 	(void)inSPBasicSuitePtr;
 	(void)inHostName;
+	BPS_RecordHostVersion(inHostVersion);
 	BPS_SelectPluginDataApiForHost(inHostVersion, &api_version, &api_subvers);
 
 	result = (*inPluginDataCallBackPtr)(
