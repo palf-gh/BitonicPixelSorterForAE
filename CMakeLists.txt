@@ -116,8 +116,8 @@ set(SOURCES
 	Source/BitonicPixelSorter_UI.cpp
 	Source/BitonicPixelSorter_CPU.cpp
 	Source/BitonicPixelSorter_GPU.cpp
-	vendor/palf/AELocalise.h
-	vendor/palf/AE_SDK.h
+	Localise/AELocalise.h
+	Localise/AE_SDK.h
 	Localise/LocKeys.h
 	Localise/Strings_en_US.h
 	Localise/Strings_ja_JP.h

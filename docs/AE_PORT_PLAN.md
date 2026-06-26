@@ -15,7 +15,7 @@ Keep this file updated as phases complete.
 
 - A standalone AE effect that anyone can build by dropping this repository into
   the Adobe AE SDK `Examples` tree. **References only the Adobe SDK.** The single
-  reused piece is the header-only `vendor/palf/AELocalise.h` (CJK+EN
+  reused piece is the header-only `Localise/AELocalise.h` (CJK+EN
   localisation), copied in — no dependency on `Palf_Plugins`.
 - Faithful to upstream: params **Direction / Order / Threshold Min / Threshold
   Max**, brightness key `0.298912 R + 0.586611 G + 0.114478 B`.

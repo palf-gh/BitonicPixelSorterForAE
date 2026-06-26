@@ -4,10 +4,9 @@
 	Self-contained After Effects port of ruccho/BitonicPixelSorter (Unity, MIT).
 	https://github.com/ruccho/BitonicPixelSorter
 
-	This plugin references only the Adobe After Effects SDK. The only third-party
-	code vendored in is _PalfLib/AELocalise.h (header-only CJK+EN localisation),
-	copied under vendor/palf/ so the project builds anywhere the SDK example tree
-	is present, without depending on the Palf_Plugins repository.
+	This plugin references only the Adobe After Effects SDK. Localisation uses
+	the header-only AELocalise helper under Localise/, so the project builds
+	anywhere the SDK example tree is present without depending on Palf_Plugins.
 */
 
 #pragma once

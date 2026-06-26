@@ -21,7 +21,7 @@
 #include "Localise/Strings_ja_JP.h"
 #include "Localise/Strings_zh_CN.h"
 #include "Localise/Strings_ko_KR.h"
-#include "vendor/palf/AELocalise.h"
+#include "Localise/AELocalise.h"
 
 namespace {
 

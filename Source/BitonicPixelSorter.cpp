@@ -2,8 +2,8 @@
 	BitonicPixelSorter.cpp
 
 	Effect entry point, global/param setup and the Smart Render dispatch for the
-	Bitonic Pixel Sorter. Self-contained: references only the Adobe SDK plus the
-	vendored AELocalise.h.
+	Bitonic Pixel Sorter. Self-contained: references only the Adobe SDK plus
+	Localise/AELocalise.h.
 
 	Phase 1 implements the CPU render path (the correctness oracle and GPU
 	fallback). The GPU path (CUDA / OpenCL / Metal / DirectX) is layered on in a
@@ -28,7 +28,7 @@
 #include "Localise/Strings_ja_JP.h"
 #include "Localise/Strings_zh_CN.h"
 #include "Localise/Strings_ko_KR.h"
-#include "vendor/palf/AELocalise.h"
+#include "Localise/AELocalise.h"
 
 namespace {
 

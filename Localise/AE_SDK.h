@@ -1,8 +1,8 @@
 // AE_SDK.h
 //
 // Small umbrella header that aggregates the Adobe After Effects SDK headers
-// needed by AELocalise.h. Vendored (copied) from Palf_Plugins/_PalfLib/AE_SDK.h
-// so this plugin stays self-contained and only references the Adobe SDK.
+// needed by AELocalise.h. Kept alongside the localisation headers so this
+// plugin stays self-contained and only references the Adobe SDK.
 //
 // AE_EffectSuites.h is added here (relative to the upstream copy) so that
 // PFAppSuite6 / PF_AppGetLanguage are available regardless of include order.

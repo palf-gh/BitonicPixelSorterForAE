@@ -1,8 +1,8 @@
 // AELocalise.h
 //
-// Vendored (copied) from Palf_Plugins/_PalfLib/AELocalise.h for self-containment.
 // Header-only CJK+EN (and more) localisation helper for After Effects plugins.
-// Only dependency is the Adobe SDK (via AE_SDK.h) plus the OS text APIs.
+// Originally derived from Palf_Plugins/_PalfLib/AELocalise.h; kept in-tree so
+// this plugin stays self-contained and only references the Adobe SDK.
 //
 // このヘッダーは、プロジェクト側で以下の順序でインクルードすることで、
 // ローカライズ機能を提供します：
@@ -16,7 +16,7 @@
 //      #include "Localise/Strings_zh_CN.h"   // 中国語(簡体字)（オプション）
 //      #include "Localise/Strings_ko_KR.h"   // 韓国語（オプション）
 //   3. このヘッダーをインクルード
-//      #include "vendor/palf/AELocalise.h"
+//      #include "Localise/AELocalise.h"
 //
 // 注意：このヘッダーは、LocKey型と各言語の名前空間（EN_US, JA_JP, ZH_CN,
 // KO_KR等）が定義されていることを前提とします。定義されていない言語は英語に

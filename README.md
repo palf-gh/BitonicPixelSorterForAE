@@ -53,11 +53,10 @@ BitonicPixelSorterForAE/
   Directory.Build.props       Windows SDK/MSBuild default output property
   Source/                     PF effect entry point, CPU path and GPU dispatch
   GPU/                        CUDA, OpenCL and HLSL bitonic kernels
-  Localise/                   EN/JA/ZH/KO string tables
+  Localise/                   EN/JA/ZH/KO string tables and AELocalise helper
   PiPL/                       AE PiPL resource source
   Mac/                        macOS bundle metadata template
   cmake/                      build helper scripts
-  vendor/palf/                copied header-only localisation shim
   docs/                       AE port plan and implementation notes
   dist/Win/Release/           tracked Windows release .aex package
   dist/Mac/Release/           tracked macOS release .plugin package
@@ -213,11 +212,10 @@ BitonicPixelSorterForAE/
   Directory.Build.props       Windows SDK / MSBuild の既定出力プロパティ
   Source/                     PF エフェクトのエントリポイント、CPU パス、GPU ディスパッチ
   GPU/                        CUDA / OpenCL / HLSL のビトニックカーネル
-  Localise/                   EN / JA / ZH / KO の文字列テーブル
+  Localise/                   EN / JA / ZH / KO の文字列テーブルと AELocalise ヘルパ
   PiPL/                       AE PiPL リソースソース
   Mac/                        macOS バンドルメタデータテンプレート
   cmake/                      ビルド補助スクリプト
-  vendor/palf/                コピー済みヘッダオンリーのローカライズシム
   docs/                       AE 移植計画と実装メモ
   dist/Win/Release/           追跡対象の Windows リリース .aex パッケージ
   dist/Mac/Release/           追跡対象の macOS リリース .plugin パッケージ
@@ -370,11 +368,10 @@ BitonicPixelSorterForAE/
   Directory.Build.props       Windows SDK / MSBuild 默认输出属性
   Source/                     PF 效果入口、CPU 路径与 GPU 调度
   GPU/                        CUDA、OpenCL 与 HLSL 双调内核
-  Localise/                   英 / 日 / 中 / 韩字符串表
+  Localise/                   英 / 日 / 中 / 韩字符串表与 AELocalise 辅助头
   PiPL/                       AE PiPL 资源源码
   Mac/                        macOS 包元数据模板
   cmake/                      构建辅助脚本
-  vendor/palf/                复制的仅头文件本地化垫片
   docs/                       AE 移植计划与实现说明
   dist/Win/Release/           纳入版本管理的 Windows 发布 .aex 包
   dist/Mac/Release/           纳入版本管理的 macOS 发布 .plugin 包
@@ -525,11 +522,10 @@ BitonicPixelSorterForAE/
   Directory.Build.props       Windows SDK / MSBuild 기본 출력 속성
   Source/                     PF 이펙트 진입점, CPU 경로, GPU 디스패치
   GPU/                        CUDA, OpenCL, HLSL 비토닉 커널
-  Localise/                   EN / JA / ZH / KO 문자열 테이블
+  Localise/                   EN / JA / ZH / KO 문자열 테이블 및 AELocalise 헬퍼
   PiPL/                       AE PiPL 리소스 소스
   Mac/                        macOS 번들 메타데이터 템플릿
   cmake/                      빌드 보조 스크립트
-  vendor/palf/                복사된 헤더 전용 현지화 심
   docs/                       AE 포트 계획 및 구현 메모
   dist/Win/Release/           추적 대상 Windows 릴리스 .aex 패키지
   dist/Mac/Release/           추적 대상 macOS 릴리스 .plugin 패키지
