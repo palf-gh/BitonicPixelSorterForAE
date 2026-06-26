@@ -274,32 +274,56 @@ elseif(APPLE)
 		message(FATAL_ERROR "Rez tool not found. Install Xcode or the Command Line Tools.")
 	endif()
 
-	set(PIPL_I    "${CMAKE_CURRENT_BINARY_DIR}/BitonicPixelSorterPiPL.i")
-	set(PIPL_RSRC "${CMAKE_CURRENT_BINARY_DIR}/BitonicPixelSorterPiPL.rsrc")
+	set(PIPL_I_DEBUG    "${CMAKE_CURRENT_BINARY_DIR}/BitonicPixelSorterPiPL_Debug.i")
+	set(PIPL_I_RELEASE  "${CMAKE_CURRENT_BINARY_DIR}/BitonicPixelSorterPiPL_Release.i")
+	set(PIPL_RSRC_DEBUG "${CMAKE_CURRENT_BINARY_DIR}/BitonicPixelSorterPiPL_Debug.rsrc")
+	set(PIPL_RSRC_RELEASE "${CMAKE_CURRENT_BINARY_DIR}/BitonicPixelSorterPiPL_Release.rsrc")
 
 	add_custom_command(
-		OUTPUT "${PIPL_I}"
+		OUTPUT "${PIPL_I_DEBUG}"
+		COMMAND "${CMAKE_CXX_COMPILER}" -E -P -x c
+			-I "${AESDK_ROOT}/Headers"
+			-I "${AESDK_ROOT}/Resources"
+			-I "${CMAKE_CURRENT_SOURCE_DIR}/Source"
+			-D __MACH__ -D AE_OS_MAC -D DEBUG=1 -D BPS_DEBUG_BUILD=1
+			${BPS_PIPL_BACKEND_DEFINES}
+			-o "${PIPL_I_DEBUG}" "${PIPL_R}"
+		DEPENDS "${PIPL_R}" "${TARGET_HEADER}"
+		COMMENT "Preprocessing PiPL resource (Debug)...")
+
+	add_custom_command(
+		OUTPUT "${PIPL_I_RELEASE}"
 		COMMAND "${CMAKE_CXX_COMPILER}" -E -P -x c
 			-I "${AESDK_ROOT}/Headers"
 			-I "${AESDK_ROOT}/Resources"
 			-I "${CMAKE_CURRENT_SOURCE_DIR}/Source"
 			-D __MACH__ -D AE_OS_MAC
 			${BPS_PIPL_BACKEND_DEFINES}
-			-o "${PIPL_I}" "${PIPL_R}"
+			-o "${PIPL_I_RELEASE}" "${PIPL_R}"
 		DEPENDS "${PIPL_R}" "${TARGET_HEADER}"
-		COMMENT "Preprocessing PiPL resource...")
+		COMMENT "Preprocessing PiPL resource (Release)...")
 
 	add_custom_command(
-		OUTPUT "${PIPL_RSRC}"
-		COMMAND "${REZ_TOOL}" -o "${PIPL_RSRC}" -useDF
+		OUTPUT "${PIPL_RSRC_DEBUG}"
+		COMMAND "${REZ_TOOL}" -o "${PIPL_RSRC_DEBUG}" -useDF
 			-i "${AESDK_ROOT}/Headers"
 			-i "${AESDK_ROOT}/Resources"
 			-i "${CMAKE_CURRENT_SOURCE_DIR}/Source"
-			"${PIPL_I}"
-		DEPENDS "${PIPL_I}"
-		COMMENT "Compiling PiPL resource with Rez...")
+			"${PIPL_I_DEBUG}"
+		DEPENDS "${PIPL_I_DEBUG}"
+		COMMENT "Compiling PiPL resource with Rez (Debug)...")
 
-	add_custom_target(${PROJECT_NAME}_pipl DEPENDS "${PIPL_RSRC}")
+	add_custom_command(
+		OUTPUT "${PIPL_RSRC_RELEASE}"
+		COMMAND "${REZ_TOOL}" -o "${PIPL_RSRC_RELEASE}" -useDF
+			-i "${AESDK_ROOT}/Headers"
+			-i "${AESDK_ROOT}/Resources"
+			-i "${CMAKE_CURRENT_SOURCE_DIR}/Source"
+			"${PIPL_I_RELEASE}"
+		DEPENDS "${PIPL_I_RELEASE}"
+		COMMENT "Compiling PiPL resource with Rez (Release)...")
+
+	add_custom_target(${PROJECT_NAME}_pipl DEPENDS "${PIPL_RSRC_DEBUG}" "${PIPL_RSRC_RELEASE}")
 
 	add_library(${PROJECT_NAME} MODULE ${SOURCES})
 	add_dependencies(${PROJECT_NAME} ${PROJECT_NAME}_pipl)
@@ -313,7 +337,7 @@ elseif(APPLE)
 	set_target_properties(${PROJECT_NAME} PROPERTIES
 		BUNDLE TRUE
 		BUNDLE_EXTENSION "plugin"
-		OUTPUT_NAME "BitonicPixelSorter"
+		OUTPUT_NAME "$<IF:$<CONFIG:Debug>,BitonicPixelSorter_debug,BitonicPixelSorter>"
 		MACOSX_BUNDLE_GUI_IDENTIFIER "com.palf.bitonicpixelsorter"
 		OSX_ARCHITECTURES "x86_64;arm64"
 		XCODE_ATTRIBUTE_GCC_SYMBOLS_PRIVATE_EXTERN "NO")
@@ -322,14 +346,15 @@ elseif(APPLE)
 	file(WRITE "${_exports}" "_EffectMain\n_PluginDataEntryFunction2\n")
 	target_link_options(${PROJECT_NAME} PRIVATE
 		-Wl,-exported_symbols_list,${_exports}
-		-Wl,-sectcreate,__TEXT,__plgin,${PIPL_RSRC})
+		-Wl,-sectcreate,__TEXT,__plgin,$<IF:$<CONFIG:Debug>,${PIPL_RSRC_DEBUG},${PIPL_RSRC_RELEASE}>)
 
 	add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
 		COMMAND ${CMAKE_COMMAND} -E make_directory
 			"$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/Contents/Resources"
 		COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
 			"$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/Contents/Info.plist"
-		COMMAND ${CMAKE_COMMAND} -E copy "${PIPL_RSRC}"
+		COMMAND ${CMAKE_COMMAND} -E copy
+			"$<IF:$<CONFIG:Debug>,${PIPL_RSRC_DEBUG},${PIPL_RSRC_RELEASE}>"
 			"$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/Contents/Resources/BitonicPixelSorterPiPL.rsrc"
 		COMMAND xattr -cr "$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>"
 		COMMENT "Assembling .plugin bundle...")
@@ -338,6 +363,10 @@ elseif(APPLE)
 	target_link_libraries(${PROJECT_NAME} PRIVATE ${COCOA_LIBRARY})
 	target_compile_definitions(${PROJECT_NAME} PRIVATE MAC_ENV)
 endif()
+
+# Keep PluginDataEntryFunction2 and PiPL match names aligned per configuration.
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+	$<$<CONFIG:Debug>:BPS_DEBUG_BUILD=1>)
 
 if(WIN32)
 	set(BPS_DIST_PLATFORM_DIR "${BPS_DIST_ROOT}/Win")
