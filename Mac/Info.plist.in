@@ -19,6 +19,6 @@
 	<key>NSAppleScriptEnabled</key>
 	<string>No</string>
 	<key>NSHumanReadableCopyright</key>
-	<string>Bitonic Pixel Sorter - ported from ruccho/BitonicPixelSorter (MIT)</string>
+	<string>Copyright (c) 2026 Palf. Ported from ruccho/BitonicPixelSorter (MIT).</string>
 </dict>
 </plist>
