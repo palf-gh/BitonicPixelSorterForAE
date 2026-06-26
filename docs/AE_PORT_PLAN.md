@@ -133,12 +133,14 @@ output; on a non-CUDA build it still builds and renders on CPU.
 2. Build: Windows SDK `dxc` directly compiles `.hlsl` to `.cso` plus `.rs`
    root signature. `GPUUtils/ParseHLSL.py` is not needed because this port is
    not using the SDK sample's GF-style cross-target source.
-3. `GPUDeviceSetup` (DirectX): `DXContext::Initialize` + `LoadShader` (see
-   `Util/DirectXUtils.h`). `SmartRenderGPU` (DirectX): `DXShaderExecution`,
-   `SetParamBuffer`, UAV/SRV bind, `Execute(lineCount, 1)`.
-4. CMake: gate `HAS_HLSL` on `dxc`; link `DirectXUtils.cpp`, `d3d12`, and
-   `d3dcompiler`; copy `DirectX_Assets/BitonicSortKernel.(cso|rs)` beside the
-   built `.aex`.
+3. `GPUDeviceSetup` (DirectX): `DXContext::Initialize` + embedded CSO/RS load via
+   `BPS_LoadEmbeddedDirectXSortShader` (build-time `dxc` output embedded by
+   `cmake/embed_binary.py`; no runtime `DirectX_Assets` folder). `SmartRenderGPU`
+   (DirectX): `DXShaderExecution`, `SetParamBuffer`, UAV/SRV bind,
+   `Execute(lineCount, 1)`.
+4. CMake: gate `HAS_HLSL` on `dxc` and Python 3; link `DirectXUtils.cpp`, `d3d12`,
+   and `d3dcompiler`; compile HLSL with `dxc` and embed `.cso`/`.rs` into the
+   `.aex` at build time.
 
 ### Phase 5 — Metal path (macOS)
 1. `GPU/BitonicPixelSorter_Kernel.metal` (or reuse `.cu` via `GF` Metal target) —
@@ -267,15 +269,22 @@ The CPU build needs none of the above.
     `RWByteAddressBuffer` destination writes, `f32tof16` brightness key packing,
     and one dispatch group per line.
   - `Source/BitonicPixelSorter_GPU.cpp` now owns `DXContext`/`ShaderObject`
-    through AE `gpu_data`, loads `DirectX_Assets/BitonicSortKernel.(cso|rs)`,
-    and dispatches through `DXShaderExecution` with CBV, dst UAV, and src SRV.
+    through AE `gpu_data` and dispatches through `DXShaderExecution` with CBV,
+    dst UAV, and src SRV.
   - CMake detects `dxc`, compiles CSO/RS assets, links `DirectXUtils.cpp`,
-    `d3d12`, and `d3dcompiler`, defines `BPS_HAS_HLSL`, and copies shader assets
-    beside Release/Debug `.aex` outputs.
+    `d3d12`, and `d3dcompiler`, and defines `BPS_HAS_HLSL`.
+  - Initial validation used runtime file loading from `DirectX_Assets/` beside
+    the `.aex` with POST_BUILD copies into `dist/Win/Release/` (superseded below).
   - Validation: `cmake --build build_cuda_verify --config Release` and
-    `--config Debug` both succeeded with CUDA + OpenCL + DirectX enabled.
-    Release produced `DirectX_Assets/BitonicSortKernel.cso` and `.rs`; `dumpbin
-    /exports` still shows `EffectMain` and `PluginDataEntryFunction2`.
+    `--config Debug` both succeeded with CUDA + OpenCL + DirectX enabled;
+    `dumpbin /exports` still shows `EffectMain` and `PluginDataEntryFunction2`.
+- 2026-06-26: DirectX shader embedding (follow-up to Phase 4):
+  - Replaced runtime `DirectX_Assets/` file loading with build-time embedding
+    via `cmake/embed_binary.py` and `BPS_LoadEmbeddedDirectXSortShader`.
+  - Removed POST_BUILD/install copies of `DirectX_Assets/`; deployment requires
+    only the built `.aex` module.
+  - Removed obsolete tracked `dist/Win/Release/DirectX_Assets/` deliverables from
+    the repository.
 - 2026-06-26: AE host-load contract fixes after in-host error screenshots:
   - Fixed PiPL / `GlobalSetup` outflags mismatch by deriving `OUT_FLAGS2` from
     the same Target header for both C++ and PiPL preprocessing. With CUDA +

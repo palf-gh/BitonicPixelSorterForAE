@@ -77,7 +77,7 @@ so tested deliverables can be attached to the repository history.
   - CUDA Toolkit for CUDA.
   - OpenCL headers and library. The CUDA Toolkit commonly supplies both.
   - Windows SDK `dxc.exe`, D3D12 and `d3dcompiler` for DirectX.
-  - Python 3 for embedding the OpenCL kernel source during configure/build.
+  - Python 3 for embedding OpenCL and DirectX shader blobs during configure/build.
 - macOS: Xcode or Command Line Tools, including `clang` and `Rez`.
 
 ### Build
@@ -111,12 +111,8 @@ Expected local outputs:
 | macOS | Release | `dist/Mac/Release/BitonicPixelSorter.plugin` |
 | macOS | Debug | `dist/Mac/Debug/BitonicPixelSorter.plugin` |
 
-When the DirectX backend is enabled, the Windows release package also includes:
-
-```text
-dist/Win/Release/DirectX_Assets/BitonicSortKernel.cso
-dist/Win/Release/DirectX_Assets/BitonicSortKernel.rs
-```
+DirectX shader bytecode and root signatures are embedded into the `.aex` at build
+time. No separate `DirectX_Assets` folder is required beside the plug-in module.
 
 ### Installing Into After Effects
 
@@ -241,7 +237,7 @@ BitonicPixelSorterForAE/
   - CUDA: CUDA Toolkit。
   - OpenCL: ヘッダとライブラリ。CUDA Toolkit に同梱されていることが多いです。
   - DirectX: Windows SDK の `dxc.exe`、D3D12、`d3dcompiler`。
-  - configure / build 時に OpenCL カーネルソースを埋め込む Python 3。
+  - configure / build 時に OpenCL および DirectX シェーダ blob を埋め込む Python 3。
 - macOS: Xcode または Command Line Tools（`clang` と `Rez` を含む）。
 
 ### ビルド
@@ -275,12 +271,8 @@ cmake --build build/Mac --config Release
 | macOS | Release | `dist/Mac/Release/BitonicPixelSorter.plugin` |
 | macOS | Debug | `dist/Mac/Debug/BitonicPixelSorter.plugin` |
 
-DirectX バックエンドを有効にした場合、Windows リリースパッケージには次も含まれます。
-
-```text
-dist/Win/Release/DirectX_Assets/BitonicSortKernel.cso
-dist/Win/Release/DirectX_Assets/BitonicSortKernel.rs
-```
+DirectX シェーダ bytecode と root signature はビルド時に `.aex` へ埋め込まれます。
+プラグインモジュール横に `DirectX_Assets` フォルダを置く必要はありません。
 
 ### After Effects へのインストール
 
@@ -401,7 +393,7 @@ BitonicPixelSorterForAE/
   - CUDA：CUDA Toolkit。
   - OpenCL：头文件与库。CUDA Toolkit 通常同时提供二者。
   - DirectX：Windows SDK 的 `dxc.exe`、D3D12 与 `d3dcompiler`。
-  - 在 configure / build 阶段嵌入 OpenCL 内核源码所需的 Python 3。
+  - 在 configure / build 阶段嵌入 OpenCL 与 DirectX 着色器 blob 所需的 Python 3。
 - macOS：Xcode 或 Command Line Tools（含 `clang` 与 `Rez`）。
 
 ### 构建
@@ -435,12 +427,7 @@ cmake --build build/Mac --config Release
 | macOS | Release | `dist/Mac/Release/BitonicPixelSorter.plugin` |
 | macOS | Debug | `dist/Mac/Debug/BitonicPixelSorter.plugin` |
 
-启用 DirectX 后端时，Windows 发布包还包含：
-
-```text
-dist/Win/Release/DirectX_Assets/BitonicSortKernel.cso
-dist/Win/Release/DirectX_Assets/BitonicSortKernel.rs
-```
+DirectX 着色器 bytecode 与 root signature 在构建时嵌入 `.aex`。无需在插件模块旁放置单独的 `DirectX_Assets` 文件夹。
 
 ### 安装到 After Effects
 
@@ -562,7 +549,7 @@ BitonicPixelSorterForAE/
   - CUDA: CUDA Toolkit.
   - OpenCL: 헤더와 라이브러리. CUDA Toolkit에 둘 다 포함되는 경우가 많습니다.
   - DirectX: Windows SDK `dxc.exe`, D3D12, `d3dcompiler`.
-  - configure / build 시 OpenCL 커널 소스를 임베드하는 Python 3.
+  - configure / build 시 OpenCL 및 DirectX 셰이더 blob을 임베드하는 Python 3.
 - macOS: Xcode 또는 Command Line Tools(`clang`, `Rez` 포함).
 
 ### 빌드
@@ -596,12 +583,7 @@ cmake --build build/Mac --config Release
 | macOS | Release | `dist/Mac/Release/BitonicPixelSorter.plugin` |
 | macOS | Debug | `dist/Mac/Debug/BitonicPixelSorter.plugin` |
 
-DirectX 백엔드를 사용하면 Windows 릴리스 패키지에 다음도 포함됩니다.
-
-```text
-dist/Win/Release/DirectX_Assets/BitonicSortKernel.cso
-dist/Win/Release/DirectX_Assets/BitonicSortKernel.rs
-```
+DirectX 셰이더 bytecode와 root signature는 빌드 시 `.aex`에 임베드됩니다. 플러그인 모듈 옆에 `DirectX_Assets` 폴더를 둘 필요가 없습니다.
 
 ### After Effects에 설치
 

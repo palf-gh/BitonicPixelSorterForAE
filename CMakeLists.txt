@@ -80,9 +80,12 @@ endif()
 
 if(WIN32)
 	find_program(BPS_DXC_EXECUTABLE NAMES dxc)
-	if(BPS_DXC_EXECUTABLE)
+	if(BPS_DXC_EXECUTABLE AND Python3_Interpreter_FOUND)
 		set(BPS_HLSL_AVAILABLE TRUE)
 		message(STATUS "BitonicPixelSorter: DirectX/HLSL enabled (${BPS_DXC_EXECUTABLE})")
+	elseif(BPS_DXC_EXECUTABLE AND NOT Python3_Interpreter_FOUND)
+		set(BPS_HLSL_AVAILABLE FALSE)
+		message(STATUS "BitonicPixelSorter: dxc found but Python3 is missing — DirectX disabled")
 	else()
 		set(BPS_HLSL_AVAILABLE FALSE)
 		message(STATUS "BitonicPixelSorter: dxc not found — DirectX disabled")
@@ -90,6 +93,8 @@ if(WIN32)
 else()
 	set(BPS_HLSL_AVAILABLE FALSE)
 endif()
+
+set(BPS_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
 include_directories(
 	"${AESDK_ROOT}/Headers"
@@ -131,7 +136,6 @@ if(BPS_CUDA_AVAILABLE)
 endif()
 
 if(BPS_OPENCL_AVAILABLE)
-	set(BPS_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 	set(BPS_OPENCL_KERNEL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/GPU/BitonicPixelSorter_Kernel.cl")
 	set(BPS_OPENCL_KERNEL_HEADER "${BPS_GENERATED_DIR}/BitonicPixelSorter_Kernel.cl.h")
 	add_custom_command(
@@ -150,12 +154,16 @@ endif()
 
 if(BPS_HLSL_AVAILABLE)
 	list(APPEND SOURCES
+		Source/BPS_DirectXShaderLoad.h
+		Source/BPS_DirectXShaderLoad.cpp
 		"${AESDK_ROOT}/Util/DirectXUtils.h"
 		"${AESDK_ROOT}/Util/DirectXUtils.cpp")
 	set(BPS_HLSL_KERNEL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/GPU/BitonicPixelSorter_Kernel.hlsl")
-	set(BPS_DIRECTX_ASSET_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/DirectX_Assets")
+	set(BPS_DIRECTX_ASSET_BUILD_DIR "${BPS_GENERATED_DIR}/DirectX_Assets")
 	set(BPS_DIRECTX_CSO "${BPS_DIRECTX_ASSET_BUILD_DIR}/BitonicSortKernel.cso")
 	set(BPS_DIRECTX_RS  "${BPS_DIRECTX_ASSET_BUILD_DIR}/BitonicSortKernel.rs")
+	set(BPS_DIRECTX_CSO_HEADER "${BPS_GENERATED_DIR}/BitonicSortKernel.cso.h")
+	set(BPS_DIRECTX_RS_HEADER  "${BPS_GENERATED_DIR}/BitonicSortKernel.rs.h")
 	add_custom_command(
 		OUTPUT "${BPS_DIRECTX_CSO}" "${BPS_DIRECTX_RS}"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${BPS_DIRECTX_ASSET_BUILD_DIR}"
@@ -169,8 +177,32 @@ if(BPS_HLSL_AVAILABLE)
 		DEPENDS "${BPS_HLSL_KERNEL_SOURCE}"
 		COMMENT "Compiling DirectX HLSL kernel..."
 		VERBATIM)
+	add_custom_command(
+		OUTPUT "${BPS_DIRECTX_CSO_HEADER}"
+		COMMAND "${Python3_EXECUTABLE}"
+			"${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.py"
+			-i "${BPS_DIRECTX_CSO}"
+			-o "${BPS_DIRECTX_CSO_HEADER}"
+			-n kBitonicSortKernel_cso
+		DEPENDS "${BPS_DIRECTX_CSO}"
+		COMMENT "Embedding DirectX CSO..."
+		VERBATIM)
+	add_custom_command(
+		OUTPUT "${BPS_DIRECTX_RS_HEADER}"
+		COMMAND "${Python3_EXECUTABLE}"
+			"${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.py"
+			-i "${BPS_DIRECTX_RS}"
+			-o "${BPS_DIRECTX_RS_HEADER}"
+			-n kBitonicSortKernel_rs
+		DEPENDS "${BPS_DIRECTX_RS}"
+		COMMENT "Embedding DirectX root signature..."
+		VERBATIM)
 	add_custom_target(${PROJECT_NAME}_directx_shaders
-		DEPENDS "${BPS_DIRECTX_CSO}" "${BPS_DIRECTX_RS}")
+		DEPENDS
+			"${BPS_DIRECTX_CSO}"
+			"${BPS_DIRECTX_RS}"
+			"${BPS_DIRECTX_CSO_HEADER}"
+			"${BPS_DIRECTX_RS_HEADER}")
 endif()
 
 set(BPS_PIPL_BACKEND_DEFINES)
@@ -425,17 +457,8 @@ endif()
 if(BPS_HLSL_AVAILABLE)
 	add_dependencies(${PROJECT_NAME} ${PROJECT_NAME}_directx_shaders)
 	target_compile_definitions(${PROJECT_NAME} PRIVATE BPS_HAS_HLSL=1)
+	target_include_directories(${PROJECT_NAME} PRIVATE "${BPS_GENERATED_DIR}")
 	target_link_libraries(${PROJECT_NAME} PRIVATE d3d12 d3dcompiler dxgi)
-	add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-		COMMAND ${CMAKE_COMMAND} -E make_directory
-			"$<TARGET_FILE_DIR:${PROJECT_NAME}>/DirectX_Assets"
-		COMMAND ${CMAKE_COMMAND} -E copy_if_different
-			"${BPS_DIRECTX_CSO}"
-			"$<TARGET_FILE_DIR:${PROJECT_NAME}>/DirectX_Assets/BitonicSortKernel.cso"
-		COMMAND ${CMAKE_COMMAND} -E copy_if_different
-			"${BPS_DIRECTX_RS}"
-			"$<TARGET_FILE_DIR:${PROJECT_NAME}>/DirectX_Assets/BitonicSortKernel.rs"
-		COMMENT "Copying DirectX shader assets...")
 endif()
 
 #------------------------------------------------------------------------------
@@ -446,16 +469,4 @@ if(BPS_AE_PLUGIN_DIR)
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different
 			"$<TARGET_FILE:${PROJECT_NAME}>" "${BPS_AE_PLUGIN_DIR}/"
 		COMMENT "Installing plugin to ${BPS_AE_PLUGIN_DIR}")
-	if(BPS_HLSL_AVAILABLE)
-		add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-			COMMAND ${CMAKE_COMMAND} -E make_directory
-				"${BPS_AE_PLUGIN_DIR}/DirectX_Assets"
-			COMMAND ${CMAKE_COMMAND} -E copy_if_different
-				"${BPS_DIRECTX_CSO}"
-				"${BPS_AE_PLUGIN_DIR}/DirectX_Assets/BitonicSortKernel.cso"
-			COMMAND ${CMAKE_COMMAND} -E copy_if_different
-				"${BPS_DIRECTX_RS}"
-				"${BPS_AE_PLUGIN_DIR}/DirectX_Assets/BitonicSortKernel.rs"
-			COMMENT "Installing DirectX shader assets to ${BPS_AE_PLUGIN_DIR}")
-	endif()
 endif()

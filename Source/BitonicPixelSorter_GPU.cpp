@@ -39,6 +39,7 @@
 #include <string>
 
 #if defined(BPS_HAS_HLSL)
+	#include "BPS_DirectXShaderLoad.h"
 	#include "DirectXUtils.h"
 	#include <dxgi1_6.h>
 #endif
@@ -468,12 +469,8 @@ PF_Err BPS_GPUDeviceSetup(
 		}
 
 		if (!err) {
-			std::wstring cso_path;
-			std::wstring sig_path;
-			BPS_DX_ERR(GetShaderPath(L"BitonicSortKernel", cso_path, sig_path));
-			BPS_DX_ERR(dx_dataP->context->LoadShader(
-				cso_path.c_str(),
-				sig_path.c_str(),
+			BPS_DX_ERR(BPS_LoadEmbeddedDirectXSortShader(
+				dx_dataP->context,
 				dx_dataP->sort_shader));
 		}
 
