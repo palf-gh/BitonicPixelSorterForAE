@@ -72,10 +72,21 @@ struct BitonicSortParams {
 	int   outputOriginY;
 	int   outputWidth;
 	int   outputHeight;
+	int   mode;
 	int   direction;
 	int   ordering;
+	int   criterion;
+	int   lineCount;
+	int   freePMin;
+	int   freeQMin;
+	int   freeLineLength;
+	int   radialLength;
 	float thresholdMin;
 	float thresholdMax;
+	float angleCos;
+	float angleSin;
+	float centerX;
+	float centerY;
 };
 
 // ---------------------------------------------------------------------------
@@ -308,10 +319,21 @@ PF_Err BPS_MetalSmartRender(
 		metal_params.outputOriginY = outputOriginY;
 		metal_params.outputWidth   = outputWidth;
 		metal_params.outputHeight  = outputHeight;
+		metal_params.mode          = (int)paramsP->mode;
 		metal_params.direction     = direction;
 		metal_params.ordering      = ordering;
+		metal_params.criterion     = (int)paramsP->criterion;
+		metal_params.lineCount     = lineCount;
+		metal_params.freePMin      = (int)paramsP->freePMin;
+		metal_params.freeQMin      = (int)paramsP->freeQMin;
+		metal_params.freeLineLength = (int)paramsP->freeLineLength;
+		metal_params.radialLength  = (int)paramsP->radialLength;
 		metal_params.thresholdMin  = paramsP->thresholdMin;
 		metal_params.thresholdMax  = paramsP->thresholdMax;
+		metal_params.angleCos      = paramsP->angleCos;
+		metal_params.angleSin      = paramsP->angleSin;
+		metal_params.centerX       = paramsP->centerX;
+		metal_params.centerY       = paramsP->centerY;
 
 		// Allocate param buffer with MTLResourceStorageModeShared.
 		// Shared mode works on both Apple Silicon (unified memory) and Intel Macs

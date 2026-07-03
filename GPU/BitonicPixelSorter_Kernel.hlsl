@@ -8,6 +8,17 @@
 #define MAX_THREADS 256u
 #define MAX_SIZE    4096u
 #define BPS_FLOAT_MAX 3.402823466e+38F
+#define BPS_TWO_PI 6.28318530717958647692f
+
+#define BPS_MODE_AXIS 1
+#define BPS_MODE_FREE_ANGLE 2
+#define BPS_MODE_ROTATION 3
+#define BPS_MODE_RADIAL 4
+
+#define BPS_CRITERION_RGB_AVERAGE 2
+#define BPS_CRITERION_RGB_PRODUCT 3
+#define BPS_CRITERION_RGB_MINIMUM 4
+#define BPS_CRITERION_RGB_MAXIMUM 5
 
 cbuffer BitonicParams : register(b0)
 {
@@ -21,10 +32,21 @@ cbuffer BitonicParams : register(b0)
 	int outputOriginY;
 	int outputWidth;
 	int outputHeight;
+	int mode;
 	int direction;
 	int ordering;
+	int criterion;
+	int lineCount;
+	int freePMin;
+	int freeQMin;
+	int freeLineLength;
+	int radialLength;
 	float thresholdMin;
 	float thresholdMax;
+	float angleCos;
+	float angleSin;
+	float centerX;
+	float centerY;
 };
 
 RWByteAddressBuffer sortTex : register(u0);
@@ -50,9 +72,21 @@ void StorePixel(RWByteAddressBuffer buf, uint index, float4 value)
 	buf.Store4(index * 16u, asuint(value));
 }
 
-float BpsBrightness(float4 c)
+float BpsSortKey(float4 c)
 {
 	// BGRA: R=.z, G=.y, B=.x
+	if (criterion == BPS_CRITERION_RGB_AVERAGE) {
+		return saturate((c.z + c.y + c.x) * (1.0f / 3.0f));
+	}
+	if (criterion == BPS_CRITERION_RGB_PRODUCT) {
+		return saturate(c.z * c.y * c.x);
+	}
+	if (criterion == BPS_CRITERION_RGB_MINIMUM) {
+		return saturate(min(min(c.z, c.y), c.x));
+	}
+	if (criterion == BPS_CRITERION_RGB_MAXIMUM) {
+		return saturate(max(max(c.z, c.y), c.x));
+	}
 	return saturate(0.298912f * c.z + 0.586611f * c.y + 0.114478f * c.x);
 }
 
@@ -81,26 +115,80 @@ bool BpsBefore(float keyA, uint indexA, float keyB, uint indexB)
 	return indexA < indexB;
 }
 
-uint SrcIndex(uint gid, uint pos)
+int BpsRoundToInt(float value)
 {
-	const int lineLayer = direction != 0 ? outputOriginY + (int)gid : outputOriginX + (int)gid;
-	const int layerX = direction != 0 ? (int)pos : lineLayer;
-	const int layerY = direction != 0 ? lineLayer : (int)pos;
-	return (uint)((layerX - inputOriginX) + (layerY - inputOriginY) * srcPitch);
+	return (int)floor(value + 0.5f);
 }
 
-uint DstIndex(uint gid, uint pos)
+uint BpsRotationLineLength(uint radius)
 {
-	const int localX = direction != 0 ? (int)pos - outputOriginX : (int)gid;
-	const int localY = direction != 0 ? (int)gid : (int)pos - outputOriginY;
-	return (uint)(localX + localY * dstPitch);
+	if (radius == 0u) {
+		return 1u;
+	}
+	uint length = (uint)ceil(BPS_TWO_PI * (float)radius);
+	return length == 0u ? 1u : length;
 }
 
-bool ShouldWrite(uint pos)
+uint BpsLineSize(uint gid)
 {
-	const int outputAxisStart = direction != 0 ? outputOriginX : outputOriginY;
-	const int outputAxisEnd = outputAxisStart + (direction != 0 ? outputWidth : outputHeight);
-	return (int)pos >= outputAxisStart && (int)pos < outputAxisEnd;
+	if (mode == BPS_MODE_FREE_ANGLE) {
+		return (uint)freeLineLength;
+	}
+	if (mode == BPS_MODE_ROTATION) {
+		return BpsRotationLineLength(gid);
+	}
+	if (mode == BPS_MODE_RADIAL) {
+		return (uint)radialLength;
+	}
+	return direction != 0 ? (uint)width : (uint)height;
+}
+
+bool BpsCoordForPos(uint gid, uint pos, out int x, out int y)
+{
+	if (mode == BPS_MODE_FREE_ANGLE) {
+		const float p = (float)(freePMin + (int)pos);
+		const float q = (float)(freeQMin + (int)gid);
+		x = BpsRoundToInt(p * angleCos - q * angleSin);
+		y = BpsRoundToInt(p * angleSin + q * angleCos);
+	} else if (mode == BPS_MODE_ROTATION) {
+		const uint lineLen = BpsRotationLineLength(gid);
+		const float theta = lineLen <= 1u ? 0.0f :
+			(BPS_TWO_PI * (float)pos) / (float)lineLen;
+		x = BpsRoundToInt(centerX + (float)gid * cos(theta));
+		y = BpsRoundToInt(centerY + (float)gid * sin(theta));
+	} else if (mode == BPS_MODE_RADIAL) {
+		const float denom = lineCount <= 0 ? 1.0f : (float)lineCount;
+		const float theta = (BPS_TWO_PI * (float)gid) / denom;
+		x = BpsRoundToInt(centerX + (float)pos * cos(theta));
+		y = BpsRoundToInt(centerY + (float)pos * sin(theta));
+	} else {
+		const int lineLayer = direction != 0 ? outputOriginY + (int)gid : outputOriginX + (int)gid;
+		x = direction != 0 ? (int)pos : lineLayer;
+		y = direction != 0 ? lineLayer : (int)pos;
+	}
+	return x >= 0 && y >= 0 && x < width && y < height;
+}
+
+bool SrcInWorld(int x, int y)
+{
+	return x >= inputOriginX && y >= inputOriginY &&
+		x < inputOriginX + width && y < inputOriginY + height;
+}
+
+bool DstInWorld(int x, int y)
+{
+	return x >= outputOriginX && y >= outputOriginY &&
+		x < outputOriginX + outputWidth && y < outputOriginY + outputHeight;
+}
+
+uint SrcIndexXY(int x, int y)
+{
+	return (uint)((x - inputOriginX) + (y - inputOriginY) * srcPitch);
+}
+
+uint DstIndexXY(int x, int y)
+{
+	return (uint)((x - outputOriginX) + (y - outputOriginY) * dstPitch);
 }
 
 [RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=1)),DescriptorTable(SRV(t0,numDescriptors=1))")]
@@ -109,11 +197,16 @@ void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 {
 	const uint gid = groupID.x;
 	const uint gtid = groupThreadID.x;
-	const uint size = direction != 0 ? (uint)width : (uint)height;
+	const uint size = BpsLineSize(gid);
+	if (size == 0u || size > MAX_SIZE) {
+		return;
+	}
 
 	for (uint pos = gtid; pos < size; pos += MAX_THREADS) {
-		if (ShouldWrite(pos)) {
-			StorePixel(sortTex, DstIndex(gid, pos), LoadPixel(srcTex, SrcIndex(gid, pos)));
+		int x = 0;
+		int y = 0;
+		if (BpsCoordForPos(gid, pos, x, y) && SrcInWorld(x, y) && DstInWorld(x, y)) {
+			StorePixel(sortTex, DstIndexXY(x, y), LoadPixel(srcTex, SrcIndexXY(x, y)));
 		}
 	}
 	GroupMemoryBarrierWithGroupSync();
@@ -123,16 +216,25 @@ void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 		if (gtid == 0u) {
 			uint spanStart = cursor;
 			while (spanStart < size) {
-				float br = BpsBrightness(LoadPixel(srcTex, SrcIndex(gid, spanStart)));
-				if (thresholdMin <= br && br <= thresholdMax) {
-					break;
+				int x = 0;
+				int y = 0;
+				if (BpsCoordForPos(gid, spanStart, x, y) && SrcInWorld(x, y)) {
+					float br = BpsSortKey(LoadPixel(srcTex, SrcIndexXY(x, y)));
+					if (thresholdMin <= br && br <= thresholdMax) {
+						break;
+					}
 				}
 				spanStart++;
 			}
 
 			uint spanEnd = spanStart;
 			while (spanEnd < size) {
-				float br = BpsBrightness(LoadPixel(srcTex, SrcIndex(gid, spanEnd)));
+				int x = 0;
+				int y = 0;
+				if (!BpsCoordForPos(gid, spanEnd, x, y) || !SrcInWorld(x, y)) {
+					break;
+				}
+				float br = BpsSortKey(LoadPixel(srcTex, SrcIndexXY(x, y)));
 				if (br < thresholdMin || br > thresholdMax) {
 					break;
 				}
@@ -163,8 +265,14 @@ void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 		for (uint loadIndex = gtid; loadIndex < sortSize; loadIndex += MAX_THREADS) {
 			if (loadIndex < spanSize) {
 				const uint pos = spanStart + loadIndex;
-				scratchKey[loadIndex] = BpsBrightness(LoadPixel(srcTex, SrcIndex(gid, pos)));
-				scratchIndex[loadIndex] = pos;
+				int x = 0;
+				int y = 0;
+				const bool valid = BpsCoordForPos(gid, pos, x, y) && SrcInWorld(x, y);
+				const uint srcIndex = valid ? SrcIndexXY(x, y) : 0xffffffffu;
+				scratchKey[loadIndex] = valid
+					? BpsSortKey(LoadPixel(srcTex, srcIndex))
+					: (ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX);
+				scratchIndex[loadIndex] = srcIndex;
 			} else {
 				scratchKey[loadIndex] = ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX;
 				scratchIndex[loadIndex] = 0xffffffffu;
@@ -201,8 +309,11 @@ void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 
 		for (uint writeIndex = gtid; writeIndex < spanSize; writeIndex += MAX_THREADS) {
 			const uint pos = spanStart + writeIndex;
-			if (ShouldWrite(pos)) {
-				StorePixel(sortTex, DstIndex(gid, pos), LoadPixel(srcTex, SrcIndex(gid, scratchIndex[writeIndex])));
+			int x = 0;
+			int y = 0;
+			if (BpsCoordForPos(gid, pos, x, y) &&
+				DstInWorld(x, y) && scratchIndex[writeIndex] != 0xffffffffu) {
+				StorePixel(sortTex, DstIndexXY(x, y), LoadPixel(srcTex, scratchIndex[writeIndex]));
 			}
 		}
 		GroupMemoryBarrierWithGroupSync();

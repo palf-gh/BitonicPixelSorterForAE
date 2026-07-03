@@ -15,9 +15,11 @@ surface from the active repository layout.
 
 ### Overview
 
-Bitonic Pixel Sorter sorts contiguous spans of pixels whose brightness falls
-inside a threshold range. Sorting can run horizontally by row or vertically by
-column, and each eligible span can be ordered ascending or descending by luma.
+Bitonic Pixel Sorter sorts contiguous spans of pixels whose selected colour key
+falls inside a threshold range. Sorting can run on horizontal/vertical axes, a
+free angle, circular rotation paths around a centre point, or radial paths from
+that centre. Each eligible span can be ordered ascending or descending by the
+same key used for thresholding.
 
 The current AE port contains:
 
@@ -35,12 +37,16 @@ validated on Apple Silicon Macs in After Effects 2023 through 2026.
 
 | Parameter | Meaning |
 | --- | --- |
-| Direction | Horizontal row sort or vertical column sort. |
-| Order | Ascending or descending brightness order. |
-| Threshold Min | Lower luma bound for sortable pixels. |
-| Threshold Max | Upper luma bound for sortable pixels. |
+| Mode | Axis, Free Angle, Rotation, or Radial sorting. |
+| Direction | Horizontal row sort or vertical column sort in Axis mode. |
+| Angle | Free Angle direction. |
+| Centre | Rotation/Radial centre point. |
+| Sort Criterion | Luminance, RGB Average, RGB Product, RGB Minimum, or RGB Maximum. |
+| Order | Ascending or descending key order. |
+| Threshold Min | Lower key bound for sortable pixels. |
+| Threshold Max | Upper key bound for sortable pixels. |
 
-The luma key follows the upstream weights:
+The default luminance key follows the upstream weights:
 
 ```text
 0.298912 * R + 0.586611 * G + 0.114478 * B
@@ -187,9 +193,10 @@ Unity プロジェクトの表層を取り除いています。
 
 ### 概要
 
-Bitonic Pixel Sorter は、輝度がしきい値範囲内に収まる連続ピクセル区間を
-ソートします。行方向の水平ソートと列方向の垂直ソートに対応し、対象区間は
-輝度の昇順または降順で並べ替えられます。
+Bitonic Pixel Sorter は、選択したカラーキーがしきい値範囲内に収まる
+連続ピクセル区間をソートします。水平/垂直の軸方向、自由角度、中心点を基準にした
+回転方向、中心点から外側へ伸びる放射方向に対応し、対象区間は同じキーの昇順または
+降順で並べ替えられます。
 
 現在の AE 移植版には次が含まれます。
 
@@ -207,12 +214,16 @@ Apple Silicon Mac 上の After Effects 2023〜2026 で検証済みです。
 
 | パラメータ | 説明 |
 | --- | --- |
-| 方向 | 行方向の水平ソート、または列方向の垂直ソート。 |
-| 並び順 | 輝度の昇順または降順。 |
-| しきい値 Min | ソート対象ピクセルの輝度下限。 |
-| しきい値 Max | ソート対象ピクセルの輝度上限。 |
+| モード | 軸方向、自由角度、回転、放射のソート方式。 |
+| 方向 | 軸方向モードでの水平ソート、または垂直ソート。 |
+| 角度 | 自由角度モードのソート方向。 |
+| 中心 | 回転/放射モードの中心点。 |
+| ソート基準 | 輝度、RGB平均、RGB積、RGB最小、RGB最大。 |
+| 並び順 | 選択キーの昇順または降順。 |
+| しきい値 Min | ソート対象ピクセルのキー下限。 |
+| しきい値 Max | ソート対象ピクセルのキー上限。 |
 
-輝度キーは上流と同じ重み付けを用います。
+既定の輝度キーは上流と同じ重み付けを用います。
 
 ```text
 0.298912 * R + 0.586611 * G + 0.114478 * B
@@ -356,8 +367,9 @@ Adobe After Effects 插件分支。算法与归属仍以原项目为准。本分
 
 ### 概述
 
-Bitonic Pixel Sorter 对亮度落在阈值范围内的连续像素区间进行排序。可按行水平
-排序或按列垂直排序，每个符合条件的区间可按亮度升序或降序排列。
+Bitonic Pixel Sorter 对所选颜色键落在阈值范围内的连续像素区间进行排序。它支持
+水平/垂直轴向、自由角度、围绕中心点的旋转路径，以及从中心点向外的放射路径。每个
+符合条件的区间可按同一键升序或降序排列。
 
 当前 AE 移植版包含：
 
@@ -374,12 +386,16 @@ Metal 已实现：可编译并链接为通用 `.plugin`，计算内核以运行�
 
 | 参数 | 含义 |
 | --- | --- |
-| 方向 | 按行水平排序或按列垂直排序。 |
-| 顺序 | 按亮度升序或降序排列。 |
-| 阈值最小值 | 可排序像素的亮度下限。 |
-| 阈值最大值 | 可排序像素的亮度上限。 |
+| 模式 | 轴向、自由角度、旋转或放射排序。 |
+| 方向 | 轴向模式下的水平或垂直排序。 |
+| 角度 | 自由角度模式的排序方向。 |
+| 中心 | 旋转/放射模式的中心点。 |
+| 排序标准 | 亮度、RGB平均值、RGB乘积、RGB最小值或RGB最大值。 |
+| 顺序 | 按所选键升序或降序排列。 |
+| 阈值最小值 | 可排序像素的键下限。 |
+| 阈值最大值 | 可排序像素的键上限。 |
 
-亮度键沿用上游权重：
+默认亮度键沿用上游权重：
 
 ```text
 0.298912 * R + 0.586611 * G + 0.114478 * B
@@ -520,9 +536,10 @@ Adobe After Effects 플러그인 포크입니다. 알고리즘과 귀속의 원�
 
 ### 개요
 
-Bitonic Pixel Sorter는 밝기가 임계값 범위 안에 들어가는 연속 픽셀 구간을
-정렬합니다. 행 단위 수평 정렬과 열 단위 수직 정렬을 지원하며, 각 대상 구간은
-휘도 기준 오름차순 또는 내림차순으로 정렬할 수 있습니다.
+Bitonic Pixel Sorter는 선택한 색상 키가 임계값 범위 안에 들어가는 연속 픽셀 구간을
+정렬합니다. 수평/수직 축 방향, 자유 각도, 중심점 기준 회전 경로, 중심점에서 바깥쪽으로
+뻗는 방사 경로를 지원하며, 각 대상 구간은 같은 키 기준 오름차순 또는 내림차순으로
+정렬할 수 있습니다.
 
 현재 AE 포트에는 다음이 포함됩니다.
 
@@ -540,12 +557,16 @@ Metal은 구현되었습니다. 유니버설 `.plugin`으로 컴파일 및 링�
 
 | 매개변수 | 의미 |
 | --- | --- |
-| 방향 | 행 단위 수평 정렬 또는 열 단위 수직 정렬. |
-| 정렬 순서 | 밝기 오름차순 또는 내림차순. |
-| 임계값 최소 | 정렬 대상 픽셀의 휘도 하한. |
-| 임계값 최대 | 정렬 대상 픽셀의 휘도 상한. |
+| 모드 | 축 방향, 자유 각도, 회전, 방사 정렬. |
+| 방향 | 축 방향 모드의 수평 또는 수직 정렬. |
+| 각도 | 자유 각도 모드의 정렬 방향. |
+| 중심 | 회전/방사 모드의 중심점. |
+| 정렬 기준 | 휘도, RGB 평균, RGB 곱, RGB 최솟값, RGB 최댓값. |
+| 정렬 순서 | 선택 키의 오름차순 또는 내림차순. |
+| 임계값 최소 | 정렬 대상 픽셀의 키 하한. |
+| 임계값 최대 | 정렬 대상 픽셀의 키 상한. |
 
-휘도 키는 상류와 동일한 가중치를 사용합니다.
+기본 휘도 키는 상류와 동일한 가중치를 사용합니다.
 
 ```text
 0.298912 * R + 0.586611 * G + 0.114478 * B

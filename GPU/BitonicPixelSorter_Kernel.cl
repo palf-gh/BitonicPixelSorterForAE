@@ -9,10 +9,34 @@
 #define MAX_THREADS 256u
 #define MAX_SIZE    4096u
 #define BPS_FLOAT_MAX 3.402823466e+38F
+#define BPS_TWO_PI 6.28318530717958647692f
 
-inline float bps_brightness(float4 c)
+#define BPS_MODE_AXIS 1
+#define BPS_MODE_FREE_ANGLE 2
+#define BPS_MODE_ROTATION 3
+#define BPS_MODE_RADIAL 4
+
+#define BPS_CRITERION_LUMINANCE 1
+#define BPS_CRITERION_RGB_AVERAGE 2
+#define BPS_CRITERION_RGB_PRODUCT 3
+#define BPS_CRITERION_RGB_MINIMUM 4
+#define BPS_CRITERION_RGB_MAXIMUM 5
+
+inline float bps_sort_key(float4 c, int criterion)
 {
 	// BGRA: R=.z, G=.y, B=.x
+	if (criterion == BPS_CRITERION_RGB_AVERAGE) {
+		return clamp((c.z + c.y + c.x) * (1.0f / 3.0f), 0.0f, 1.0f);
+	}
+	if (criterion == BPS_CRITERION_RGB_PRODUCT) {
+		return clamp(c.z * c.y * c.x, 0.0f, 1.0f);
+	}
+	if (criterion == BPS_CRITERION_RGB_MINIMUM) {
+		return clamp(fmin(fmin(c.z, c.y), c.x), 0.0f, 1.0f);
+	}
+	if (criterion == BPS_CRITERION_RGB_MAXIMUM) {
+		return clamp(fmax(fmax(c.z, c.y), c.x), 0.0f, 1.0f);
+	}
 	return clamp(0.298912f * c.z + 0.586611f * c.y + 0.114478f * c.x, 0.0f, 1.0f);
 }
 
@@ -35,6 +59,62 @@ inline bool bps_before(float keyA, uint indexA, float keyB, uint indexB)
 	return indexA < indexB;
 }
 
+inline int bps_round_to_int(float value)
+{
+	return (int)floor(value + 0.5f);
+}
+
+inline uint bps_rotation_line_length(uint radius)
+{
+	if (radius == 0u) return 1u;
+	uint length = (uint)ceil(BPS_TWO_PI * (float)radius);
+	return length == 0u ? 1u : length;
+}
+
+inline uint bps_line_size(int mode, int direction, uint gid,
+						  int width, int height,
+						  int freeLineLength, int radialLength)
+{
+	if (mode == BPS_MODE_FREE_ANGLE) return (uint)freeLineLength;
+	if (mode == BPS_MODE_ROTATION) return bps_rotation_line_length(gid);
+	if (mode == BPS_MODE_RADIAL) return (uint)radialLength;
+	return direction ? (uint)width : (uint)height;
+}
+
+inline bool bps_coord_for_pos(int mode, int direction, uint gid, uint pos,
+							  int width, int height,
+							  int outputOriginX, int outputOriginY,
+							  int lineCount,
+							  int freePMin, int freeQMin, int freeLineLength,
+							  float angleCos, float angleSin,
+							  float centerX, float centerY,
+							  int *x, int *y)
+{
+	if (mode == BPS_MODE_FREE_ANGLE) {
+		const float p = (float)(freePMin + (int)pos);
+		const float q = (float)(freeQMin + (int)gid);
+		*x = bps_round_to_int(p * angleCos - q * angleSin);
+		*y = bps_round_to_int(p * angleSin + q * angleCos);
+		(void)freeLineLength;
+	} else if (mode == BPS_MODE_ROTATION) {
+		const uint lineLen = bps_rotation_line_length(gid);
+		const float theta = (lineLen <= 1u) ? 0.0f :
+			(BPS_TWO_PI * (float)pos) / (float)lineLen;
+		*x = bps_round_to_int(centerX + (float)gid * cos(theta));
+		*y = bps_round_to_int(centerY + (float)gid * sin(theta));
+	} else if (mode == BPS_MODE_RADIAL) {
+		const float denom = lineCount <= 0 ? 1.0f : (float)lineCount;
+		const float theta = (BPS_TWO_PI * (float)gid) / denom;
+		*x = bps_round_to_int(centerX + (float)pos * cos(theta));
+		*y = bps_round_to_int(centerY + (float)pos * sin(theta));
+	} else {
+		const int lineLayer = direction ? (outputOriginY + (int)gid) : (outputOriginX + (int)gid);
+		*x = direction ? (int)pos : lineLayer;
+		*y = direction ? lineLayer : (int)pos;
+	}
+	return *x >= 0 && *y >= 0 && *x < width && *y < height;
+}
+
 __kernel void BitonicSortKernel(
 	__global const float4 *srcTex,
 	__global float4       *sortTex,
@@ -48,10 +128,21 @@ __kernel void BitonicSortKernel(
 	int                    outputOriginY,
 	int                    outputWidth,
 	int                    outputHeight,
+	int                    mode,
 	int                    direction,
 	int                    ordering,
+	int                    criterion,
+	int                    lineCount,
+	int                    freePMin,
+	int                    freeQMin,
+	int                    freeLineLength,
+	int                    radialLength,
 	float                  thresholdMin,
-	float                  thresholdMax)
+	float                  thresholdMax,
+	float                  angleCos,
+	float                  angleSin,
+	float                  centerX,
+	float                  centerY)
 {
 	// scratchKey + scratchIndex already use the full 32 KB local-memory budget
 	// guaranteed by the OpenCL spec, so the span metadata reuses scratchIndex[0..3]
@@ -64,20 +155,27 @@ __kernel void BitonicSortKernel(
 
 	const uint gid = get_group_id(0);
 	const uint gtid = get_local_id(0);
-	const uint size = direction ? (uint)width : (uint)height;
-	const int lineLayer = direction ? (outputOriginY + (int)gid) : (outputOriginX + (int)gid);
-	const int outputAxisStart = direction ? outputOriginX : outputOriginY;
-	const int outputAxisEnd = outputAxisStart + (direction ? outputWidth : outputHeight);
+	const uint size = bps_line_size(mode, direction, gid, width, height,
+									freeLineLength, radialLength);
+	if (size == 0u || size > MAX_SIZE) {
+		return;
+	}
 
-	#define BPS_SRC_INDEX(pos) ((uint)(((direction ? (int)(pos) : lineLayer) - inputOriginX) + \
-								((direction ? lineLayer : (int)(pos)) - inputOriginY) * srcPitch))
-	#define BPS_DST_INDEX(pos) ((uint)(((direction ? (int)(pos) - outputOriginX : (int)gid)) + \
-								((direction ? (int)gid : (int)(pos) - outputOriginY) * dstPitch)))
-	#define BPS_SHOULD_WRITE(pos) ((int)(pos) >= outputAxisStart && (int)(pos) < outputAxisEnd)
+	#define BPS_SRC_IN_WORLD(x, y) ((x) >= inputOriginX && (y) >= inputOriginY && \
+									(x) < inputOriginX + width && (y) < inputOriginY + height)
+	#define BPS_DST_IN_WORLD(x, y) ((x) >= outputOriginX && (y) >= outputOriginY && \
+									(x) < outputOriginX + outputWidth && (y) < outputOriginY + outputHeight)
+	#define BPS_SRC_INDEX_XY(x, y) ((uint)(((x) - inputOriginX) + ((y) - inputOriginY) * srcPitch))
+	#define BPS_DST_INDEX_XY(x, y) ((uint)(((x) - outputOriginX) + ((y) - outputOriginY) * dstPitch))
 
 	for (uint pos = gtid; pos < size; pos += MAX_THREADS) {
-		if (BPS_SHOULD_WRITE(pos)) {
-			sortTex[BPS_DST_INDEX(pos)] = srcTex[BPS_SRC_INDEX(pos)];
+		int x = 0, y = 0;
+		if (bps_coord_for_pos(mode, direction, gid, pos, width, height,
+							  outputOriginX, outputOriginY, lineCount,
+							  freePMin, freeQMin, freeLineLength,
+							  angleCos, angleSin, centerX, centerY, &x, &y) &&
+			BPS_SRC_IN_WORLD(x, y) && BPS_DST_IN_WORLD(x, y)) {
+			sortTex[BPS_DST_INDEX_XY(x, y)] = srcTex[BPS_SRC_INDEX_XY(x, y)];
 		}
 	}
 	barrier(CLK_LOCAL_MEM_FENCE);
@@ -87,14 +185,27 @@ __kernel void BitonicSortKernel(
 		if (gtid == 0u) {
 			uint spanStart = cursor;
 			while (spanStart < size) {
-				float br = bps_brightness(srcTex[BPS_SRC_INDEX(spanStart)]);
-				if (thresholdMin <= br && br <= thresholdMax) break;
+				int x = 0, y = 0;
+				if (bps_coord_for_pos(mode, direction, gid, spanStart, width, height,
+									  outputOriginX, outputOriginY, lineCount,
+									  freePMin, freeQMin, freeLineLength,
+									  angleCos, angleSin, centerX, centerY, &x, &y) &&
+					BPS_SRC_IN_WORLD(x, y)) {
+					float br = bps_sort_key(srcTex[BPS_SRC_INDEX_XY(x, y)], criterion);
+					if (thresholdMin <= br && br <= thresholdMax) break;
+				}
 				spanStart++;
 			}
 
 			uint spanEnd = spanStart;
 			while (spanEnd < size) {
-				float br = bps_brightness(srcTex[BPS_SRC_INDEX(spanEnd)]);
+				int x = 0, y = 0;
+				if (!bps_coord_for_pos(mode, direction, gid, spanEnd, width, height,
+									   outputOriginX, outputOriginY, lineCount,
+									   freePMin, freeQMin, freeLineLength,
+									   angleCos, angleSin, centerX, centerY, &x, &y) ||
+					!BPS_SRC_IN_WORLD(x, y)) break;
+				float br = bps_sort_key(srcTex[BPS_SRC_INDEX_XY(x, y)], criterion);
 				if (br < thresholdMin || br > thresholdMax) break;
 				spanEnd++;
 			}
@@ -123,8 +234,16 @@ __kernel void BitonicSortKernel(
 		for (uint i = gtid; i < sortSize; i += MAX_THREADS) {
 			if (i < spanSize) {
 				const uint pos = spanStart + i;
-				scratchKey[i] = bps_brightness(srcTex[BPS_SRC_INDEX(pos)]);
-				scratchIndex[i] = pos;
+				int x = 0, y = 0;
+				const bool valid = bps_coord_for_pos(mode, direction, gid, pos, width, height,
+													 outputOriginX, outputOriginY, lineCount,
+													 freePMin, freeQMin, freeLineLength,
+													 angleCos, angleSin, centerX, centerY, &x, &y) &&
+								   BPS_SRC_IN_WORLD(x, y);
+				const uint srcIndex = valid ? BPS_SRC_INDEX_XY(x, y) : 0xffffffffu;
+				scratchKey[i] = valid ? bps_sort_key(srcTex[srcIndex], criterion) :
+					(ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX);
+				scratchIndex[i] = srcIndex;
 			} else {
 				scratchKey[i] = ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX;
 				scratchIndex[i] = 0xffffffffu;
@@ -159,8 +278,13 @@ __kernel void BitonicSortKernel(
 
 		for (uint i = gtid; i < spanSize; i += MAX_THREADS) {
 			const uint pos = spanStart + i;
-			if (BPS_SHOULD_WRITE(pos)) {
-				sortTex[BPS_DST_INDEX(pos)] = srcTex[BPS_SRC_INDEX(scratchIndex[i])];
+			int x = 0, y = 0;
+			if (bps_coord_for_pos(mode, direction, gid, pos, width, height,
+								  outputOriginX, outputOriginY, lineCount,
+								  freePMin, freeQMin, freeLineLength,
+								  angleCos, angleSin, centerX, centerY, &x, &y) &&
+				BPS_DST_IN_WORLD(x, y) && scratchIndex[i] != 0xffffffffu) {
+				sortTex[BPS_DST_INDEX_XY(x, y)] = srcTex[scratchIndex[i]];
 			}
 		}
 		barrier(CLK_LOCAL_MEM_FENCE);
@@ -168,7 +292,8 @@ __kernel void BitonicSortKernel(
 		cursor = spanEnd + 1u;
 	}
 
-	#undef BPS_SRC_INDEX
-	#undef BPS_DST_INDEX
-	#undef BPS_SHOULD_WRITE
+	#undef BPS_SRC_IN_WORLD
+	#undef BPS_DST_IN_WORLD
+	#undef BPS_SRC_INDEX_XY
+	#undef BPS_DST_INDEX_XY
 }

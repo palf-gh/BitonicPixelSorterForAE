@@ -9,10 +9,22 @@ namespace AELocalise {
 namespace JA_JP {
 inline const char *GetString(LocKey::Key key) {
   switch (key) {
+  case LocKey::STR_MODE_NAME:
+    return "モード";
+  case LocKey::STR_MODE_ITEMS:
+    return "軸方向|自由角度|回転|放射";
   case LocKey::STR_DIRECTION_NAME:
     return "方向";
   case LocKey::STR_DIRECTION_ITEMS:
     return "水平|垂直";
+  case LocKey::STR_ANGLE_NAME:
+    return "角度";
+  case LocKey::STR_CENTER_NAME:
+    return "中心";
+  case LocKey::STR_SORT_CRITERION_NAME:
+    return "ソート基準";
+  case LocKey::STR_SORT_CRITERION_ITEMS:
+    return "輝度|RGB平均|RGB積|RGB最小|RGB最大";
   case LocKey::STR_ORDER_NAME:
     return "並び順";
   case LocKey::STR_ORDER_ITEMS:

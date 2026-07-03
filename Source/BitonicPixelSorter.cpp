@@ -18,7 +18,9 @@
 	#include <cstdarg>
 	#include <cstdio>
 #endif
+#include <algorithm>
 #include <cstdlib>
+#include <cmath>
 #include <new>
 #include <string>
 
@@ -32,6 +34,95 @@
 #include "Localise/AELocalise.h"
 
 namespace {
+
+constexpr double BPS_PI = 3.14159265358979323846;
+
+static A_long
+BPS_ClampPopup(A_long value, A_long min_value, A_long max_value, A_long default_value)
+{
+	return (value >= min_value && value <= max_value) ? value : default_value;
+}
+
+static float
+BPS_RationalScale(const PF_RationalScale &scale)
+{
+	if (scale.num <= 0 || scale.den <= 0) {
+		return 1.0f;
+	}
+	return static_cast<float>(scale.num) / static_cast<float>(scale.den);
+}
+
+static void
+BPS_ResolvePathGeometry(PF_InData *in_data, BitonicSorterParams *paramsP)
+{
+	const A_long frameW = in_data ? in_data->width : 0;
+	const A_long frameH = in_data ? in_data->height : 0;
+
+	paramsP->freePMin = 0;
+	paramsP->freeQMin = 0;
+	paramsP->freeLineLength = 0;
+	paramsP->freeLineCount = 0;
+	paramsP->radialLength = 0;
+	paramsP->radialLineCount = 0;
+	paramsP->maxLineLength = 0;
+
+	if (frameW <= 0 || frameH <= 0) {
+		return;
+	}
+
+	if (paramsP->mode == BPS_MODE_FREE_ANGLE) {
+		const double c = paramsP->angleCos;
+		const double s = paramsP->angleSin;
+		const double xs[4] = {0.0, static_cast<double>(frameW - 1), 0.0, static_cast<double>(frameW - 1)};
+		const double ys[4] = {0.0, 0.0, static_cast<double>(frameH - 1), static_cast<double>(frameH - 1)};
+		double minP = xs[0] * c + ys[0] * s;
+		double maxP = minP;
+		double minQ = -xs[0] * s + ys[0] * c;
+		double maxQ = minQ;
+		for (int i = 1; i < 4; ++i) {
+			const double p = xs[i] * c + ys[i] * s;
+			const double q = -xs[i] * s + ys[i] * c;
+			minP = (p < minP) ? p : minP;
+			maxP = (p > maxP) ? p : maxP;
+			minQ = (q < minQ) ? q : minQ;
+			maxQ = (q > maxQ) ? q : maxQ;
+		}
+		paramsP->freePMin = static_cast<A_long>(std::floor(minP));
+		paramsP->freeQMin = static_cast<A_long>(std::floor(minQ));
+		paramsP->freeLineLength = static_cast<A_long>(std::floor(maxP)) - paramsP->freePMin + 1;
+		paramsP->freeLineCount = static_cast<A_long>(std::floor(maxQ)) - paramsP->freeQMin + 1;
+		paramsP->maxLineLength = paramsP->freeLineLength;
+		return;
+	}
+
+	if (paramsP->mode == BPS_MODE_ROTATION || paramsP->mode == BPS_MODE_RADIAL) {
+		const double xs[4] = {0.0, static_cast<double>(frameW - 1), 0.0, static_cast<double>(frameW - 1)};
+		const double ys[4] = {0.0, 0.0, static_cast<double>(frameH - 1), static_cast<double>(frameH - 1)};
+		double maxRadius = 0.0;
+		for (int i = 0; i < 4; ++i) {
+			const double dx = xs[i] - paramsP->centerX;
+			const double dy = ys[i] - paramsP->centerY;
+			const double radius = std::sqrt(dx * dx + dy * dy);
+			maxRadius = (radius > maxRadius) ? radius : maxRadius;
+		}
+		const A_long radiusCeil = static_cast<A_long>(std::ceil(maxRadius));
+		paramsP->radialLength = radiusCeil + 1;
+		paramsP->radialLineCount = static_cast<A_long>(std::ceil(2.0 * BPS_PI * maxRadius));
+		if (paramsP->radialLineCount < 1) {
+			paramsP->radialLineCount = 1;
+		}
+		paramsP->maxLineLength = (paramsP->mode == BPS_MODE_RADIAL)
+			? paramsP->radialLength
+			: static_cast<A_long>(std::ceil(2.0 * BPS_PI * radiusCeil));
+		if (paramsP->maxLineLength < 1) {
+			paramsP->maxLineLength = 1;
+		}
+		return;
+	}
+
+	paramsP->maxLineLength =
+		(paramsP->direction == BPS_DIR_HORIZONTAL) ? frameW : frameH;
+}
 
 #if defined(BPS_RENDER_DIAG)
 static const char *
@@ -166,7 +257,17 @@ ParamsSetup(
 	PF_Err		err = PF_Err_NONE;
 	PF_ParamDef	def;
 
-	// GPU acceleration status (read-only custom UI) — first user control after input.
+	// Mode: first visible control. Its ID is appended for compatibility, but it
+	// is registered before older controls so it appears at the top of the ECW.
+	AEFX_CLR_STRUCT(def);
+	{
+		std::string name  = AELocalise::GetStringForAE(LocKey::STR_MODE_NAME, in_data);
+		std::string items = AELocalise::GetStringForAE(LocKey::STR_MODE_ITEMS, in_data);
+		def.flags = PF_ParamFlag_SUPERVISE | PF_ParamFlag_USE_VALUE_FOR_OLD_PROJECTS;
+		PF_ADD_POPUP(name.c_str(), 4, BPS_MODE_DFLT, items.c_str(), BPS_MODE);
+	}
+
+	// GPU acceleration status (read-only custom UI).
 	AEFX_CLR_STRUCT(def);
 	{
 		std::string name =
@@ -200,6 +301,32 @@ ParamsSetup(
 		PF_ADD_POPUP(name.c_str(), 2, BPS_DIRECTION_DFLT, items.c_str(), BPS_DIRECTION);
 	}
 
+	// Free-angle direction.
+	AEFX_CLR_STRUCT(def);
+	{
+		std::string name = AELocalise::GetStringForAE(LocKey::STR_ANGLE_NAME, in_data);
+		def.flags = PF_ParamFlag_USE_VALUE_FOR_OLD_PROJECTS;
+		PF_ADD_ANGLE(name.c_str(), BPS_ANGLE_DFLT, BPS_ANGLE);
+	}
+
+	// Rotation / radial centre point.
+	AEFX_CLR_STRUCT(def);
+	{
+		std::string name = AELocalise::GetStringForAE(LocKey::STR_CENTER_NAME, in_data);
+		def.flags = PF_ParamFlag_USE_VALUE_FOR_OLD_PROJECTS;
+		PF_ADD_POINT(name.c_str(), BPS_CENTER_X_DFLT, BPS_CENTER_Y_DFLT, FALSE, BPS_CENTER);
+	}
+
+	// Sort criterion.
+	AEFX_CLR_STRUCT(def);
+	{
+		std::string name  = AELocalise::GetStringForAE(LocKey::STR_SORT_CRITERION_NAME, in_data);
+		std::string items = AELocalise::GetStringForAE(LocKey::STR_SORT_CRITERION_ITEMS, in_data);
+		def.flags = PF_ParamFlag_USE_VALUE_FOR_OLD_PROJECTS;
+		PF_ADD_POPUP(name.c_str(), 5, BPS_SORT_CRITERION_DFLT,
+					 items.c_str(), BPS_SORT_CRITERION);
+	}
+
 	// Order (Ascending / Descending).
 	AEFX_CLR_STRUCT(def);
 	{
@@ -208,7 +335,7 @@ ParamsSetup(
 		PF_ADD_POPUP(name.c_str(), 2, BPS_ORDER_DFLT, items.c_str(), BPS_ORDER);
 	}
 
-	// Threshold Min (brightness lower bound, shown as a percentage).
+	// Threshold Min (selected key lower bound, shown as a percentage).
 	AEFX_CLR_STRUCT(def);
 	{
 		std::string name = AELocalise::GetStringForAE(LocKey::STR_THRESHOLD_MIN, in_data);
@@ -216,7 +343,7 @@ ParamsSetup(
 							 1, PF_ValueDisplayFlag_PERCENT, 0, BPS_THRESHOLD_MIN);
 	}
 
-	// Threshold Max (brightness upper bound, shown as a percentage).
+	// Threshold Max (selected key upper bound, shown as a percentage).
 	AEFX_CLR_STRUCT(def);
 	{
 		std::string name = AELocalise::GetStringForAE(LocKey::STR_THRESHOLD_MAX, in_data);
@@ -280,27 +407,64 @@ PreRender(
 	PF_ParamDef cur_param;
 
 	AEFX_CLR_STRUCT(cur_param);
-	ERR(PF_CHECKOUT_PARAM(in_data, BPS_DIRECTION, in_data->current_time,
+	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_MODE, in_data->current_time,
 						  in_data->time_step, in_data->time_scale, &cur_param));
-	infoP->direction = cur_param.u.pd.value;	// 1 = Horizontal, 2 = Vertical
+	infoP->mode = BPS_ClampPopup(cur_param.u.pd.value,
+								 BPS_MODE_AXIS, BPS_MODE_RADIAL, BPS_MODE_DFLT);
 
 	AEFX_CLR_STRUCT(cur_param);
-	ERR(PF_CHECKOUT_PARAM(in_data, BPS_ORDER, in_data->current_time,
+	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_DIRECTION, in_data->current_time,
+						  in_data->time_step, in_data->time_scale, &cur_param));
+	infoP->direction = BPS_ClampPopup(cur_param.u.pd.value,
+									  BPS_DIR_HORIZONTAL, BPS_DIR_VERTICAL,
+									  BPS_DIRECTION_DFLT);
+
+	AEFX_CLR_STRUCT(cur_param);
+	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_ORDER, in_data->current_time,
 						  in_data->time_step, in_data->time_scale, &cur_param));
 	infoP->ascending = (cur_param.u.pd.value == BPS_ORDER_ASCENDING) ? 1 : 0;
 
 	AEFX_CLR_STRUCT(cur_param);
-	ERR(PF_CHECKOUT_PARAM(in_data, BPS_THRESHOLD_MIN, in_data->current_time,
+	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_SORT_CRITERION, in_data->current_time,
+						  in_data->time_step, in_data->time_scale, &cur_param));
+	infoP->criterion = BPS_ClampPopup(cur_param.u.pd.value,
+									  BPS_CRITERION_LUMINANCE,
+									  BPS_CRITERION_RGB_MAXIMUM,
+									  BPS_SORT_CRITERION_DFLT);
+
+	AEFX_CLR_STRUCT(cur_param);
+	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_ANGLE, in_data->current_time,
+						  in_data->time_step, in_data->time_scale, &cur_param));
+	const double angle_degrees = FIX_2_FLOAT(cur_param.u.ad.value);
+	infoP->angleRadians = static_cast<float>(angle_degrees * BPS_PI / 180.0);
+	infoP->angleCos = static_cast<float>(std::cos(infoP->angleRadians));
+	infoP->angleSin = static_cast<float>(std::sin(infoP->angleRadians));
+
+	infoP->downsampleX = BPS_RationalScale(in_data->downsample_x);
+	infoP->downsampleY = BPS_RationalScale(in_data->downsample_y);
+
+	AEFX_CLR_STRUCT(cur_param);
+	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_CENTER, in_data->current_time,
+						  in_data->time_step, in_data->time_scale, &cur_param));
+	infoP->centerX = static_cast<float>(FIX_2_FLOAT(cur_param.u.td.x_value) *
+										infoP->downsampleX);
+	infoP->centerY = static_cast<float>(FIX_2_FLOAT(cur_param.u.td.y_value) *
+										infoP->downsampleY);
+
+	AEFX_CLR_STRUCT(cur_param);
+	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_THRESHOLD_MIN, in_data->current_time,
 						  in_data->time_step, in_data->time_scale, &cur_param));
 	infoP->thresholdMin = (float)(cur_param.u.fs_d.value / 100.0);
 
 	AEFX_CLR_STRUCT(cur_param);
-	ERR(PF_CHECKOUT_PARAM(in_data, BPS_THRESHOLD_MAX, in_data->current_time,
+	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_THRESHOLD_MAX, in_data->current_time,
 						  in_data->time_step, in_data->time_scale, &cur_param));
 	infoP->thresholdMax = (float)(cur_param.u.fs_d.value / 100.0);
 
+	BPS_ResolvePathGeometry(in_data, infoP);
+
 	const BpsGpuEligibility gpu_eligibility =
-		BPS_EvaluateGpuEligibility(in_data, infoP->direction, output_rect);
+		BPS_EvaluateGpuEligibility(in_data, infoP->maxLineLength, output_rect);
 	if (gpu_eligibility.render_possible) {
 		extraP->output->flags |= PF_RenderOutputFlag_GPU_RENDER_POSSIBLE;
 	}
@@ -308,7 +472,7 @@ PreRender(
 #if defined(BPS_RENDER_DIAG)
 	BPS_DiagLog(
 		"PreRender output_request=(%ld,%ld,%ld,%ld) clipped=(%ld,%ld,%ld,%ld) "
-		"gpu_possible=%d reason=%s frame=%ldx%ld direction=%ld",
+		"gpu_possible=%d reason=%s frame=%ldx%ld mode=%ld direction=%ld criterion=%ld max_line=%ld",
 		static_cast<long>(raw_req.rect.left),
 		static_cast<long>(raw_req.rect.top),
 		static_cast<long>(raw_req.rect.right),
@@ -321,14 +485,19 @@ PreRender(
 		GpuBlockReasonName(gpu_eligibility.reason),
 		static_cast<long>(in_data->width),
 		static_cast<long>(in_data->height),
-		static_cast<long>(infoP->direction));
+		static_cast<long>(infoP->mode),
+		static_cast<long>(infoP->direction),
+		static_cast<long>(infoP->criterion),
+		static_cast<long>(infoP->maxLineLength));
 #endif
 
 	// Pixel sorting needs the complete sort axis for each requested output
 	// pixel. Expand only the dependency axis, while keeping the produced result
 	// within AE's requested output rectangle.
 	req.rect = output_rect;
-	if (infoP->direction == BPS_DIR_HORIZONTAL) {
+	if (infoP->mode != BPS_MODE_AXIS) {
+		req.rect = BPS_FrameRect(in_data);
+	} else if (infoP->direction == BPS_DIR_HORIZONTAL) {
 		req.rect.left = 0;
 		req.rect.right = in_data->width;
 	} else {
@@ -427,6 +596,22 @@ SmartRender(
 
 	ERR2(extraP->cb->checkin_layer_pixels(in_data->effect_ref, BPS_INPUT));
 	return err;
+}
+
+//-----------------------------------------------------------------------------
+static PF_Err
+UserChangedParam(
+	PF_InData					*in_data,
+	PF_OutData					*out_data,
+	PF_ParamDef					*params[],
+	PF_LayerDef					*output,
+	PF_UserChangedParamExtra		*extraP)
+{
+	if (extraP && extraP->param_index == BPS_UI_MODE) {
+		out_data->out_flags |= PF_OutFlag_SEND_UPDATE_PARAMS_UI;
+		return BPS_UpdateParamsUI(in_data, out_data, params, output);
+	}
+	return PF_Err_NONE;
 }
 
 //-----------------------------------------------------------------------------
@@ -545,6 +730,10 @@ EffectMain(
 		case PF_Cmd_EVENT:
 			err = BPS_HandleEvent(in_data, out_data, params, output,
 								  reinterpret_cast<PF_EventExtra *>(extra));
+			break;
+		case PF_Cmd_USER_CHANGED_PARAM:
+			err = UserChangedParam(in_data, out_data, params, output,
+								   reinterpret_cast<PF_UserChangedParamExtra *>(extra));
 			break;
 		case PF_Cmd_UPDATE_PARAMS_UI:
 			err = BPS_UpdateParamsUI(in_data, out_data, params, output);

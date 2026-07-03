@@ -8,7 +8,7 @@
 	Buffer bindings:
 	  buffer(0) - srcTex     : device const float4*   (source image)
 	  buffer(1) - sortTex    : device float4*          (destination image)
-	  buffer(2) - params     : constant BitonicSortParams& (14 scalar params packed)
+	  buffer(2) - params     : constant BitonicSortParams& (host-packed scalar params)
 
 	Threadgroup memory budget:
 	  scratchKey[4096]   = 4096 * 4 bytes = 16 384 bytes
@@ -25,6 +25,17 @@ using namespace metal;
 #define MAX_THREADS 256u
 #define MAX_SIZE    4096u
 #define BPS_FLOAT_MAX 3.402823466e+38F
+#define BPS_TWO_PI 6.28318530717958647692f
+
+#define BPS_MODE_AXIS 1
+#define BPS_MODE_FREE_ANGLE 2
+#define BPS_MODE_ROTATION 3
+#define BPS_MODE_RADIAL 4
+
+#define BPS_CRITERION_RGB_AVERAGE 2
+#define BPS_CRITERION_RGB_PRODUCT 3
+#define BPS_CRITERION_RGB_MINIMUM 4
+#define BPS_CRITERION_RGB_MAXIMUM 5
 
 // ---------------------------------------------------------------------------
 // Parameter struct - must match BitonicSortParams in BPS_MetalBackend.mm
@@ -42,18 +53,41 @@ struct BitonicSortParams {
 	int outputOriginY;
 	int outputWidth;
 	int outputHeight;
+	int mode;
 	int direction;
 	int ordering;
+	int criterion;
+	int lineCount;
+	int freePMin;
+	int freeQMin;
+	int freeLineLength;
+	int radialLength;
 	float thresholdMin;
 	float thresholdMax;
+	float angleCos;
+	float angleSin;
+	float centerX;
+	float centerY;
 };
 
 // ---------------------------------------------------------------------------
 // Helper functions - direct ports of the OpenCL inline helpers.
 // ---------------------------------------------------------------------------
-inline float bps_brightness(float4 c)
+inline float bps_sort_key(float4 c, int criterion)
 {
 	// BGRA: R=.z, G=.y, B=.x
+	if (criterion == BPS_CRITERION_RGB_AVERAGE) {
+		return clamp((c.z + c.y + c.x) * (1.0f / 3.0f), 0.0f, 1.0f);
+	}
+	if (criterion == BPS_CRITERION_RGB_PRODUCT) {
+		return clamp(c.z * c.y * c.x, 0.0f, 1.0f);
+	}
+	if (criterion == BPS_CRITERION_RGB_MINIMUM) {
+		return clamp(min(min(c.z, c.y), c.x), 0.0f, 1.0f);
+	}
+	if (criterion == BPS_CRITERION_RGB_MAXIMUM) {
+		return clamp(max(max(c.z, c.y), c.x), 0.0f, 1.0f);
+	}
 	return clamp(0.298912f * c.z + 0.586611f * c.y + 0.114478f * c.x, 0.0f, 1.0f);
 }
 
@@ -76,6 +110,77 @@ inline bool bps_before(float keyA, uint indexA, float keyB, uint indexB)
 	return indexA < indexB;
 }
 
+inline int bps_round_to_int(float value)
+{
+	return (int)floor(value + 0.5f);
+}
+
+inline uint bps_rotation_line_length(uint radius)
+{
+	if (radius == 0u) return 1u;
+	const uint length = (uint)ceil(BPS_TWO_PI * (float)radius);
+	return length == 0u ? 1u : length;
+}
+
+inline uint bps_line_size(constant BitonicSortParams &p, uint gid)
+{
+	if (p.mode == BPS_MODE_FREE_ANGLE) return (uint)p.freeLineLength;
+	if (p.mode == BPS_MODE_ROTATION) return bps_rotation_line_length(gid);
+	if (p.mode == BPS_MODE_RADIAL) return (uint)p.radialLength;
+	return p.direction ? (uint)p.width : (uint)p.height;
+}
+
+inline bool bps_coord_for_pos(constant BitonicSortParams &p, uint gid, uint pos,
+							  thread int *x, thread int *y)
+{
+	if (p.mode == BPS_MODE_FREE_ANGLE) {
+		const float pp = (float)(p.freePMin + (int)pos);
+		const float q = (float)(p.freeQMin + (int)gid);
+		*x = bps_round_to_int(pp * p.angleCos - q * p.angleSin);
+		*y = bps_round_to_int(pp * p.angleSin + q * p.angleCos);
+	} else if (p.mode == BPS_MODE_ROTATION) {
+		const uint lineLen = bps_rotation_line_length(gid);
+		const float theta = (lineLen <= 1u) ? 0.0f :
+			(BPS_TWO_PI * (float)pos) / (float)lineLen;
+		*x = bps_round_to_int(p.centerX + (float)gid * cos(theta));
+		*y = bps_round_to_int(p.centerY + (float)gid * sin(theta));
+	} else if (p.mode == BPS_MODE_RADIAL) {
+		const float denom = p.lineCount <= 0 ? 1.0f : (float)p.lineCount;
+		const float theta = (BPS_TWO_PI * (float)gid) / denom;
+		*x = bps_round_to_int(p.centerX + (float)pos * cos(theta));
+		*y = bps_round_to_int(p.centerY + (float)pos * sin(theta));
+	} else {
+		const int lineLayer = p.direction
+			? (p.outputOriginY + (int)gid)
+			: (p.outputOriginX + (int)gid);
+		*x = p.direction ? (int)pos : lineLayer;
+		*y = p.direction ? lineLayer : (int)pos;
+	}
+	return *x >= 0 && *y >= 0 && *x < p.width && *y < p.height;
+}
+
+inline bool bps_src_in_world(constant BitonicSortParams &p, int x, int y)
+{
+	return x >= p.inputOriginX && y >= p.inputOriginY &&
+		x < p.inputOriginX + p.width && y < p.inputOriginY + p.height;
+}
+
+inline bool bps_dst_in_world(constant BitonicSortParams &p, int x, int y)
+{
+	return x >= p.outputOriginX && y >= p.outputOriginY &&
+		x < p.outputOriginX + p.outputWidth && y < p.outputOriginY + p.outputHeight;
+}
+
+inline uint bps_src_index_xy(constant BitonicSortParams &p, int x, int y)
+{
+	return (uint)((x - p.inputOriginX) + (y - p.inputOriginY) * p.srcPitch);
+}
+
+inline uint bps_dst_index_xy(constant BitonicSortParams &p, int x, int y)
+{
+	return (uint)((x - p.outputOriginX) + (y - p.outputOriginY) * p.dstPitch);
+}
+
 // ---------------------------------------------------------------------------
 // Kernel
 // ---------------------------------------------------------------------------
@@ -96,28 +201,18 @@ kernel void BitonicSortKernel(
 	threadgroup float scratchKey[MAX_SIZE];
 	threadgroup uint  scratchIndex[MAX_SIZE];
 
-	const uint size = p.direction ? (uint)p.width : (uint)p.height;
-	const int lineLayer = p.direction
-		? (p.outputOriginY + (int)gid)
-		: (p.outputOriginX + (int)gid);
-	const int outputAxisStart = p.direction ? p.outputOriginX : p.outputOriginY;
-	const int outputAxisEnd   = outputAxisStart + (p.direction ? p.outputWidth : p.outputHeight);
-
-#define BPS_SRC_INDEX(pos) \
-	((uint)(((p.direction ? (int)(pos) : lineLayer) - p.inputOriginX) + \
-	        ((p.direction ? lineLayer : (int)(pos)) - p.inputOriginY) * p.srcPitch))
-
-#define BPS_DST_INDEX(pos) \
-	((uint)(((p.direction ? (int)(pos) - p.outputOriginX : (int)gid)) + \
-	        ((p.direction ? (int)gid : (int)(pos) - p.outputOriginY) * p.dstPitch)))
-
-#define BPS_SHOULD_WRITE(pos) \
-	((int)(pos) >= outputAxisStart && (int)(pos) < outputAxisEnd)
+	const uint size = bps_line_size(p, gid);
+	if (size == 0u || size > MAX_SIZE) {
+		return;
+	}
 
 	// Copy source pixels that belong to this line's output range.
 	for (uint pos = gtid; pos < size; pos += MAX_THREADS) {
-		if (BPS_SHOULD_WRITE(pos)) {
-			sortTex[BPS_DST_INDEX(pos)] = srcTex[BPS_SRC_INDEX(pos)];
+		int x = 0;
+		int y = 0;
+		if (bps_coord_for_pos(p, gid, pos, &x, &y) &&
+			bps_src_in_world(p, x, y) && bps_dst_in_world(p, x, y)) {
+			sortTex[bps_dst_index_xy(p, x, y)] = srcTex[bps_src_index_xy(p, x, y)];
 		}
 	}
 	threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -129,14 +224,23 @@ kernel void BitonicSortKernel(
 		if (gtid == 0u) {
 			uint spanStart = cursor;
 			while (spanStart < size) {
-				float br = bps_brightness(srcTex[BPS_SRC_INDEX(spanStart)]);
-				if (p.thresholdMin <= br && br <= p.thresholdMax) break;
+				int x = 0;
+				int y = 0;
+				if (bps_coord_for_pos(p, gid, spanStart, &x, &y) &&
+					bps_src_in_world(p, x, y)) {
+					float br = bps_sort_key(srcTex[bps_src_index_xy(p, x, y)], p.criterion);
+					if (p.thresholdMin <= br && br <= p.thresholdMax) break;
+				}
 				spanStart++;
 			}
 
 			uint spanEnd = spanStart;
 			while (spanEnd < size) {
-				float br = bps_brightness(srcTex[BPS_SRC_INDEX(spanEnd)]);
+				int x = 0;
+				int y = 0;
+				if (!bps_coord_for_pos(p, gid, spanEnd, &x, &y) ||
+					!bps_src_in_world(p, x, y)) break;
+				float br = bps_sort_key(srcTex[bps_src_index_xy(p, x, y)], p.criterion);
 				if (br < p.thresholdMin || br > p.thresholdMax) break;
 				spanEnd++;
 			}
@@ -166,8 +270,15 @@ kernel void BitonicSortKernel(
 		for (uint i = gtid; i < sortSize; i += MAX_THREADS) {
 			if (i < spanSize) {
 				const uint pos = spanStart + i;
-				scratchKey[i]   = bps_brightness(srcTex[BPS_SRC_INDEX(pos)]);
-				scratchIndex[i] = pos;
+				int x = 0;
+				int y = 0;
+				const bool valid = bps_coord_for_pos(p, gid, pos, &x, &y) &&
+					bps_src_in_world(p, x, y);
+				const uint srcIndex = valid ? bps_src_index_xy(p, x, y) : 0xffffffffu;
+				scratchKey[i] = valid
+					? bps_sort_key(srcTex[srcIndex], p.criterion)
+					: (ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX);
+				scratchIndex[i] = srcIndex;
 			} else {
 				scratchKey[i]   = ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX;
 				scratchIndex[i] = 0xffffffffu;
@@ -202,8 +313,11 @@ kernel void BitonicSortKernel(
 
 		for (uint i = gtid; i < spanSize; i += MAX_THREADS) {
 			const uint pos = spanStart + i;
-			if (BPS_SHOULD_WRITE(pos)) {
-				sortTex[BPS_DST_INDEX(pos)] = srcTex[BPS_SRC_INDEX(scratchIndex[i])];
+			int x = 0;
+			int y = 0;
+			if (bps_coord_for_pos(p, gid, pos, &x, &y) &&
+				bps_dst_in_world(p, x, y) && scratchIndex[i] != 0xffffffffu) {
+				sortTex[bps_dst_index_xy(p, x, y)] = srcTex[scratchIndex[i]];
 			}
 		}
 		threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -211,7 +325,4 @@ kernel void BitonicSortKernel(
 		cursor = spanEnd + 1u;
 	}
 
-#undef BPS_SRC_INDEX
-#undef BPS_DST_INDEX
-#undef BPS_SHOULD_WRITE
 }

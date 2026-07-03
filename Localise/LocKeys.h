@@ -5,8 +5,14 @@
 // "Item1|Item2" string (the form PF_ADD_POPUP expects), localised as a whole.
 namespace LocKey {
 enum Key {
+  STR_MODE_NAME,
+  STR_MODE_ITEMS,        // "Axis|Free Angle|Rotation|Radial"
   STR_DIRECTION_NAME,
   STR_DIRECTION_ITEMS,   // "Horizontal|Vertical"
+  STR_ANGLE_NAME,
+  STR_CENTER_NAME,
+  STR_SORT_CRITERION_NAME,
+  STR_SORT_CRITERION_ITEMS,
   STR_ORDER_NAME,
   STR_ORDER_ITEMS,       // "Ascending|Descending"
   STR_THRESHOLD_MIN,

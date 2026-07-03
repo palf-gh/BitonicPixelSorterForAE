@@ -77,12 +77,12 @@ bool BPS_ShouldAcceptGpuDeviceSetup(
 
 inline BpsGpuEligibility BPS_EvaluateGpuEligibility(
 	const PF_InData *in_data,
-	A_long direction,
+	A_long max_sort_axis_len,
 	const PF_LRect &output_rect)
 {
 #if !defined(BPS_GPU_ENABLED)
 	(void)in_data;
-	(void)direction;
+	(void)max_sort_axis_len;
 	(void)output_rect;
 	return {false, BpsGpuBlockReason::NoBackendCompiled};
 #else
@@ -95,9 +95,7 @@ inline BpsGpuEligibility BPS_EvaluateGpuEligibility(
 		return {false, BpsGpuBlockReason::HostPremiere};
 	}
 
-	const A_long sort_axis_len =
-		(direction == BPS_DIR_HORIZONTAL) ? in_data->width : in_data->height;
-	if (sort_axis_len > BPS_GPU_MAX_LINE) {
+	if (max_sort_axis_len > BPS_GPU_MAX_LINE) {
 		return {false, BpsGpuBlockReason::SortAxisTooLong};
 	}
 

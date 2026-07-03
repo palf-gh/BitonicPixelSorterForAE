@@ -9,10 +9,22 @@ namespace AELocalise {
 namespace KO_KR {
 inline const char *GetString(LocKey::Key key) {
   switch (key) {
+  case LocKey::STR_MODE_NAME:
+    return "모드";
+  case LocKey::STR_MODE_ITEMS:
+    return "축 방향|자유 각도|회전|방사";
   case LocKey::STR_DIRECTION_NAME:
     return "방향";
   case LocKey::STR_DIRECTION_ITEMS:
     return "수평|수직";
+  case LocKey::STR_ANGLE_NAME:
+    return "각도";
+  case LocKey::STR_CENTER_NAME:
+    return "중심";
+  case LocKey::STR_SORT_CRITERION_NAME:
+    return "정렬 기준";
+  case LocKey::STR_SORT_CRITERION_ITEMS:
+    return "휘도|RGB 평균|RGB 곱|RGB 최솟값|RGB 최댓값";
   case LocKey::STR_ORDER_NAME:
     return "정렬";
   case LocKey::STR_ORDER_ITEMS:

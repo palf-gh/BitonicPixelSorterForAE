@@ -56,7 +56,10 @@
 		int srcPitch, int dstPitch, int width, int height,
 		int inputOriginX, int inputOriginY,
 		int outputOriginX, int outputOriginY, int outputWidth, int outputHeight,
-		int direction, int ordering, float thresholdMin, float thresholdMax);
+		int mode, int direction, int ordering, int criterion, int lineCount,
+		int freePMin, int freeQMin, int freeLineLength, int radialLength,
+		float thresholdMin, float thresholdMax,
+		float angleCos, float angleSin, float centerX, float centerY);
 #endif
 
 #if defined(BPS_HAS_OPENCL)
@@ -110,10 +113,21 @@ struct DirectXSortParams {
 	int outputOriginY;
 	int outputWidth;
 	int outputHeight;
+	int mode;
 	int direction;
 	int ordering;
+	int criterion;
+	int lineCount;
+	int freePMin;
+	int freeQMin;
+	int freeLineLength;
+	int radialLength;
 	float thresholdMin;
 	float thresholdMax;
+	float angleCos;
+	float angleSin;
+	float centerX;
+	float centerY;
 };
 
 inline PF_Err DXErr(bool success)
@@ -581,8 +595,15 @@ PF_Err BPS_SmartRenderGPU(
 		return PF_Err_UNRECOGNIZED_PARAM_TYPE;
 	}
 
+	const int mode = static_cast<int>(paramsP->mode);
 	const int direction = (paramsP->direction == BPS_DIR_HORIZONTAL) ? 1 : 0;
-	const int lineCount = direction ? output_worldP->height : output_worldP->width;
+	const int lineCount = (paramsP->mode == BPS_MODE_AXIS)
+		? (direction ? output_worldP->height : output_worldP->width)
+		: ((paramsP->mode == BPS_MODE_FREE_ANGLE)
+			? static_cast<int>(paramsP->freeLineCount)
+			: ((paramsP->mode == BPS_MODE_ROTATION)
+				? static_cast<int>(paramsP->radialLength)
+				: static_cast<int>(paramsP->radialLineCount)));
 	if (lineCount <= 0) {
 		return PF_Err_NONE;
 	}
@@ -630,6 +651,11 @@ PF_Err BPS_SmartRenderGPU(
 	const int outputWidth = output_worldP->width;
 	const int outputHeight = output_worldP->height;
 	const int ordering  = paramsP->ascending ? 1 : 0;
+	const int criterion = static_cast<int>(paramsP->criterion);
+	const int freePMin = static_cast<int>(paramsP->freePMin);
+	const int freeQMin = static_cast<int>(paramsP->freeQMin);
+	const int freeLineLength = static_cast<int>(paramsP->freeLineLength);
+	const int radialLength = static_cast<int>(paramsP->radialLength);
 
 	if (err) {
 		return err;
@@ -663,10 +689,21 @@ PF_Err BPS_SmartRenderGPU(
 		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &outputOriginY));
 		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &outputWidth));
 		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &outputHeight));
+		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &mode));
 		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &direction));
 		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &ordering));
+		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &criterion));
+		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &lineCount));
+		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &freePMin));
+		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &freeQMin));
+		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &freeLineLength));
+		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &radialLength));
 		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &paramsP->thresholdMin));
 		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &paramsP->thresholdMax));
+		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &paramsP->angleCos));
+		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &paramsP->angleSin));
+		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &paramsP->centerX));
+		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &paramsP->centerY));
 
 		const size_t local = 256;
 		const size_t global = static_cast<size_t>(lineCount) * local;
@@ -702,7 +739,11 @@ PF_Err BPS_SmartRenderGPU(
 			BitonicSort_CUDA(src_mem, dst_mem, srcPitch, dstPitch, width, height,
 							 inputOriginX, inputOriginY, outputOriginX, outputOriginY,
 							 outputWidth, outputHeight,
-							 direction, ordering, paramsP->thresholdMin, paramsP->thresholdMax);
+							 mode, direction, ordering, criterion, lineCount,
+							 freePMin, freeQMin, freeLineLength, radialLength,
+							 paramsP->thresholdMin, paramsP->thresholdMax,
+							 paramsP->angleCos, paramsP->angleSin,
+							 paramsP->centerX, paramsP->centerY);
 
 		if (cuda_result != cudaSuccess) {
 			(void)cudaGetLastError();
@@ -754,10 +795,21 @@ PF_Err BPS_SmartRenderGPU(
 			outputOriginY,
 			outputWidth,
 			outputHeight,
+			mode,
 			direction,
 			ordering,
+			criterion,
+			lineCount,
+			freePMin,
+			freeQMin,
+			freeLineLength,
+			radialLength,
 			paramsP->thresholdMin,
-			paramsP->thresholdMax
+			paramsP->thresholdMax,
+			paramsP->angleCos,
+			paramsP->angleSin,
+			paramsP->centerX,
+			paramsP->centerY
 		};
 
 		DXShaderExecution shader_execution(
@@ -795,6 +847,8 @@ PF_Err BPS_SmartRenderGPU(
 
 	// No backend matched — should not be reached when BPS_GPU_ENABLED is set.
 	(void)src_mem; (void)dst_mem; (void)srcPitch; (void)dstPitch;
-	(void)width; (void)height; (void)direction; (void)ordering;
+	(void)width; (void)height; (void)mode; (void)direction; (void)ordering;
+	(void)criterion; (void)freePMin; (void)freeQMin; (void)freeLineLength;
+	(void)radialLength; (void)lineCount;
 	return PF_Err_UNRECOGNIZED_PARAM_TYPE;
 }

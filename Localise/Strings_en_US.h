@@ -9,10 +9,22 @@ namespace AELocalise {
 namespace EN_US {
 inline const char *GetString(LocKey::Key key) {
   switch (key) {
+  case LocKey::STR_MODE_NAME:
+    return "Mode";
+  case LocKey::STR_MODE_ITEMS:
+    return "Axis|Free Angle|Rotation|Radial";
   case LocKey::STR_DIRECTION_NAME:
     return "Direction";
   case LocKey::STR_DIRECTION_ITEMS:
     return "Horizontal|Vertical";
+  case LocKey::STR_ANGLE_NAME:
+    return "Angle";
+  case LocKey::STR_CENTER_NAME:
+    return "Centre";
+  case LocKey::STR_SORT_CRITERION_NAME:
+    return "Sort Criterion";
+  case LocKey::STR_SORT_CRITERION_ITEMS:
+    return "Luminance|RGB Average|RGB Product|RGB Minimum|RGB Maximum";
   case LocKey::STR_ORDER_NAME:
     return "Order";
   case LocKey::STR_ORDER_ITEMS:

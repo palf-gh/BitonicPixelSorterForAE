@@ -30,6 +30,8 @@
 #include "AE_EffectGPUSuites.h"
 #include "PrSDKAESupport.h"
 
+#include <cmath>
+
 #ifdef AE_OS_WIN
 	#include <Windows.h>
 #endif
@@ -55,9 +57,30 @@ enum {
 	BPS_GPU_STATUS,			// custom UI: GPU acceleration status (read-only)
 	BPS_DIRECTION,			// popup: Horizontal / Vertical
 	BPS_ORDER,				// popup: Ascending / Descending
-	BPS_THRESHOLD_MIN,		// float slider, brightness lower bound (%)
-	BPS_THRESHOLD_MAX,		// float slider, brightness upper bound (%)
+	BPS_THRESHOLD_MIN,		// float slider, selected key lower bound (%)
+	BPS_THRESHOLD_MAX,		// float slider, selected key upper bound (%)
+	BPS_MODE,				// popup: Axis / Free Angle / Rotation / Radial
+	BPS_ANGLE,				// angle: Free Angle direction
+	BPS_CENTER,				// point: Rotation / Radial centre
+	BPS_SORT_CRITERION,		// popup: sort/threshold key
 	BPS_NUM_PARAMS
+};
+
+// Current UI/checkout indexes. These are deliberately separate from persisted
+// parameter IDs so new controls can appear above older streams without
+// renumbering the IDs stored in existing After Effects projects.
+enum {
+	BPS_UI_INPUT = 0,
+	BPS_UI_MODE,
+	BPS_UI_GPU_STATUS,
+	BPS_UI_DIRECTION,
+	BPS_UI_ANGLE,
+	BPS_UI_CENTER,
+	BPS_UI_SORT_CRITERION,
+	BPS_UI_ORDER,
+	BPS_UI_THRESHOLD_MIN,
+	BPS_UI_THRESHOLD_MAX,
+	BPS_UI_NUM_PARAMS
 };
 
 // Direction popup choices (1-based, as AE popups are).
@@ -66,15 +89,37 @@ enum {
 	BPS_DIR_VERTICAL		// sort along Y within each column
 };
 
+// Mode popup choices (1-based).
+enum {
+	BPS_MODE_AXIS = 1,
+	BPS_MODE_FREE_ANGLE,
+	BPS_MODE_ROTATION,
+	BPS_MODE_RADIAL
+};
+
 // Order popup choices (1-based).
 enum {
 	BPS_ORDER_ASCENDING = 1,
 	BPS_ORDER_DESCENDING
 };
 
+// Sort criterion popup choices (1-based).
+enum {
+	BPS_CRITERION_LUMINANCE = 1,
+	BPS_CRITERION_RGB_AVERAGE,
+	BPS_CRITERION_RGB_PRODUCT,
+	BPS_CRITERION_RGB_MINIMUM,
+	BPS_CRITERION_RGB_MAXIMUM
+};
+
 // Parameter defaults.
 #define BPS_DIRECTION_DFLT		BPS_DIR_HORIZONTAL
+#define BPS_MODE_DFLT			BPS_MODE_AXIS
 #define BPS_ORDER_DFLT			BPS_ORDER_ASCENDING
+#define BPS_ANGLE_DFLT			0.0
+#define BPS_CENTER_X_DFLT		50.0
+#define BPS_CENTER_Y_DFLT		50.0
+#define BPS_SORT_CRITERION_DFLT	BPS_CRITERION_LUMINANCE
 #define BPS_THRESHOLD_MIN_DFLT	40.0	// percent (upstream default 0.4)
 #define BPS_THRESHOLD_MAX_DFLT	60.0	// percent (upstream default 0.6)
 
@@ -87,15 +132,31 @@ enum {
 // Resolved parameters, computed at PreRender and consumed at (Smart)Render.
 //-----------------------------------------------------------------------------
 typedef struct {
+	A_long	mode;			// BPS_MODE_*
 	A_long	direction;		// BPS_DIR_HORIZONTAL or BPS_DIR_VERTICAL
 	A_long	ascending;		// 1 = ascending, 0 = descending
+	A_long	criterion;		// BPS_CRITERION_*
 	float	thresholdMin;	// normalised 0..1
 	float	thresholdMax;	// normalised 0..1
+	float	angleRadians;
+	float	angleCos;
+	float	angleSin;
+	float	centerX;		// render-space layer coordinate
+	float	centerY;		// render-space layer coordinate
+	float	downsampleX;
+	float	downsampleY;
+	A_long	freePMin;
+	A_long	freeQMin;
+	A_long	freeLineLength;
+	A_long	freeLineCount;
+	A_long	radialLength;
+	A_long	radialLineCount;
+	A_long	maxLineLength;
 } BitonicSorterParams;
 
 //-----------------------------------------------------------------------------
 // CPU render entry (implemented in BitonicPixelSorter_CPU.cpp).
-// Sorts contiguous in-threshold spans of each line by brightness. No size limit,
+// Sorts contiguous in-threshold spans of each line by the selected key. No size limit,
 // supports 8/16/32-bit. Acts as the GPU fallback and the correctness oracle.
 //-----------------------------------------------------------------------------
 PF_Err BPS_SortImageCPU(

@@ -53,7 +53,7 @@
 // PiPL uses PF_Stage_DEVELOP=0 ... RELEASE=3 numeric below)
 //-----------------------------------------------------------------------------
 #define	MAJOR_VERSION	1
-#define	MINOR_VERSION	0
+#define	MINOR_VERSION	1
 #define	BUG_VERSION		0
 #define	STAGE_VERSION	3		// PF_Stage_RELEASE (numeric, so the PiPL preprocessor needs no AE enums)
 #define	BUILD_VERSION	1
@@ -61,8 +61,8 @@
 // Packed version, identical bit layout to PF_VERSION() in AE_EffectVers.h.
 // Used by the PiPL resource (AE_Effect_Version) and GlobalSetup (my_version).
 // PiPLtool's expression parser does not accept shifts or the 'L' suffix, so this
-// is a precomputed literal. For (1,0,0,3,1): (1<<19)|(3<<9)|1 = 525825.
-#define	BPS_VERSION_PACKED	525825
+// is a precomputed literal. For (1,1,0,3,1): (1<<19)|(1<<14)|(3<<9)|1 = 542209.
+#define	BPS_VERSION_PACKED	542209
 
 //-----------------------------------------------------------------------------
 // Global out-flags (see AE_Effect.h). Written as explicit integer literals so
