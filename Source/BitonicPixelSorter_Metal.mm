@@ -44,6 +44,7 @@
 #include "BPS_MetalBackend.h"
 #include "BitonicPixelSorter_Kernel.metal.h"	// kBitonicPixelSorter_Kernel_MetalString
 
+#include <cstdint>
 #include <cstring>
 #include <new>
 
@@ -53,7 +54,11 @@
 // in plain malloc'd memory without ARC tracking.
 // ---------------------------------------------------------------------------
 struct MetalGPUData {
-	void *sort_pipeline_bridge;	// CFBridgingRetain'd id<MTLComputePipelineState>
+	void *sort_pipeline_bridge;			// CFBridgingRetain'd id<MTLComputePipelineState>
+	void *domain_sort_pipeline_bridge;
+	void *apply_domain_pipeline_bridge;
+	void *copy_pipeline_bridge;
+	void *mapped_sort_pipeline_bridge;
 };
 
 // ---------------------------------------------------------------------------
@@ -76,17 +81,27 @@ struct BitonicSortParams {
 	int   direction;
 	int   ordering;
 	int   criterion;
+	int   trigger;
+	int   affect;
+	float cycleDegrees;
 	int   lineCount;
 	int   freePMin;
 	int   freeQMin;
 	int   freeLineLength;
 	int   radialLength;
+	int   domainStride;
 	float thresholdMin;
 	float thresholdMax;
 	float angleCos;
 	float angleSin;
 	float centerX;
 	float centerY;
+	float swirlK;
+	int   swirlLineMin;
+	int   pathDirection;
+	int   pathSMin;
+	int   pathNMin;
+	int   pathSampleCount;
 };
 
 // ---------------------------------------------------------------------------
@@ -141,30 +156,37 @@ PF_Err BPS_MetalDeviceSetup(
 			return PF_Err_INTERNAL_STRUCT_DAMAGED;
 		}
 
-		id<MTLFunction> sortFunction =
-			[library newFunctionWithName:@"BitonicSortKernel"];
-		// library is ARC-managed; it is released when it goes out of scope.
-
-		if (!sortFunction) {
-			return PF_Err_INTERNAL_STRUCT_DAMAGED;
+		NSString *kernel_names[5] = {
+			@"BitonicSortKernel",
+			@"BitonicSortDomainKernel",
+			@"BitonicApplyDomainKernel",
+			@"BitonicCopyInputKernel",
+			@"BitonicSortMappedKernel"
+		};
+		id<MTLComputePipelineState> pipelines[5] = {nil, nil, nil, nil, nil};
+		for (int i = 0; i < 5; ++i) {
+			id<MTLFunction> function = [library newFunctionWithName:kernel_names[i]];
+			if (!function) {
+				return PF_Err_INTERNAL_STRUCT_DAMAGED;
+			}
+			nsErr = nil;
+			pipelines[i] = [device newComputePipelineStateWithFunction:function error:&nsErr];
+			if (!pipelines[i]) {
+				return PF_Err_INTERNAL_STRUCT_DAMAGED;
+			}
+			// Sort kernels use 32 KB of threadgroup memory; apply does not, but
+			// the same device budget check is harmless.
+			if ([pipelines[i] staticThreadgroupMemoryLength] >
+				[device maxThreadgroupMemoryLength]) {
+				return PF_Err_INTERNAL_STRUCT_DAMAGED;
+			}
 		}
 
-		nsErr = nil;
-		id<MTLComputePipelineState> pipeline =
-			[device newComputePipelineStateWithFunction:sortFunction error:&nsErr];
-		// sortFunction is ARC-managed; released when it goes out of scope.
-
-		if (!pipeline) {
-			return PF_Err_INTERNAL_STRUCT_DAMAGED;
-		}
-
-		// After building the pipeline, also validate its static threadgroup
-		// memory consumption.  For this kernel the arrays are compile-time sized
-		// (no runtime-dynamic allocation), so staticThreadgroupMemoryLength should
-		// report 32 768.  Guard against future kernel changes that exceed the budget.
-		if ([pipeline staticThreadgroupMemoryLength] > [device maxThreadgroupMemoryLength]) {
-			return PF_Err_INTERNAL_STRUCT_DAMAGED;
-		}
+		id<MTLComputePipelineState> sort_pipeline = pipelines[0];
+		id<MTLComputePipelineState> domain_sort_pipeline = pipelines[1];
+		id<MTLComputePipelineState> apply_domain_pipeline = pipelines[2];
+		id<MTLComputePipelineState> copy_pipeline = pipelines[3];
+		id<MTLComputePipelineState> mapped_sort_pipeline = pipelines[4];
 
 		// Allocate the PF_Handle to hold MetalGPUData.
 		PF_Handle gpu_dataH = handle_suite->host_new_handle(sizeof(MetalGPUData));
@@ -176,13 +198,21 @@ PF_Err BPS_MetalDeviceSetup(
 			reinterpret_cast<MetalGPUData *>(*gpu_dataH);
 		std::memset(metal_dataP, 0, sizeof(MetalGPUData));
 
-		// Transfer ownership of the pipeline out of ARC into the PF_Handle.
+		// Transfer ownership of the pipelines out of ARC into the PF_Handle.
 		// CFBridgingRetain moves the ARC-managed object into manual retain/release:
 		// ARC no longer releases the object; we are now responsible.  The matching
 		// CFBridgingRelease in setdown restores ARC ownership briefly (to a local
-		// variable), which releases on exit.  Do NOT call [pipeline release] after
-		// this — CFBridgingRetain already consumed the +1 from newComputePipeline…
-		metal_dataP->sort_pipeline_bridge = const_cast<void *>(CFBridgingRetain(pipeline));
+		// variable), which releases on exit.
+		metal_dataP->sort_pipeline_bridge =
+			const_cast<void *>(CFBridgingRetain(sort_pipeline));
+		metal_dataP->domain_sort_pipeline_bridge =
+			const_cast<void *>(CFBridgingRetain(domain_sort_pipeline));
+		metal_dataP->apply_domain_pipeline_bridge =
+			const_cast<void *>(CFBridgingRetain(apply_domain_pipeline));
+		metal_dataP->copy_pipeline_bridge =
+			const_cast<void *>(CFBridgingRetain(copy_pipeline));
+		metal_dataP->mapped_sort_pipeline_bridge =
+			const_cast<void *>(CFBridgingRetain(mapped_sort_pipeline));
 
 		extraP->output->gpu_data = gpu_dataH;
 		out_dataP->out_flags2 = PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
@@ -219,14 +249,42 @@ PF_Err BPS_MetalDeviceSetdown(
 			MetalGPUData *metal_dataP =
 				reinterpret_cast<MetalGPUData *>(*gpu_dataH);
 
-			// Release the pipeline: balance the CFBridgingRetain from setup.
+			// Release pipelines: balance the CFBridgingRetain from setup.
 			// CFBridgingRelease transfers the +1 into a local ARC variable that
 			// immediately goes out of scope, decrementing the retain count.
+			if (metal_dataP->mapped_sort_pipeline_bridge) {
+				id<MTLComputePipelineState> pipeline =
+					(id<MTLComputePipelineState>)CFBridgingRelease(
+						metal_dataP->mapped_sort_pipeline_bridge);
+				(void)pipeline;
+				metal_dataP->mapped_sort_pipeline_bridge = nullptr;
+			}
+			if (metal_dataP->copy_pipeline_bridge) {
+				id<MTLComputePipelineState> pipeline =
+					(id<MTLComputePipelineState>)CFBridgingRelease(
+						metal_dataP->copy_pipeline_bridge);
+				(void)pipeline;
+				metal_dataP->copy_pipeline_bridge = nullptr;
+			}
+			if (metal_dataP->apply_domain_pipeline_bridge) {
+				id<MTLComputePipelineState> pipeline =
+					(id<MTLComputePipelineState>)CFBridgingRelease(
+						metal_dataP->apply_domain_pipeline_bridge);
+				(void)pipeline;
+				metal_dataP->apply_domain_pipeline_bridge = nullptr;
+			}
+			if (metal_dataP->domain_sort_pipeline_bridge) {
+				id<MTLComputePipelineState> pipeline =
+					(id<MTLComputePipelineState>)CFBridgingRelease(
+						metal_dataP->domain_sort_pipeline_bridge);
+				(void)pipeline;
+				metal_dataP->domain_sort_pipeline_bridge = nullptr;
+			}
 			if (metal_dataP->sort_pipeline_bridge) {
 				id<MTLComputePipelineState> pipeline =
 					(id<MTLComputePipelineState>)CFBridgingRelease(
 						metal_dataP->sort_pipeline_bridge);
-				(void)pipeline; // ARC releases on scope exit
+				(void)pipeline;
 				metal_dataP->sort_pipeline_bridge = nullptr;
 			}
 
@@ -283,7 +341,7 @@ PF_Err BPS_MetalSmartRender(
 		                             &device_info));
 		if (err) { return err; }
 
-		// Recover the pipeline from the PF_Handle.
+		// Recover pipelines from the PF_Handle.
 		PF_Handle gpu_dataH =
 			reinterpret_cast<PF_Handle>(
 				const_cast<void *>(extraP->input->gpu_data));
@@ -294,11 +352,20 @@ PF_Err BPS_MetalSmartRender(
 		MetalGPUData *metal_dataP =
 			reinterpret_cast<MetalGPUData *>(*gpu_dataH);
 
-		// __bridge cast: we do NOT transfer ownership; the pipeline is still owned
+		// __bridge cast: we do NOT transfer ownership; pipelines remain owned
 		// by the CFBridgingRetain in the PF_Handle.
-		id<MTLComputePipelineState> pipeline =
+		id<MTLComputePipelineState> sort_pipeline =
 			(__bridge id<MTLComputePipelineState>)metal_dataP->sort_pipeline_bridge;
-		if (!pipeline) {
+		id<MTLComputePipelineState> domain_sort_pipeline =
+			(__bridge id<MTLComputePipelineState>)metal_dataP->domain_sort_pipeline_bridge;
+		id<MTLComputePipelineState> apply_domain_pipeline =
+			(__bridge id<MTLComputePipelineState>)metal_dataP->apply_domain_pipeline_bridge;
+		id<MTLComputePipelineState> copy_pipeline =
+			(__bridge id<MTLComputePipelineState>)metal_dataP->copy_pipeline_bridge;
+		id<MTLComputePipelineState> mapped_sort_pipeline =
+			(__bridge id<MTLComputePipelineState>)metal_dataP->mapped_sort_pipeline_bridge;
+		if (!sort_pipeline || !domain_sort_pipeline || !apply_domain_pipeline ||
+			!copy_pipeline || !mapped_sort_pipeline) {
 			return PF_Err_INTERNAL_STRUCT_DAMAGED;
 		}
 
@@ -323,17 +390,38 @@ PF_Err BPS_MetalSmartRender(
 		metal_params.direction     = direction;
 		metal_params.ordering      = ordering;
 		metal_params.criterion     = (int)paramsP->criterion;
+		metal_params.trigger       = (int)paramsP->trigger;
+		metal_params.affect        = (int)paramsP->affect;
+		metal_params.cycleDegrees  = paramsP->cycleDegrees;
 		metal_params.lineCount     = lineCount;
 		metal_params.freePMin      = (int)paramsP->freePMin;
 		metal_params.freeQMin      = (int)paramsP->freeQMin;
 		metal_params.freeLineLength = (int)paramsP->freeLineLength;
-		metal_params.radialLength  = (int)paramsP->radialLength;
+		metal_params.radialLength  = (paramsP->mode == BPS_MODE_PATH)
+			? (int)paramsP->domainMaxLineLength
+			: (int)paramsP->radialLength;
+		{
+			int stride = (int)paramsP->domainMaxLineLength;
+			if (stride > 1) {
+				unsigned int v = (unsigned int)stride - 1u;
+				v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
+				stride = (int)(v + 1u);
+			}
+			stride *= 2; // 2x: guarantees spanStart + sortSize <= domainStride
+			metal_params.domainStride = stride;
+		}
 		metal_params.thresholdMin  = paramsP->thresholdMin;
 		metal_params.thresholdMax  = paramsP->thresholdMax;
 		metal_params.angleCos      = paramsP->angleCos;
 		metal_params.angleSin      = paramsP->angleSin;
 		metal_params.centerX       = paramsP->centerX;
 		metal_params.centerY       = paramsP->centerY;
+		metal_params.swirlK        = paramsP->swirlK;
+		metal_params.swirlLineMin  = (int)paramsP->swirlLineMin;
+		metal_params.pathDirection = (int)paramsP->pathDirection;
+		metal_params.pathSMin      = (int)paramsP->pathSMin;
+		metal_params.pathNMin      = (int)paramsP->pathNMin;
+		metal_params.pathSampleCount = (int)paramsP->pathSampleCount;
 
 		// Allocate param buffer with MTLResourceStorageModeShared.
 		// Shared mode works on both Apple Silicon (unified memory) and Intel Macs
@@ -350,31 +438,181 @@ PF_Err BPS_MetalSmartRender(
 		id<MTLBuffer> src_buffer = (__bridge id<MTLBuffer>)src_mem;
 		id<MTLBuffer> dst_buffer = (__bridge id<MTLBuffer>)dst_mem;
 
-		// Encode and commit.
-		id<MTLCommandBuffer>        commandBuffer  = [queue commandBuffer];
-		id<MTLComputeCommandEncoder> computeEncoder =
-			[commandBuffer computeCommandEncoder];
+		const NSUInteger pathCount =
+			paramsP->pathSampleCount > 0
+				? (NSUInteger)paramsP->pathSampleCount
+				: 1u;
+		const NSUInteger pathBytes = pathCount * sizeof(float) * 5u;
+		id<MTLBuffer> pathBuffer =
+			[device newBufferWithLength:pathBytes
+			                    options:MTLResourceStorageModeShared];
+		if (!pathBuffer) {
+			return PF_Err_OUT_OF_MEMORY;
+		}
+		std::memset([pathBuffer contents], 0, pathBytes);
+		if (paramsP->pathSampleCount > 0 && paramsP->pathSamples) {
+			std::memcpy([pathBuffer contents], paramsP->pathSamples,
+						(size_t)paramsP->pathSampleCount * sizeof(float) * 5u);
+		}
 
-		[computeEncoder setComputePipelineState:pipeline];
-		[computeEncoder setBuffer:src_buffer  offset:0 atIndex:0];	// buffer(0) srcTex
-		[computeEncoder setBuffer:dst_buffer  offset:0 atIndex:1];	// buffer(1) sortTex
-		[computeEncoder setBuffer:paramBuffer offset:0 atIndex:2];	// buffer(2) params
+		id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
 
-		// One threadgroup per line, 256 threads per threadgroup (matches MAX_THREADS
-		// in the kernel and the OpenCL local size).
-		MTLSize threadgroupsPerGrid  = MTLSizeMake((NSUInteger)lineCount, 1, 1);
-		MTLSize threadsPerThreadgroup = MTLSizeMake(256, 1, 1);
-		[computeEncoder dispatchThreadgroups:threadgroupsPerGrid
-		               threadsPerThreadgroup:threadsPerThreadgroup];
+		if (paramsP->mode == BPS_MODE_AXIS) {
+			id<MTLComputeCommandEncoder> computeEncoder =
+				[commandBuffer computeCommandEncoder];
 
-		[computeEncoder endEncoding];
+			[computeEncoder setComputePipelineState:sort_pipeline];
+			[computeEncoder setBuffer:src_buffer  offset:0 atIndex:0];
+			[computeEncoder setBuffer:dst_buffer  offset:0 atIndex:1];
+			[computeEncoder setBuffer:paramBuffer offset:0 atIndex:2];
+			[computeEncoder setBuffer:pathBuffer  offset:0 atIndex:3];
+
+			MTLSize threadgroupsPerGrid  = MTLSizeMake((NSUInteger)lineCount, 1, 1);
+			MTLSize threadsPerThreadgroup = MTLSizeMake(256, 1, 1);
+			[computeEncoder dispatchThreadgroups:threadgroupsPerGrid
+			               threadsPerThreadgroup:threadsPerThreadgroup];
+			[computeEncoder endEncoding];
+		} else if (paramsP->mode == BPS_MODE_PATH) {
+			id<MTLComputeCommandEncoder> copyEncoder =
+				[commandBuffer computeCommandEncoder];
+			[copyEncoder setComputePipelineState:copy_pipeline];
+			[copyEncoder setBuffer:src_buffer  offset:0 atIndex:0];
+			[copyEncoder setBuffer:dst_buffer  offset:0 atIndex:1];
+			[copyEncoder setBuffer:paramBuffer offset:0 atIndex:2];
+			const NSUInteger copyGroupsX =
+				((NSUInteger)outputWidth + 15u) / 16u;
+			const NSUInteger copyGroupsY =
+				((NSUInteger)outputHeight + 15u) / 16u;
+			[copyEncoder dispatchThreadgroups:MTLSizeMake(copyGroupsX, copyGroupsY, 1)
+			            threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+			[copyEncoder endEncoding];
+
+			if (paramsP->mappedRecordCount > 0 &&
+				paramsP->mappedWorkItemCount > 0 &&
+				paramsP->mappedRecords &&
+				paramsP->mappedLineOffsets &&
+				paramsP->mappedWorkOffsets) {
+				const NSUInteger recordsBytes =
+					(NSUInteger)paramsP->mappedRecordCount *
+					(NSUInteger)sizeof(BpsMappedPixelRecord);
+				const NSUInteger offsetsBytes =
+					((NSUInteger)lineCount + 1u) *
+					(NSUInteger)sizeof(std::uint32_t);
+				const NSUInteger domainBytes =
+					(NSUInteger)paramsP->mappedWorkItemCount *
+					(NSUInteger)sizeof(unsigned int);
+				const NSUInteger keysBytes =
+					(NSUInteger)paramsP->mappedWorkItemCount *
+					(NSUInteger)sizeof(float);
+
+				id<MTLBuffer> recordsBuffer =
+					[device newBufferWithBytes:paramsP->mappedRecords
+					                    length:recordsBytes
+					                   options:MTLResourceStorageModeShared];
+				id<MTLBuffer> lineOffsetsBuffer =
+					[device newBufferWithBytes:paramsP->mappedLineOffsets
+					                    length:offsetsBytes
+					                   options:MTLResourceStorageModeShared];
+				id<MTLBuffer> workOffsetsBuffer =
+					[device newBufferWithBytes:paramsP->mappedWorkOffsets
+					                    length:offsetsBytes
+					                   options:MTLResourceStorageModeShared];
+				id<MTLBuffer> domainBuffer =
+					[device newBufferWithLength:domainBytes
+					                    options:MTLResourceStorageModePrivate];
+				id<MTLBuffer> keysBuffer =
+					[device newBufferWithLength:keysBytes
+					                    options:MTLResourceStorageModePrivate];
+				if (!recordsBuffer || !lineOffsetsBuffer || !workOffsetsBuffer ||
+					!domainBuffer || !keysBuffer) {
+					return PF_Err_OUT_OF_MEMORY;
+				}
+
+				id<MTLComputeCommandEncoder> mappedEncoder =
+					[commandBuffer computeCommandEncoder];
+				[mappedEncoder setComputePipelineState:mapped_sort_pipeline];
+				[mappedEncoder setBuffer:src_buffer         offset:0 atIndex:0];
+				[mappedEncoder setBuffer:dst_buffer         offset:0 atIndex:1];
+				[mappedEncoder setBuffer:domainBuffer      offset:0 atIndex:2];
+				[mappedEncoder setBuffer:keysBuffer        offset:0 atIndex:3];
+				[mappedEncoder setBuffer:paramBuffer       offset:0 atIndex:4];
+				[mappedEncoder setBuffer:recordsBuffer     offset:0 atIndex:5];
+				[mappedEncoder setBuffer:lineOffsetsBuffer offset:0 atIndex:6];
+				[mappedEncoder setBuffer:workOffsetsBuffer offset:0 atIndex:7];
+				[mappedEncoder dispatchThreadgroups:MTLSizeMake((NSUInteger)lineCount, 1, 1)
+				              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+				[mappedEncoder endEncoding];
+			}
+		} else {
+			const int domainStride = metal_params.domainStride;
+			if (domainStride <= 0 || outputWidth <= 0 || outputHeight <= 0) {
+				return PF_Err_NONE;
+			}
+
+			const NSUInteger domainCount =
+				(NSUInteger)lineCount * (NSUInteger)domainStride;
+			const NSUInteger domainBytes = domainCount * sizeof(unsigned int);
+			const NSUInteger keysBytes = domainCount * sizeof(float);
+			id<MTLBuffer> domainBuffer =
+				[device newBufferWithLength:domainBytes
+				                    options:MTLResourceStorageModePrivate];
+			id<MTLBuffer> keysBuffer =
+				[device newBufferWithLength:keysBytes
+				                    options:MTLResourceStorageModePrivate];
+			if (!domainBuffer || !keysBuffer) {
+				return PF_Err_OUT_OF_MEMORY;
+			}
+
+			// Clear domain indices to 0xFFFFFFFF via a small shared staging buffer.
+			id<MTLBuffer> clearBuffer =
+				[device newBufferWithLength:domainBytes
+				                    options:MTLResourceStorageModeShared];
+			if (!clearBuffer) {
+				return PF_Err_OUT_OF_MEMORY;
+			}
+			std::memset([clearBuffer contents], 0xFF, domainBytes);
+
+			id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
+			[blitEncoder copyFromBuffer:clearBuffer
+			               sourceOffset:0
+			                   toBuffer:domainBuffer
+			          destinationOffset:0
+			                       size:domainBytes];
+			[blitEncoder endEncoding];
+
+			id<MTLComputeCommandEncoder> sortEncoder =
+				[commandBuffer computeCommandEncoder];
+			[sortEncoder setComputePipelineState:domain_sort_pipeline];
+			[sortEncoder setBuffer:src_buffer   offset:0 atIndex:0];
+			[sortEncoder setBuffer:domainBuffer offset:0 atIndex:1];
+			[sortEncoder setBuffer:keysBuffer   offset:0 atIndex:2];
+			[sortEncoder setBuffer:paramBuffer  offset:0 atIndex:3];
+			[sortEncoder setBuffer:pathBuffer   offset:0 atIndex:4];
+			[sortEncoder dispatchThreadgroups:MTLSizeMake((NSUInteger)lineCount, 1, 1)
+			            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+			[sortEncoder endEncoding];
+
+			id<MTLComputeCommandEncoder> applyEncoder =
+				[commandBuffer computeCommandEncoder];
+			[applyEncoder setComputePipelineState:apply_domain_pipeline];
+			[applyEncoder setBuffer:src_buffer   offset:0 atIndex:0];
+			[applyEncoder setBuffer:dst_buffer   offset:0 atIndex:1];
+			[applyEncoder setBuffer:domainBuffer offset:0 atIndex:2];
+			[applyEncoder setBuffer:paramBuffer  offset:0 atIndex:3];
+			[applyEncoder setBuffer:pathBuffer   offset:0 atIndex:4];
+			const NSUInteger applyGroupsX =
+				((NSUInteger)outputWidth + 15u) / 16u;
+			const NSUInteger applyGroupsY =
+				((NSUInteger)outputHeight + 15u) / 16u;
+			[applyEncoder dispatchThreadgroups:MTLSizeMake(applyGroupsX, applyGroupsY, 1)
+			             threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+			[applyEncoder endEncoding];
+		}
+
 		[commandBuffer commit];
 		// Do NOT call waitUntilCompleted — AE owns the queue and manages
 		// synchronisation between the GPU and the host.  This mirrors the
 		// SDK ProcAmp reference which commits without waiting.
-
-		// paramBuffer is ARC-managed; released automatically at end of
-		// @autoreleasepool scope.
 
 	} // @autoreleasepool
 

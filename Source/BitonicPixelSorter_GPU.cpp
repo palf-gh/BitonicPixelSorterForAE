@@ -3,8 +3,12 @@
 
 	GPU command handling: device setup/setdown and the GPU smart-render dispatch.
 	After Effects GPU worlds are PF_PixelFormat_GPU_BGRA128 (linear, row-pitched
-	float4 buffers in BGRA order). A single pass reads the source and writes the
-	sorted result to the destination — no intermediate buffer is needed.
+	float4 buffers in BGRA order).
+
+	Axis mode is a single pass (src → dst). Non-axis modes use exact multi-pass:
+	sort each path into a temporary domain of source indices, then inverse-map
+	every output pixel and gather — matching the CPU oracle and avoiding the
+	forward-scatter races inherent to Free Angle / Rotation / Radial paths.
 
 	Each framework backend is compiled only when its toolchain is available; the
 	build system defines BPS_HAS_CUDA / BPS_HAS_OPENCL / BPS_HAS_HLSL /
@@ -28,16 +32,19 @@
 
 #include "BitonicPixelSorter.h"
 #include "BitonicPixelSorter_GpuEligibility.h"
+#include "BitonicPixelSorter_PathGeometry.h"
 
 #include <atomic>
 #if defined(BPS_RENDER_DIAG)
 	#include <cstdarg>
 	#include <cstdio>
 #endif
+#include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <new>
 #include <string>
+#include <vector>
 
 #if defined(BPS_HAS_HLSL)
 	#include "BPS_DirectXShaderLoad.h"
@@ -56,10 +63,19 @@
 		int srcPitch, int dstPitch, int width, int height,
 		int inputOriginX, int inputOriginY,
 		int outputOriginX, int outputOriginY, int outputWidth, int outputHeight,
-		int mode, int direction, int ordering, int criterion, int lineCount,
+		int mode, int direction, int ordering, int criterion, int trigger, int affect,
+		float cycleDegrees, int lineCount,
 		int freePMin, int freeQMin, int freeLineLength, int radialLength,
+		int domainStride,
 		float thresholdMin, float thresholdMax,
-		float angleCos, float angleSin, float centerX, float centerY);
+		float angleCos, float angleSin, float centerX, float centerY,
+		float swirlK, int swirlLineMin,
+		int pathDirection, int pathSMin, int pathNMin, int pathSampleCount,
+		const void *pathSamplesHost,
+		int mappedRecordCount, int mappedWorkItemCount,
+		const void *mappedRecordsHost,
+		const void *mappedLineOffsetsHost,
+		const void *mappedWorkOffsetsHost);
 #endif
 
 #if defined(BPS_HAS_OPENCL)
@@ -68,6 +84,10 @@ namespace {
 struct OpenCLGPUData {
 	cl_program program;
 	cl_kernel sort_kernel;
+	cl_kernel domain_sort_kernel;
+	cl_kernel apply_domain_kernel;
+	cl_kernel copy_kernel;
+	cl_kernel mapped_sort_kernel;
 };
 
 inline PF_Err CL2Err(cl_int cl_result)
@@ -80,6 +100,22 @@ inline PF_Err CL2Err(cl_int cl_result)
 static void ReleaseOpenCLData(OpenCLGPUData *cl_dataP)
 {
 	if (cl_dataP) {
+		if (cl_dataP->apply_domain_kernel) {
+			(void)clReleaseKernel(cl_dataP->apply_domain_kernel);
+			cl_dataP->apply_domain_kernel = 0;
+		}
+		if (cl_dataP->mapped_sort_kernel) {
+			(void)clReleaseKernel(cl_dataP->mapped_sort_kernel);
+			cl_dataP->mapped_sort_kernel = 0;
+		}
+		if (cl_dataP->copy_kernel) {
+			(void)clReleaseKernel(cl_dataP->copy_kernel);
+			cl_dataP->copy_kernel = 0;
+		}
+		if (cl_dataP->domain_sort_kernel) {
+			(void)clReleaseKernel(cl_dataP->domain_sort_kernel);
+			cl_dataP->domain_sort_kernel = 0;
+		}
 		if (cl_dataP->sort_kernel) {
 			(void)clReleaseKernel(cl_dataP->sort_kernel);
 			cl_dataP->sort_kernel = 0;
@@ -100,6 +136,10 @@ namespace {
 struct DirectXGPUData {
 	DXContextPtr context;
 	ShaderObjectPtr sort_shader;
+	ShaderObjectPtr domain_sort_shader;
+	ShaderObjectPtr apply_domain_shader;
+	ShaderObjectPtr copy_shader;
+	ShaderObjectPtr mapped_sort_shader;
 };
 
 struct DirectXSortParams {
@@ -117,17 +157,27 @@ struct DirectXSortParams {
 	int direction;
 	int ordering;
 	int criterion;
+	int trigger;
+	int affect;
+	float cycleDegrees;
 	int lineCount;
 	int freePMin;
 	int freeQMin;
 	int freeLineLength;
 	int radialLength;
+	int domainStride;
 	float thresholdMin;
 	float thresholdMax;
 	float angleCos;
 	float angleSin;
 	float centerX;
 	float centerY;
+	float swirlK;
+	int swirlLineMin;
+	int pathDirection;
+	int pathSMin;
+	int pathNMin;
+	int pathSampleCount;
 };
 
 inline PF_Err DXErr(bool success)
@@ -140,6 +190,10 @@ inline PF_Err DXErr(bool success)
 static void ReleaseDirectXData(DirectXGPUData *dx_dataP)
 {
 	if (dx_dataP) {
+		dx_dataP->apply_domain_shader.reset();
+		dx_dataP->mapped_sort_shader.reset();
+		dx_dataP->copy_shader.reset();
+		dx_dataP->domain_sort_shader.reset();
 		dx_dataP->sort_shader.reset();
 		dx_dataP->context.reset();
 	}
@@ -196,6 +250,18 @@ const char *BPS_FrameworkName(PF_GPU_Framework framework)
 	default: return "";
 	}
 }
+
+#if defined(BPS_HAS_CUDA)
+std::string BPS_QueryCudaDeviceName(CUdevice device)
+{
+	char name[256] = {};
+	// Driver API only: safe during GPU_DEVICE_SETUP (no runtime context required).
+	if (cuDeviceGetName(name, static_cast<int>(sizeof(name)), device) != CUDA_SUCCESS) {
+		return std::string();
+	}
+	return std::string(name);
+}
+#endif
 
 #if defined(BPS_HAS_OPENCL)
 std::string BPS_QueryOpenCLDeviceName(cl_device_id device)
@@ -374,10 +440,13 @@ PF_Err BPS_GPUDeviceSetup(
 		// CUDA kernels are statically linked; nothing to compile here. Do not call
 		// the CUDA runtime during device setup — the SDK sample does not, and
 		// cudaGetDevice on a host-owned context has been observed to crash Release
-		// builds on older After Effects versions.
+		// builds on older After Effects versions. Device name uses the Driver API.
 		if (!err) {
 			out_dataP->out_flags2 = PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
-			BPS_RecordGpuDevice(device_info.device_framework, std::string());
+			const CUdevice cu_device = static_cast<CUdevice>(
+				reinterpret_cast<uintptr_t>(device_info.devicePV));
+			BPS_RecordGpuDevice(device_info.device_framework,
+								BPS_QueryCudaDeviceName(cu_device));
 		}
 	}
 #endif
@@ -439,6 +508,30 @@ PF_Err BPS_GPUDeviceSetup(
 		}
 
 		if (!err) {
+			cl_dataP->domain_sort_kernel =
+				clCreateKernel(cl_dataP->program, "BitonicSortDomainKernel", &result);
+			BPS_CL_ERR(result);
+		}
+
+		if (!err) {
+			cl_dataP->apply_domain_kernel =
+				clCreateKernel(cl_dataP->program, "BitonicApplyDomainKernel", &result);
+			BPS_CL_ERR(result);
+		}
+
+		if (!err) {
+			cl_dataP->copy_kernel =
+				clCreateKernel(cl_dataP->program, "BitonicCopyInputKernel", &result);
+			BPS_CL_ERR(result);
+		}
+
+		if (!err) {
+			cl_dataP->mapped_sort_kernel =
+				clCreateKernel(cl_dataP->program, "BitonicSortMappedKernel", &result);
+			BPS_CL_ERR(result);
+		}
+
+		if (!err) {
 			extraP->output->gpu_data = gpu_dataH;
 			out_dataP->out_flags2 = PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
 			BPS_RecordGpuDevice(device_info.device_framework, BPS_QueryOpenCLDeviceName(device));
@@ -483,6 +576,10 @@ PF_Err BPS_GPUDeviceSetup(
 		if (!err) {
 			dx_dataP->context = std::make_shared<DXContext>();
 			dx_dataP->sort_shader = std::make_shared<ShaderObject>();
+			dx_dataP->domain_sort_shader = std::make_shared<ShaderObject>();
+			dx_dataP->apply_domain_shader = std::make_shared<ShaderObject>();
+			dx_dataP->copy_shader = std::make_shared<ShaderObject>();
+			dx_dataP->mapped_sort_shader = std::make_shared<ShaderObject>();
 
 			BPS_DX_ERR(dx_dataP->context->Initialize(
 				reinterpret_cast<ID3D12Device *>(device_info.devicePV),
@@ -493,6 +590,30 @@ PF_Err BPS_GPUDeviceSetup(
 			BPS_DX_ERR(BPS_LoadEmbeddedDirectXSortShader(
 				dx_dataP->context,
 				dx_dataP->sort_shader));
+		}
+
+		if (!err) {
+			BPS_DX_ERR(BPS_LoadEmbeddedDirectXDomainSortShader(
+				dx_dataP->context,
+				dx_dataP->domain_sort_shader));
+		}
+
+		if (!err) {
+			BPS_DX_ERR(BPS_LoadEmbeddedDirectXApplyDomainShader(
+				dx_dataP->context,
+				dx_dataP->apply_domain_shader));
+		}
+
+		if (!err) {
+			BPS_DX_ERR(BPS_LoadEmbeddedDirectXCopyShader(
+				dx_dataP->context,
+				dx_dataP->copy_shader));
+		}
+
+		if (!err) {
+			BPS_DX_ERR(BPS_LoadEmbeddedDirectXMappedSortShader(
+				dx_dataP->context,
+				dx_dataP->mapped_sort_shader));
 		}
 
 		if (!err) {
@@ -599,12 +720,8 @@ PF_Err BPS_SmartRenderGPU(
 	const int direction = (paramsP->direction == BPS_DIR_HORIZONTAL) ? 1 : 0;
 	const int lineCount = (paramsP->mode == BPS_MODE_AXIS)
 		? (direction ? output_worldP->height : output_worldP->width)
-		: ((paramsP->mode == BPS_MODE_FREE_ANGLE)
-			? static_cast<int>(paramsP->freeLineCount)
-			: ((paramsP->mode == BPS_MODE_ROTATION)
-				? static_cast<int>(paramsP->radialLength)
-				: static_cast<int>(paramsP->radialLineCount)));
-	if (lineCount <= 0) {
+		: static_cast<int>(paramsP->domainLineCount);
+	if (lineCount <= 0 && paramsP->mode != BPS_MODE_PATH) {
 		return PF_Err_NONE;
 	}
 
@@ -652,10 +769,41 @@ PF_Err BPS_SmartRenderGPU(
 	const int outputHeight = output_worldP->height;
 	const int ordering  = paramsP->ascending ? 1 : 0;
 	const int criterion = static_cast<int>(paramsP->criterion);
+	const int trigger = static_cast<int>(paramsP->trigger);
+	const int affect = static_cast<int>(paramsP->affect);
+	const float cycleDegrees = paramsP->cycleDegrees;
 	const int freePMin = static_cast<int>(paramsP->freePMin);
 	const int freeQMin = static_cast<int>(paramsP->freeQMin);
 	const int freeLineLength = static_cast<int>(paramsP->freeLineLength);
-	const int radialLength = static_cast<int>(paramsP->radialLength);
+	// Path mode stores line length in domainMaxLineLength only.
+	const int radialLength = (paramsP->mode == BPS_MODE_PATH)
+		? static_cast<int>(paramsP->domainMaxLineLength)
+		: static_cast<int>(paramsP->radialLength);
+	const int domainStrideRaw = static_cast<int>(paramsP->domainMaxLineLength);
+	const float swirlK = paramsP->swirlK;
+	const int swirlLineMin = static_cast<int>(paramsP->swirlLineMin);
+	const int pathDirection = static_cast<int>(paramsP->pathDirection);
+	const int pathSMin = static_cast<int>(paramsP->pathSMin);
+	const int pathNMin = static_cast<int>(paramsP->pathNMin);
+	const int pathSampleCount = static_cast<int>(paramsP->pathSampleCount);
+	const void *pathSamplesHost = paramsP->pathSamples;
+	const int mappedRecordCount = static_cast<int>(paramsP->mappedRecordCount);
+	const int mappedWorkItemCount = static_cast<int>(paramsP->mappedWorkItemCount);
+	const void *mappedRecordsHost = paramsP->mappedRecords;
+	const void *mappedLineOffsetsHost = paramsP->mappedLineOffsets;
+	const void *mappedWorkOffsetsHost = paramsP->mappedWorkOffsets;
+	// Round up to the next power of two, then double it.  Doubling guarantees
+	// that in-place bitonic padding for any span [spanStart, spanStart+sortSize)
+	// never overflows the line's allocated region, even when the span starts
+	// past the halfway point (e.g. when the leading arc of a Rotation circle
+	// is entirely outside the frame and spanStart is large).
+	int domainStride = domainStrideRaw;
+	if (domainStride > 1) {
+		unsigned int v = static_cast<unsigned int>(domainStride) - 1u;
+		v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
+		domainStride = static_cast<int>(v + 1u);
+	}
+	domainStride *= 2; // 2x ensures spanStart + sortSize <= domainStride always
 
 	if (err) {
 		return err;
@@ -675,47 +823,303 @@ PF_Err BPS_SmartRenderGPU(
 		OpenCLGPUData *cl_dataP = reinterpret_cast<OpenCLGPUData *>(*gpu_dataH);
 		cl_mem cl_src_mem = reinterpret_cast<cl_mem>(src_mem);
 		cl_mem cl_dst_mem = reinterpret_cast<cl_mem>(dst_mem);
+		cl_command_queue queue =
+			reinterpret_cast<cl_command_queue>(device_info.command_queuePV);
+		cl_context context = reinterpret_cast<cl_context>(device_info.contextPV);
 
-		cl_uint param_index = 0;
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(cl_mem), &cl_src_mem));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(cl_mem), &cl_dst_mem));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &srcPitch));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &dstPitch));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &width));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &height));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &inputOriginX));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &inputOriginY));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &outputOriginX));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &outputOriginY));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &outputWidth));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &outputHeight));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &mode));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &direction));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &ordering));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &criterion));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &lineCount));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &freePMin));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &freeQMin));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &freeLineLength));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &radialLength));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &paramsP->thresholdMin));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &paramsP->thresholdMax));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &paramsP->angleCos));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &paramsP->angleSin));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &paramsP->centerX));
-		BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &paramsP->centerY));
+		// Path samples buffer (dummy 1-sample when unused so the arg is valid).
+		const size_t path_count =
+			pathSampleCount > 0 ? static_cast<size_t>(pathSampleCount) : 1u;
+		const size_t path_bytes = path_count * sizeof(BpsPathSample);
+		cl_int path_cl_result = CL_SUCCESS;
+		cl_mem path_mem = clCreateBuffer(context, CL_MEM_READ_ONLY, path_bytes,
+										 0, &path_cl_result);
+		BPS_CL_ERR(path_cl_result);
+		if (!err) {
+			std::vector<BpsPathSample> path_upload(path_count);
+			if (pathSampleCount > 0 && pathSamplesHost) {
+				std::memcpy(path_upload.data(), pathSamplesHost,
+							static_cast<size_t>(pathSampleCount) * sizeof(BpsPathSample));
+			}
+			BPS_CL_ERR(clEnqueueWriteBuffer(queue, path_mem, CL_TRUE, 0, path_bytes,
+											path_upload.data(), 0, 0, 0));
+		}
+		if (err) {
+			if (path_mem) {
+				(void)clReleaseMemObject(path_mem);
+			}
+			return err;
+		}
 
-		const size_t local = 256;
-		const size_t global = static_cast<size_t>(lineCount) * local;
-		BPS_CL_ERR(clEnqueueNDRangeKernel(reinterpret_cast<cl_command_queue>(device_info.command_queuePV),
-										  cl_dataP->sort_kernel,
-										  1,
-										  0,
-										  &global,
-										  &local,
-										  0,
-										  0,
-										  0));
+		auto set_path_tail = [&](cl_kernel kernel, cl_uint &param_index) {
+			BPS_CL_ERR(clSetKernelArg(kernel, param_index++, sizeof(float), &swirlK));
+			BPS_CL_ERR(clSetKernelArg(kernel, param_index++, sizeof(int), &swirlLineMin));
+			BPS_CL_ERR(clSetKernelArg(kernel, param_index++, sizeof(int), &pathDirection));
+			BPS_CL_ERR(clSetKernelArg(kernel, param_index++, sizeof(int), &pathSMin));
+			BPS_CL_ERR(clSetKernelArg(kernel, param_index++, sizeof(int), &pathNMin));
+			BPS_CL_ERR(clSetKernelArg(kernel, param_index++, sizeof(int), &pathSampleCount));
+			BPS_CL_ERR(clSetKernelArg(kernel, param_index++, sizeof(cl_mem), &path_mem));
+		};
+
+		if (mode == BPS_MODE_AXIS) {
+			cl_uint param_index = 0;
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(cl_mem), &cl_src_mem));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(cl_mem), &cl_dst_mem));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &srcPitch));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &dstPitch));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &width));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &height));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &inputOriginX));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &inputOriginY));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &outputOriginX));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &outputOriginY));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &outputWidth));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &outputHeight));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &mode));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &direction));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &ordering));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &criterion));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &trigger));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &affect));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &cycleDegrees));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &lineCount));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &freePMin));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &freeQMin));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &freeLineLength));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(int), &radialLength));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &paramsP->thresholdMin));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &paramsP->thresholdMax));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &paramsP->angleCos));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &paramsP->angleSin));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &paramsP->centerX));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(float), &paramsP->centerY));
+			set_path_tail(cl_dataP->sort_kernel, param_index);
+
+			const size_t local = 256;
+			const size_t global = static_cast<size_t>(lineCount) * local;
+			BPS_CL_ERR(clEnqueueNDRangeKernel(queue, cl_dataP->sort_kernel, 1, 0,
+											  &global, &local, 0, 0, 0));
+			(void)clReleaseMemObject(path_mem);
+			return err;
+		}
+
+		if (mode == BPS_MODE_PATH) {
+			cl_uint copy_index = 0;
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->copy_kernel, copy_index++, sizeof(cl_mem), &cl_src_mem));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->copy_kernel, copy_index++, sizeof(cl_mem), &cl_dst_mem));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->copy_kernel, copy_index++, sizeof(int), &srcPitch));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->copy_kernel, copy_index++, sizeof(int), &dstPitch));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->copy_kernel, copy_index++, sizeof(int), &width));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->copy_kernel, copy_index++, sizeof(int), &height));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->copy_kernel, copy_index++, sizeof(int), &inputOriginX));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->copy_kernel, copy_index++, sizeof(int), &inputOriginY));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->copy_kernel, copy_index++, sizeof(int), &outputOriginX));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->copy_kernel, copy_index++, sizeof(int), &outputOriginY));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->copy_kernel, copy_index++, sizeof(int), &outputWidth));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->copy_kernel, copy_index++, sizeof(int), &outputHeight));
+			const size_t copy_local[2] = {16, 16};
+			const size_t copy_global[2] = {
+				((static_cast<size_t>(outputWidth) + 15u) / 16u) * 16u,
+				((static_cast<size_t>(outputHeight) + 15u) / 16u) * 16u
+			};
+			BPS_CL_ERR(clEnqueueNDRangeKernel(queue, cl_dataP->copy_kernel, 2, 0,
+											  copy_global, copy_local, 0, 0, 0));
+
+			if (err || mappedRecordCount <= 0 || mappedWorkItemCount <= 0 ||
+				!mappedRecordsHost || !mappedLineOffsetsHost || !mappedWorkOffsetsHost) {
+				(void)clReleaseMemObject(path_mem);
+				return err;
+			}
+
+			cl_int cl_result = CL_SUCCESS;
+			const size_t recordsBytes =
+				static_cast<size_t>(mappedRecordCount) * sizeof(BpsMappedPixelRecord);
+			const size_t offsetsBytes =
+				static_cast<size_t>(lineCount + 1) * sizeof(cl_uint);
+			const size_t workBytes =
+				static_cast<size_t>(mappedWorkItemCount) * sizeof(cl_uint);
+			cl_mem records_mem = clCreateBuffer(context, CL_MEM_READ_ONLY,
+												recordsBytes, 0, &cl_result);
+			BPS_CL_ERR(cl_result);
+			cl_mem line_offsets_mem = 0;
+			if (!err) {
+				line_offsets_mem = clCreateBuffer(context, CL_MEM_READ_ONLY,
+												  offsetsBytes, 0, &cl_result);
+				BPS_CL_ERR(cl_result);
+			}
+			cl_mem work_offsets_mem = 0;
+			if (!err) {
+				work_offsets_mem = clCreateBuffer(context, CL_MEM_READ_ONLY,
+												  offsetsBytes, 0, &cl_result);
+				BPS_CL_ERR(cl_result);
+			}
+			cl_mem domain_mem = 0;
+			if (!err) {
+				domain_mem = clCreateBuffer(context, CL_MEM_READ_WRITE,
+											workBytes, 0, &cl_result);
+				BPS_CL_ERR(cl_result);
+			}
+			cl_mem keys_mem = 0;
+			if (!err) {
+				keys_mem = clCreateBuffer(context, CL_MEM_READ_WRITE,
+										  static_cast<size_t>(mappedWorkItemCount) * sizeof(cl_float),
+										  0, &cl_result);
+				BPS_CL_ERR(cl_result);
+			}
+			if (!err) {
+				BPS_CL_ERR(clEnqueueWriteBuffer(queue, records_mem, CL_TRUE, 0,
+												recordsBytes, mappedRecordsHost, 0, 0, 0));
+				BPS_CL_ERR(clEnqueueWriteBuffer(queue, line_offsets_mem, CL_TRUE, 0,
+												offsetsBytes, mappedLineOffsetsHost, 0, 0, 0));
+				BPS_CL_ERR(clEnqueueWriteBuffer(queue, work_offsets_mem, CL_TRUE, 0,
+												offsetsBytes, mappedWorkOffsetsHost, 0, 0, 0));
+			}
+			if (!err) {
+				cl_uint param_index = 0;
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(cl_mem), &cl_src_mem));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(cl_mem), &cl_dst_mem));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(cl_mem), &domain_mem));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(cl_mem), &keys_mem));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(cl_mem), &records_mem));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(cl_mem), &line_offsets_mem));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(cl_mem), &work_offsets_mem));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(int), &srcPitch));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(int), &dstPitch));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(int), &width));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(int), &height));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(int), &inputOriginX));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(int), &inputOriginY));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(int), &outputOriginX));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(int), &outputOriginY));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(int), &outputWidth));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(int), &outputHeight));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(int), &ordering));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(int), &criterion));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(int), &trigger));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(int), &affect));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(float), &cycleDegrees));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(float), &paramsP->thresholdMin));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(float), &paramsP->thresholdMax));
+				BPS_CL_ERR(clSetKernelArg(cl_dataP->mapped_sort_kernel, param_index++, sizeof(int), &lineCount));
+
+				const size_t local = 256;
+				const size_t global = static_cast<size_t>(lineCount) * local;
+				BPS_CL_ERR(clEnqueueNDRangeKernel(queue, cl_dataP->mapped_sort_kernel, 1, 0,
+												  &global, &local, 0, 0, 0));
+			}
+
+			if (keys_mem) (void)clReleaseMemObject(keys_mem);
+			if (domain_mem) (void)clReleaseMemObject(domain_mem);
+			if (work_offsets_mem) (void)clReleaseMemObject(work_offsets_mem);
+			if (line_offsets_mem) (void)clReleaseMemObject(line_offsets_mem);
+			if (records_mem) (void)clReleaseMemObject(records_mem);
+			(void)clReleaseMemObject(path_mem);
+			return err;
+		}
+
+		if (domainStride <= 0 || outputWidth <= 0 || outputHeight <= 0) {
+			(void)clReleaseMemObject(path_mem);
+			return PF_Err_NONE;
+		}
+		const size_t domainCount =
+			static_cast<size_t>(lineCount) * static_cast<size_t>(domainStride);
+		const size_t domainBytes = domainCount * sizeof(cl_uint);
+		const size_t keysBytes = domainCount * sizeof(cl_float);
+		cl_int cl_result = CL_SUCCESS;
+		cl_mem domain_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, domainBytes, 0, &cl_result);
+		BPS_CL_ERR(cl_result);
+		cl_mem keys_mem = 0;
+		if (!err) {
+			keys_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, keysBytes, 0, &cl_result);
+			BPS_CL_ERR(cl_result);
+		}
+		if (err) {
+			if (domain_mem) {
+				(void)clReleaseMemObject(domain_mem);
+			}
+			return err;
+		}
+
+		const cl_uint invalid_index = 0xffffffffu;
+		BPS_CL_ERR(clEnqueueFillBuffer(queue, domain_mem, &invalid_index, sizeof(invalid_index),
+									   0, domainBytes, 0, 0, 0));
+
+		if (!err) {
+			cl_uint param_index = 0;
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(cl_mem), &cl_src_mem));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(cl_mem), &domain_mem));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(cl_mem), &keys_mem));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(int), &srcPitch));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(int), &width));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(int), &height));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(int), &inputOriginX));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(int), &inputOriginY));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(int), &mode));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(int), &ordering));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(int), &criterion));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(int), &trigger));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(int), &affect));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(float), &cycleDegrees));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(int), &lineCount));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(int), &freePMin));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(int), &freeQMin));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(int), &freeLineLength));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(int), &radialLength));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(int), &domainStride));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(float), &paramsP->thresholdMin));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(float), &paramsP->thresholdMax));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(float), &paramsP->angleCos));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(float), &paramsP->angleSin));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(float), &paramsP->centerX));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->domain_sort_kernel, param_index++, sizeof(float), &paramsP->centerY));
+			set_path_tail(cl_dataP->domain_sort_kernel, param_index);
+
+			const size_t local = 256;
+			const size_t global = static_cast<size_t>(lineCount) * local;
+			BPS_CL_ERR(clEnqueueNDRangeKernel(queue, cl_dataP->domain_sort_kernel, 1, 0,
+											  &global, &local, 0, 0, 0));
+		}
+
+		if (!err) {
+			cl_uint param_index = 0;
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(cl_mem), &cl_src_mem));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(cl_mem), &cl_dst_mem));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(cl_mem), &domain_mem));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(int), &srcPitch));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(int), &dstPitch));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(int), &width));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(int), &height));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(int), &inputOriginX));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(int), &inputOriginY));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(int), &outputOriginX));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(int), &outputOriginY));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(int), &outputWidth));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(int), &outputHeight));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(int), &mode));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(int), &lineCount));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(int), &freePMin));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(int), &freeQMin));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(int), &freeLineLength));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(int), &radialLength));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(int), &domainStride));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(float), &paramsP->angleCos));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(float), &paramsP->angleSin));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(float), &paramsP->centerX));
+			BPS_CL_ERR(clSetKernelArg(cl_dataP->apply_domain_kernel, param_index++, sizeof(float), &paramsP->centerY));
+			set_path_tail(cl_dataP->apply_domain_kernel, param_index);
+
+			const size_t local[2] = {16, 16};
+			const size_t global[2] = {
+				((static_cast<size_t>(outputWidth) + 15u) / 16u) * 16u,
+				((static_cast<size_t>(outputHeight) + 15u) / 16u) * 16u
+			};
+			BPS_CL_ERR(clEnqueueNDRangeKernel(queue, cl_dataP->apply_domain_kernel, 2, 0,
+											  global, local, 0, 0, 0));
+		}
+
+		(void)clReleaseMemObject(keys_mem);
+		(void)clReleaseMemObject(domain_mem);
+		(void)clReleaseMemObject(path_mem);
 		return err;
 	}
 #endif
@@ -739,11 +1143,20 @@ PF_Err BPS_SmartRenderGPU(
 			BitonicSort_CUDA(src_mem, dst_mem, srcPitch, dstPitch, width, height,
 							 inputOriginX, inputOriginY, outputOriginX, outputOriginY,
 							 outputWidth, outputHeight,
-							 mode, direction, ordering, criterion, lineCount,
+							 mode, direction, ordering, criterion, trigger, affect,
+							 cycleDegrees, lineCount,
 							 freePMin, freeQMin, freeLineLength, radialLength,
+							 domainStride,
 							 paramsP->thresholdMin, paramsP->thresholdMax,
 							 paramsP->angleCos, paramsP->angleSin,
-							 paramsP->centerX, paramsP->centerY);
+							 paramsP->centerX, paramsP->centerY,
+							 swirlK, swirlLineMin,
+							 pathDirection, pathSMin, pathNMin, pathSampleCount,
+							 pathSamplesHost,
+							 mappedRecordCount, mappedWorkItemCount,
+							 mappedRecordsHost,
+							 mappedLineOffsetsHost,
+							 mappedWorkOffsetsHost);
 
 		if (cuda_result != cudaSuccess) {
 			(void)cudaGetLastError();
@@ -799,32 +1212,418 @@ PF_Err BPS_SmartRenderGPU(
 			direction,
 			ordering,
 			criterion,
+			trigger,
+			affect,
+			cycleDegrees,
 			lineCount,
 			freePMin,
 			freeQMin,
 			freeLineLength,
 			radialLength,
+			domainStride,
 			paramsP->thresholdMin,
 			paramsP->thresholdMax,
 			paramsP->angleCos,
 			paramsP->angleSin,
 			paramsP->centerX,
-			paramsP->centerY
+			paramsP->centerY,
+			swirlK,
+			swirlLineMin,
+			pathDirection,
+			pathSMin,
+			pathNMin,
+			pathSampleCount
 		};
 
-		DXShaderExecution shader_execution(
-			dx_dataP->context,
-			dx_dataP->sort_shader,
-			3);
+		const UINT src_bytes =
+			static_cast<UINT>(input_worldP->height * input_worldP->rowbytes);
+		const UINT dst_bytes =
+			static_cast<UINT>(output_worldP->height * output_worldP->rowbytes);
+		auto create_uploaded_buffer =
+			[&](const void *bytesP,
+				UINT byte_count,
+				Microsoft::WRL::ComPtr<ID3D12Resource> &default_resource,
+				Microsoft::WRL::ComPtr<ID3D12Resource> &upload_resource) -> PF_Err {
+				if (!bytesP || byte_count == 0) {
+					return PF_Err_BAD_CALLBACK_PARAM;
+				}
+				D3D12_HEAP_PROPERTIES default_heap = {
+					D3D12_HEAP_TYPE_DEFAULT,
+					D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+					D3D12_MEMORY_POOL_UNKNOWN,
+					0, 0};
+				D3D12_HEAP_PROPERTIES upload_heap = {
+					D3D12_HEAP_TYPE_UPLOAD,
+					D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+					D3D12_MEMORY_POOL_UNKNOWN,
+					0, 0};
+				D3D12_RESOURCE_DESC desc = {
+					D3D12_RESOURCE_DIMENSION_BUFFER, 0,
+					byte_count, 1, 1, 1,
+					DXGI_FORMAT_UNKNOWN, 1, 0,
+					D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+					D3D12_RESOURCE_FLAG_NONE};
+				if (FAILED(dx_dataP->context->mDevice->CreateCommittedResource(
+						&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+						D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+						IID_PPV_ARGS(default_resource.GetAddressOf())))) {
+					return PF_Err_OUT_OF_MEMORY;
+				}
+				if (FAILED(dx_dataP->context->mDevice->CreateCommittedResource(
+						&upload_heap, D3D12_HEAP_FLAG_NONE, &desc,
+						D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+						IID_PPV_ARGS(upload_resource.GetAddressOf())))) {
+					return PF_Err_OUT_OF_MEMORY;
+				}
+				void *mapped = nullptr;
+				if (FAILED(upload_resource->Map(0, nullptr, &mapped))) {
+					return PF_Err_OUT_OF_MEMORY;
+				}
+				std::memcpy(mapped, bytesP, byte_count);
+				upload_resource->Unmap(0, nullptr);
+				dx_dataP->context->mCommandList->CopyResource(
+					default_resource.Get(), upload_resource.Get());
+				return PF_Err_NONE;
+			};
 
-		BPS_DX_ERR(shader_execution.SetParamBuffer(&dx_params, sizeof(dx_params)));
-		BPS_DX_ERR(shader_execution.SetUnorderedAccessView(
-			reinterpret_cast<ID3D12Resource *>(dst_mem),
-			static_cast<UINT>(output_worldP->height * output_worldP->rowbytes)));
-		BPS_DX_ERR(shader_execution.SetShaderResourceView(
-			reinterpret_cast<ID3D12Resource *>(src_mem),
-			static_cast<UINT>(input_worldP->height * input_worldP->rowbytes)));
-		BPS_DX_ERR(shader_execution.Execute(static_cast<UINT>(lineCount), 1));
+		// Path samples as a RAW byte-address buffer (t1). Always bind at least
+		// one sample so the SRV is valid when Path mode is inactive.
+		const UINT path_count =
+			pathSampleCount > 0 ? static_cast<UINT>(pathSampleCount) : 1u;
+		const UINT path_bytes =
+			path_count * static_cast<UINT>(sizeof(BpsPathSample));
+		Microsoft::WRL::ComPtr<ID3D12Resource> path_resource;
+		Microsoft::WRL::ComPtr<ID3D12Resource> path_upload;
+		{
+			D3D12_HEAP_PROPERTIES default_heap = {
+				D3D12_HEAP_TYPE_DEFAULT,
+				D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+				D3D12_MEMORY_POOL_UNKNOWN,
+				0, 0};
+			D3D12_HEAP_PROPERTIES upload_heap = {
+				D3D12_HEAP_TYPE_UPLOAD,
+				D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+				D3D12_MEMORY_POOL_UNKNOWN,
+				0, 0};
+			D3D12_RESOURCE_DESC path_desc = {
+				D3D12_RESOURCE_DIMENSION_BUFFER, 0,
+				path_bytes, 1, 1, 1,
+				DXGI_FORMAT_UNKNOWN, 1, 0,
+				D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+				D3D12_RESOURCE_FLAG_NONE};
+			if (FAILED(dx_dataP->context->mDevice->CreateCommittedResource(
+					&default_heap, D3D12_HEAP_FLAG_NONE, &path_desc,
+					D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+					IID_PPV_ARGS(path_resource.GetAddressOf())))) {
+				return PF_Err_OUT_OF_MEMORY;
+			}
+			if (FAILED(dx_dataP->context->mDevice->CreateCommittedResource(
+					&upload_heap, D3D12_HEAP_FLAG_NONE, &path_desc,
+					D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+					IID_PPV_ARGS(path_upload.GetAddressOf())))) {
+				return PF_Err_OUT_OF_MEMORY;
+			}
+			void *mapped = nullptr;
+			if (FAILED(path_upload->Map(0, nullptr, &mapped))) {
+				return PF_Err_OUT_OF_MEMORY;
+			}
+			std::memset(mapped, 0, path_bytes);
+			if (pathSampleCount > 0 && pathSamplesHost) {
+				std::memcpy(mapped, pathSamplesHost,
+							static_cast<size_t>(pathSampleCount) * sizeof(BpsPathSample));
+			}
+			path_upload->Unmap(0, nullptr);
+		}
+
+		if (mode == BPS_MODE_AXIS) {
+			DXShaderExecution shader_execution(
+				dx_dataP->context,
+				dx_dataP->sort_shader,
+				4);
+
+			dx_dataP->context->mCommandList->CopyResource(
+				path_resource.Get(), path_upload.Get());
+			D3D12_RESOURCE_BARRIER path_barrier = {};
+			path_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			path_barrier.Transition.pResource = path_resource.Get();
+			path_barrier.Transition.Subresource = 0;
+			path_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+			path_barrier.Transition.StateAfter =
+				D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+			dx_dataP->context->mCommandList->ResourceBarrier(1, &path_barrier);
+
+			BPS_DX_ERR(shader_execution.SetParamBuffer(&dx_params, sizeof(dx_params)));
+			BPS_DX_ERR(shader_execution.SetUnorderedAccessView(
+				reinterpret_cast<ID3D12Resource *>(dst_mem),
+				dst_bytes));
+			BPS_DX_ERR(shader_execution.SetShaderResourceView(
+				reinterpret_cast<ID3D12Resource *>(src_mem),
+				src_bytes));
+			BPS_DX_ERR(shader_execution.SetShaderResourceView(
+				path_resource.Get(), path_bytes));
+			BPS_DX_ERR(shader_execution.Execute(static_cast<UINT>(lineCount), 1));
+			return err;
+		}
+
+		if (mode == BPS_MODE_PATH) {
+			{
+				DXShaderExecution copy_execution(
+					dx_dataP->context,
+					dx_dataP->copy_shader,
+					3);
+				BPS_DX_ERR(copy_execution.SetParamBuffer(&dx_params, sizeof(dx_params)));
+				BPS_DX_ERR(copy_execution.SetUnorderedAccessView(
+					reinterpret_cast<ID3D12Resource *>(dst_mem),
+					dst_bytes));
+				BPS_DX_ERR(copy_execution.SetShaderResourceView(
+					reinterpret_cast<ID3D12Resource *>(src_mem),
+					src_bytes));
+				const UINT apply_x = static_cast<UINT>((outputWidth + 15) / 16);
+				const UINT apply_y = static_cast<UINT>((outputHeight + 15) / 16);
+				BPS_DX_ERR(copy_execution.Execute(apply_x, apply_y));
+			}
+
+			if (err || mappedRecordCount <= 0 || mappedWorkItemCount <= 0 ||
+				!mappedRecordsHost || !mappedLineOffsetsHost || !mappedWorkOffsetsHost) {
+				return err;
+			}
+
+			const UINT records_bytes =
+				static_cast<UINT>(static_cast<size_t>(mappedRecordCount) *
+								  sizeof(BpsMappedPixelRecord));
+			const UINT offsets_bytes =
+				static_cast<UINT>(static_cast<size_t>(lineCount + 1) *
+								  sizeof(std::uint32_t));
+			const UINT mapped_domain_bytes =
+				static_cast<UINT>(static_cast<size_t>(mappedWorkItemCount) *
+								  sizeof(UINT));
+			const UINT mapped_keys_bytes =
+				static_cast<UINT>(static_cast<size_t>(mappedWorkItemCount) *
+								  sizeof(float));
+
+			Microsoft::WRL::ComPtr<ID3D12Resource> records_resource;
+			Microsoft::WRL::ComPtr<ID3D12Resource> records_upload;
+			Microsoft::WRL::ComPtr<ID3D12Resource> line_offsets_resource;
+			Microsoft::WRL::ComPtr<ID3D12Resource> line_offsets_upload;
+			Microsoft::WRL::ComPtr<ID3D12Resource> work_offsets_resource;
+			Microsoft::WRL::ComPtr<ID3D12Resource> work_offsets_upload;
+			ERR(create_uploaded_buffer(mappedRecordsHost, records_bytes,
+										records_resource, records_upload));
+			ERR(create_uploaded_buffer(mappedLineOffsetsHost, offsets_bytes,
+										line_offsets_resource, line_offsets_upload));
+			ERR(create_uploaded_buffer(mappedWorkOffsetsHost, offsets_bytes,
+										work_offsets_resource, work_offsets_upload));
+			if (err) {
+				return err;
+			}
+
+			D3D12_RESOURCE_BARRIER srv_barriers[3] = {};
+			ID3D12Resource *srv_resources[3] = {
+				records_resource.Get(),
+				line_offsets_resource.Get(),
+				work_offsets_resource.Get()
+			};
+			for (int i = 0; i < 3; ++i) {
+				srv_barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				srv_barriers[i].Transition.pResource = srv_resources[i];
+				srv_barriers[i].Transition.Subresource = 0;
+				srv_barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+				srv_barriers[i].Transition.StateAfter =
+					D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+			}
+			dx_dataP->context->mCommandList->ResourceBarrier(3, srv_barriers);
+
+			Microsoft::WRL::ComPtr<ID3D12Resource> mapped_domain_resource;
+			Microsoft::WRL::ComPtr<ID3D12Resource> mapped_keys_resource;
+			D3D12_HEAP_PROPERTIES default_heap = {
+				D3D12_HEAP_TYPE_DEFAULT,
+				D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+				D3D12_MEMORY_POOL_UNKNOWN,
+				0, 0};
+			D3D12_RESOURCE_DESC mapped_domain_desc = {
+				D3D12_RESOURCE_DIMENSION_BUFFER, 0,
+				mapped_domain_bytes, 1, 1, 1,
+				DXGI_FORMAT_UNKNOWN, 1, 0,
+				D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+				D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
+			D3D12_RESOURCE_DESC mapped_keys_desc = mapped_domain_desc;
+			mapped_keys_desc.Width = mapped_keys_bytes;
+			if (FAILED(dx_dataP->context->mDevice->CreateCommittedResource(
+					&default_heap, D3D12_HEAP_FLAG_NONE,
+					&mapped_domain_desc,
+					D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+					nullptr,
+					IID_PPV_ARGS(mapped_domain_resource.GetAddressOf())))) {
+				return PF_Err_OUT_OF_MEMORY;
+			}
+			if (FAILED(dx_dataP->context->mDevice->CreateCommittedResource(
+					&default_heap, D3D12_HEAP_FLAG_NONE,
+					&mapped_keys_desc,
+					D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+					nullptr,
+					IID_PPV_ARGS(mapped_keys_resource.GetAddressOf())))) {
+				return PF_Err_OUT_OF_MEMORY;
+			}
+
+			DXShaderExecution mapped_execution(
+				dx_dataP->context,
+				dx_dataP->mapped_sort_shader,
+				8);
+			BPS_DX_ERR(mapped_execution.SetParamBuffer(&dx_params, sizeof(dx_params)));
+			BPS_DX_ERR(mapped_execution.SetUnorderedAccessView(
+				reinterpret_cast<ID3D12Resource *>(dst_mem),
+				dst_bytes));
+			BPS_DX_ERR(mapped_execution.SetUnorderedAccessView(
+				mapped_domain_resource.Get(), mapped_domain_bytes));
+			BPS_DX_ERR(mapped_execution.SetUnorderedAccessView(
+				mapped_keys_resource.Get(), mapped_keys_bytes));
+			BPS_DX_ERR(mapped_execution.SetShaderResourceView(
+				reinterpret_cast<ID3D12Resource *>(src_mem),
+				src_bytes));
+			BPS_DX_ERR(mapped_execution.SetShaderResourceView(
+				records_resource.Get(), records_bytes));
+			BPS_DX_ERR(mapped_execution.SetShaderResourceView(
+				line_offsets_resource.Get(), offsets_bytes));
+			BPS_DX_ERR(mapped_execution.SetShaderResourceView(
+				work_offsets_resource.Get(), offsets_bytes));
+			BPS_DX_ERR(mapped_execution.Execute(static_cast<UINT>(lineCount), 1));
+			return err;
+		}
+
+		if (domainStride <= 0 || outputWidth <= 0 || outputHeight <= 0) {
+			return PF_Err_NONE;
+		}
+
+		const UINT domain_bytes = static_cast<UINT>(
+			static_cast<size_t>(lineCount) * static_cast<size_t>(domainStride) * sizeof(UINT));
+		const UINT keys_bytes = static_cast<UINT>(
+			static_cast<size_t>(lineCount) * static_cast<size_t>(domainStride) * sizeof(float));
+		Microsoft::WRL::ComPtr<ID3D12Resource> domain_resource;
+		Microsoft::WRL::ComPtr<ID3D12Resource> keys_resource;
+		D3D12_HEAP_PROPERTIES default_heap = {
+			D3D12_HEAP_TYPE_DEFAULT,
+			D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+			D3D12_MEMORY_POOL_UNKNOWN,
+			0, 0};
+		D3D12_RESOURCE_DESC domain_desc = {
+			D3D12_RESOURCE_DIMENSION_BUFFER, 0,
+			domain_bytes, 1, 1, 1,
+			DXGI_FORMAT_UNKNOWN, 1, 0,
+			D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+			D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
+		D3D12_RESOURCE_DESC keys_desc = domain_desc;
+		keys_desc.Width = keys_bytes;
+		if (FAILED(dx_dataP->context->mDevice->CreateCommittedResource(
+				&default_heap,
+				D3D12_HEAP_FLAG_NONE,
+				&domain_desc,
+				D3D12_RESOURCE_STATE_COPY_DEST,
+				nullptr,
+				IID_PPV_ARGS(domain_resource.GetAddressOf())))) {
+			return PF_Err_OUT_OF_MEMORY;
+		}
+		if (FAILED(dx_dataP->context->mDevice->CreateCommittedResource(
+				&default_heap,
+				D3D12_HEAP_FLAG_NONE,
+				&keys_desc,
+				D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+				nullptr,
+				IID_PPV_ARGS(keys_resource.GetAddressOf())))) {
+			return PF_Err_OUT_OF_MEMORY;
+		}
+
+		// Clear domain indices to 0xFFFFFFFF (invalid).
+		Microsoft::WRL::ComPtr<ID3D12Resource> upload_resource;
+		D3D12_HEAP_PROPERTIES upload_heap = {
+			D3D12_HEAP_TYPE_UPLOAD,
+			D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+			D3D12_MEMORY_POOL_UNKNOWN,
+			0, 0};
+		D3D12_RESOURCE_DESC upload_desc = domain_desc;
+		upload_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+		if (FAILED(dx_dataP->context->mDevice->CreateCommittedResource(
+				&upload_heap,
+				D3D12_HEAP_FLAG_NONE,
+				&upload_desc,
+				D3D12_RESOURCE_STATE_GENERIC_READ,
+				nullptr,
+				IID_PPV_ARGS(upload_resource.GetAddressOf())))) {
+			return PF_Err_OUT_OF_MEMORY;
+		}
+
+		void *mapped = nullptr;
+		if (FAILED(upload_resource->Map(0, nullptr, &mapped))) {
+			return PF_Err_OUT_OF_MEMORY;
+		}
+		std::memset(mapped, 0xFF, domain_bytes);
+		upload_resource->Unmap(0, nullptr);
+
+		{
+			DXShaderExecution sort_execution(
+				dx_dataP->context,
+				dx_dataP->domain_sort_shader,
+				5);
+			// Upload clear before the sort dispatch shares the command list.
+			dx_dataP->context->mCommandList->CopyResource(
+				domain_resource.Get(), upload_resource.Get());
+			dx_dataP->context->mCommandList->CopyResource(
+				path_resource.Get(), path_upload.Get());
+			D3D12_RESOURCE_BARRIER barriers[2] = {};
+			barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			barriers[0].Transition.pResource = domain_resource.Get();
+			barriers[0].Transition.Subresource = 0;
+			barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+			barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+			barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			barriers[1].Transition.pResource = path_resource.Get();
+			barriers[1].Transition.Subresource = 0;
+			barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+			barriers[1].Transition.StateAfter =
+				D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+			dx_dataP->context->mCommandList->ResourceBarrier(2, barriers);
+
+			BPS_DX_ERR(sort_execution.SetParamBuffer(&dx_params, sizeof(dx_params)));
+			BPS_DX_ERR(sort_execution.SetUnorderedAccessView(
+				domain_resource.Get(), domain_bytes));
+			BPS_DX_ERR(sort_execution.SetUnorderedAccessView(
+				keys_resource.Get(), keys_bytes));
+			BPS_DX_ERR(sort_execution.SetShaderResourceView(
+				reinterpret_cast<ID3D12Resource *>(src_mem),
+				src_bytes));
+			BPS_DX_ERR(sort_execution.SetShaderResourceView(
+				path_resource.Get(), path_bytes));
+			BPS_DX_ERR(sort_execution.Execute(static_cast<UINT>(lineCount), 1));
+		}
+
+		if (!err) {
+			// Domain is now read-only for the apply pass.
+			DXShaderExecution apply_execution(
+				dx_dataP->context,
+				dx_dataP->apply_domain_shader,
+				5);
+			D3D12_RESOURCE_BARRIER barrier = {};
+			barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			barrier.Transition.pResource = domain_resource.Get();
+			barrier.Transition.Subresource = 0;
+			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+			dx_dataP->context->mCommandList->ResourceBarrier(1, &barrier);
+
+			BPS_DX_ERR(apply_execution.SetParamBuffer(&dx_params, sizeof(dx_params)));
+			BPS_DX_ERR(apply_execution.SetUnorderedAccessView(
+				reinterpret_cast<ID3D12Resource *>(dst_mem),
+				dst_bytes));
+			BPS_DX_ERR(apply_execution.SetShaderResourceView(
+				reinterpret_cast<ID3D12Resource *>(src_mem),
+				src_bytes));
+			BPS_DX_ERR(apply_execution.SetShaderResourceView(
+				path_resource.Get(), path_bytes));
+			BPS_DX_ERR(apply_execution.SetShaderResourceView(
+				domain_resource.Get(), domain_bytes));
+			const UINT apply_x = static_cast<UINT>((outputWidth + 15) / 16);
+			const UINT apply_y = static_cast<UINT>((outputHeight + 15) / 16);
+			BPS_DX_ERR(apply_execution.Execute(apply_x, apply_y));
+		}
 		return err;
 	}
 #endif
@@ -848,7 +1647,8 @@ PF_Err BPS_SmartRenderGPU(
 	// No backend matched — should not be reached when BPS_GPU_ENABLED is set.
 	(void)src_mem; (void)dst_mem; (void)srcPitch; (void)dstPitch;
 	(void)width; (void)height; (void)mode; (void)direction; (void)ordering;
-	(void)criterion; (void)freePMin; (void)freeQMin; (void)freeLineLength;
-	(void)radialLength; (void)lineCount;
+	(void)criterion; (void)trigger; (void)affect; (void)cycleDegrees;
+	(void)freePMin; (void)freeQMin; (void)freeLineLength;
+	(void)radialLength; (void)domainStride; (void)lineCount;
 	return PF_Err_UNRECOGNIZED_PARAM_TYPE;
 }

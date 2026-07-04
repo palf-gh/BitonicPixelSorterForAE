@@ -77,11 +77,13 @@ bool BPS_ShouldAcceptGpuDeviceSetup(
 
 inline BpsGpuEligibility BPS_EvaluateGpuEligibility(
 	const PF_InData *in_data,
+	A_long mode,
 	A_long max_sort_axis_len,
 	const PF_LRect &output_rect)
 {
 #if !defined(BPS_GPU_ENABLED)
 	(void)in_data;
+	(void)mode;
 	(void)max_sort_axis_len;
 	(void)output_rect;
 	return {false, BpsGpuBlockReason::NoBackendCompiled};
@@ -95,8 +97,13 @@ inline BpsGpuEligibility BPS_EvaluateGpuEligibility(
 		return {false, BpsGpuBlockReason::HostPremiere};
 	}
 
-	if (max_sort_axis_len > BPS_GPU_MAX_LINE) {
-		return {false, BpsGpuBlockReason::SortAxisTooLong};
+	// Axis mode sorts in group-shared memory, so the sort-axis length is the
+	// remaining structural limit. Non-axis modes use global-memory domain/map
+	// paths whose line length may exceed the shared-memory budget.
+	if (mode == BPS_MODE_AXIS) {
+		if (max_sort_axis_len > BPS_GPU_MAX_LINE) {
+			return {false, BpsGpuBlockReason::SortAxisTooLong};
+		}
 	}
 
 	return {true, BpsGpuBlockReason::None};

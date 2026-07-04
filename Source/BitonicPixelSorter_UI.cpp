@@ -1,8 +1,8 @@
 /*
 	BitonicPixelSorter_UI.cpp
 
-	Effect Controls custom UI for the GPU acceleration status readout.
-	Draws localised coloured text using the shared GPU eligibility predicate.
+	Effect Controls custom UI for the GPU acceleration status readout, and
+	mode-dependent parameter visibility (Direction / Angle / Centre).
 */
 
 #include "BitonicPixelSorter.h"
@@ -26,21 +26,10 @@
 
 namespace {
 
-constexpr double BPS_UI_PI = 3.14159265358979323846;
-
 static A_long
 BPS_ClampPopupForUI(A_long value, A_long min_value, A_long max_value, A_long default_value)
 {
 	return (value >= min_value && value <= max_value) ? value : default_value;
-}
-
-static float
-BPS_RationalScaleForUI(const PF_RationalScale &scale)
-{
-	if (scale.num <= 0 || scale.den <= 0) {
-		return 1.0f;
-	}
-	return static_cast<float>(scale.num) / static_cast<float>(scale.den);
 }
 
 static A_long
@@ -52,7 +41,7 @@ BPS_MaxLineLengthForUI(PF_InData *in_data, PF_ParamDef *params[])
 
 	const A_long mode = params[BPS_UI_MODE]
 		? BPS_ClampPopupForUI(params[BPS_UI_MODE]->u.pd.value,
-							  BPS_MODE_AXIS, BPS_MODE_RADIAL, BPS_MODE_DFLT)
+							  BPS_MODE_AXIS, BPS_MODE_PATH, BPS_MODE_DFLT)
 		: BPS_MODE_DFLT;
 
 	if (mode == BPS_MODE_AXIS) {
@@ -64,54 +53,8 @@ BPS_MaxLineLengthForUI(PF_InData *in_data, PF_ParamDef *params[])
 		return (direction == BPS_DIR_HORIZONTAL) ? in_data->width : in_data->height;
 	}
 
-	if (mode == BPS_MODE_FREE_ANGLE) {
-		const double angle_degrees = params[BPS_UI_ANGLE]
-			? FIX_2_FLOAT(params[BPS_UI_ANGLE]->u.ad.value)
-			: BPS_ANGLE_DFLT;
-		const double radians = angle_degrees * BPS_UI_PI / 180.0;
-		const double c = std::cos(radians);
-		const double s = std::sin(radians);
-		const double xs[4] = {0.0, static_cast<double>(in_data->width - 1),
-							  0.0, static_cast<double>(in_data->width - 1)};
-		const double ys[4] = {0.0, 0.0, static_cast<double>(in_data->height - 1),
-							  static_cast<double>(in_data->height - 1)};
-		double minP = xs[0] * c + ys[0] * s;
-		double maxP = minP;
-		for (int i = 1; i < 4; ++i) {
-			const double p = xs[i] * c + ys[i] * s;
-			minP = (p < minP) ? p : minP;
-			maxP = (p > maxP) ? p : maxP;
-		}
-		return static_cast<A_long>(std::floor(maxP)) -
-			   static_cast<A_long>(std::floor(minP)) + 1;
-	}
-
-	const float downX = BPS_RationalScaleForUI(in_data->downsample_x);
-	const float downY = BPS_RationalScaleForUI(in_data->downsample_y);
-	const double centerX = params[BPS_UI_CENTER]
-		? FIX_2_FLOAT(params[BPS_UI_CENTER]->u.td.x_value) * downX
-		: static_cast<double>(in_data->width) * 0.5;
-	const double centerY = params[BPS_UI_CENTER]
-		? FIX_2_FLOAT(params[BPS_UI_CENTER]->u.td.y_value) * downY
-		: static_cast<double>(in_data->height) * 0.5;
-	const double xs[4] = {0.0, static_cast<double>(in_data->width - 1),
-						  0.0, static_cast<double>(in_data->width - 1)};
-	const double ys[4] = {0.0, 0.0, static_cast<double>(in_data->height - 1),
-						  static_cast<double>(in_data->height - 1)};
-	double maxRadius = 0.0;
-	for (int i = 0; i < 4; ++i) {
-		const double dx = xs[i] - centerX;
-		const double dy = ys[i] - centerY;
-		const double radius = std::sqrt(dx * dx + dy * dy);
-		maxRadius = (radius > maxRadius) ? radius : maxRadius;
-	}
-	const A_long radiusCeil = static_cast<A_long>(std::ceil(maxRadius));
-	if (mode == BPS_MODE_RADIAL) {
-		return radiusCeil + 1;
-	}
-	A_long rotationLineLength =
-		static_cast<A_long>(std::ceil(2.0 * BPS_UI_PI * radiusCeil));
-	return rotationLineLength < 1 ? 1 : rotationLineLength;
+	// Non-axis GPU eligibility is gated on frame size, not path length.
+	return in_data->width > in_data->height ? in_data->width : in_data->height;
 }
 
 static void
@@ -297,8 +240,12 @@ BPS_DrawGpuStatus(
 
 	if (!err && PF_EA_CONTROL == event_extra->effect_win.area) {
 		const A_long max_line_length = BPS_MaxLineLengthForUI(in_data, params);
+		const A_long mode = params[BPS_UI_MODE]
+			? BPS_ClampPopupForUI(params[BPS_UI_MODE]->u.pd.value,
+								  BPS_MODE_AXIS, BPS_MODE_PATH, BPS_MODE_DFLT)
+			: BPS_MODE_DFLT;
 		const BpsGpuEligibility eligibility = BPS_EvaluateGpuEligibility(
-			in_data, max_line_length, BPS_FrameRect(in_data));
+			in_data, mode, max_line_length, BPS_FrameRect(in_data));
 
 		const bool last_render_used_gpu = BPS_LastRenderUsedGpu();
 		bool draw_second_line = false;
@@ -377,6 +324,44 @@ BPS_DrawGpuStatus(
 	return err;
 }
 
+// Hide/show a parameter stream via AEGP_DynStreamFlag_HIDDEN only.
+// Initial hide (ParamsSetup) uses PF_PUI_INVISIBLE + COLLAPSE_TWIRLY for ANGLE /
+// POINT controls; never toggle PF_PUI_INVISIBLE here via PF_UpdateParamUI
+// (Premiere-only per SDK). See .agents/skills/ae-initially-hidden-params.
+static PF_Err
+BPS_SetParamVisible(
+	PF_InData *in_data,
+	PF_ParamDef *params[],
+	AEGP_SuiteHandler &suites,
+	AEGP_PluginID plugin_id,
+	AEGP_EffectRefH effectH,
+	A_long index,
+	bool visible)
+{
+	(void)in_data;
+
+	if (index <= BPS_UI_INPUT || index >= BPS_UI_NUM_PARAMS || !params[index]) {
+		return PF_Err_NONE;
+	}
+
+	if (!plugin_id || !effectH || !suites.StreamSuite2() ||
+		!suites.DynamicStreamSuite2()) {
+		return PF_Err_NONE;
+	}
+
+	AEGP_StreamRefH streamH = NULL;
+	if (suites.StreamSuite2()->AEGP_GetNewEffectStreamByIndex(
+			plugin_id, effectH, index, &streamH) ||
+		!streamH) {
+		return PF_Err_NONE;
+	}
+
+	const PF_Err err = suites.DynamicStreamSuite2()->AEGP_SetDynamicStreamFlag(
+		streamH, AEGP_DynStreamFlag_HIDDEN, FALSE, !visible);
+	suites.StreamSuite2()->AEGP_DisposeStream(streamH);
+	return err;
+}
+
 } // namespace
 
 PF_Err
@@ -418,33 +403,50 @@ BPS_UpdateParamsUI(
 	}
 
 	AEGP_SuiteHandler suites(in_data->pica_basicP);
-	if (!suites.ParamUtilsSuite3()) {
-		return PF_Err_NONE;
-	}
 
 	const A_long mode = BPS_ClampPopupForUI(params[BPS_UI_MODE]->u.pd.value,
-										   BPS_MODE_AXIS, BPS_MODE_RADIAL,
+										   BPS_MODE_AXIS, BPS_MODE_PATH,
 										   BPS_MODE_DFLT);
 
-	auto setParamInvisible = [&](A_long index, bool invisible) -> PF_Err {
-		if (index <= BPS_UI_INPUT || index >= BPS_UI_NUM_PARAMS || !params[index]) {
-			return PF_Err_NONE;
+	AEGP_PluginID plugin_id = 0;
+	if (in_data->global_data && suites.HandleSuite1()) {
+		BPS_GlobalData *globalP = reinterpret_cast<BPS_GlobalData *>(
+			suites.HandleSuite1()->host_lock_handle(in_data->global_data));
+		if (globalP) {
+			plugin_id = globalP->plugin_id;
 		}
+		suites.HandleSuite1()->host_unlock_handle(in_data->global_data);
+	}
 
-		PF_ParamDef def = *params[index];
-		if (invisible) {
-			def.ui_flags |= PF_PUI_INVISIBLE;
-		} else {
-			def.ui_flags &= ~PF_PUI_INVISIBLE;
-		}
-		return suites.ParamUtilsSuite3()->PF_UpdateParamUI(
-			in_data->effect_ref, index, &def);
-	};
+	AEGP_EffectRefH effectH = NULL;
+	if (plugin_id && suites.PFInterfaceSuite1()) {
+		(void)suites.PFInterfaceSuite1()->AEGP_GetNewEffectForEffect(
+			plugin_id, in_data->effect_ref, &effectH);
+	}
 
 	PF_Err err = PF_Err_NONE;
-	ERR(setParamInvisible(BPS_UI_DIRECTION, mode != BPS_MODE_AXIS));
-	ERR(setParamInvisible(BPS_UI_ANGLE, mode != BPS_MODE_FREE_ANGLE));
-	ERR(setParamInvisible(BPS_UI_CENTER,
-						  mode != BPS_MODE_ROTATION && mode != BPS_MODE_RADIAL));
+	ERR(BPS_SetParamVisible(in_data, params, suites, plugin_id, effectH,
+							BPS_UI_DIRECTION, mode == BPS_MODE_AXIS));
+	// Angle: Free Angle direction, or Rotation path start offset.
+	ERR(BPS_SetParamVisible(in_data, params, suites, plugin_id, effectH,
+							BPS_UI_ANGLE,
+							mode == BPS_MODE_FREE_ANGLE ||
+								mode == BPS_MODE_ROTATION));
+	ERR(BPS_SetParamVisible(in_data, params, suites, plugin_id, effectH,
+							BPS_UI_CENTER,
+							mode == BPS_MODE_ROTATION ||
+								mode == BPS_MODE_RADIAL ||
+								mode == BPS_MODE_SWIRL));
+	ERR(BPS_SetParamVisible(in_data, params, suites, plugin_id, effectH,
+							BPS_UI_SWIRL_AMOUNT, mode == BPS_MODE_SWIRL));
+	ERR(BPS_SetParamVisible(in_data, params, suites, plugin_id, effectH,
+							BPS_UI_PATH, mode == BPS_MODE_PATH));
+	ERR(BPS_SetParamVisible(in_data, params, suites, plugin_id, effectH,
+							BPS_UI_PATH_DIRECTION, mode == BPS_MODE_PATH));
+
+	if (effectH && suites.EffectSuite2()) {
+		suites.EffectSuite2()->AEGP_DisposeEffect(effectH);
+	}
+
 	return err;
 }

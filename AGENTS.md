@@ -24,6 +24,26 @@ It must reference only the Adobe SDK Examples tree and files inside
 - Do not change `MATCHNAME`, PiPL identifiers, or persisted data formats without
   explicit confirmation.
 
+## Initially Hidden Parameters
+
+Mode-dependent controls (Angle, Centre, Swirl, Path, and similar) must start
+hidden when Mode defaults to Axis. Follow the shared skill — do not improvise:
+
+- [ae-initially-hidden-params](../.agents/skills/ae-initially-hidden-params/SKILL.md)
+
+Summary:
+
+1. **ParamsSetup (creation only):** `PF_PUI_INVISIBLE` plus
+   `PF_ParamFlag_COLLAPSE_TWIRLY` on `PF_ADD_ANGLE` / `PF_ADD_POINT` (and any
+   control with a separate topic vs control region).
+2. **Runtime:** `AEGP_DynStreamFlag_HIDDEN` only (`BPS_UpdateParamsUI`). Never
+   toggle `PF_PUI_INVISIBLE` via `PF_UpdateParamUI` on After Effects.
+3. **First paint:** call the same visibility update from `PF_Cmd_SEQUENCE_SETUP`
+   and `PF_Cmd_SEQUENCE_RESETUP`, not only `UPDATE_PARAMS_UI`.
+
+Removing `COLLAPSE_TWIRLY` from an initially-hidden ANGLE to “show the dial when
+revealed” reintroduces the orphan dial on first apply. Keep `COLLAPSE_TWIRLY`.
+
 ## Build And Validation
 
 - Prefer Windows Debug builds for development validation:

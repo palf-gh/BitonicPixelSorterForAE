@@ -15,11 +15,13 @@ surface from the active repository layout.
 
 ### Overview
 
-Bitonic Pixel Sorter sorts contiguous spans of pixels whose selected colour key
-falls inside a threshold range. Sorting can run on horizontal/vertical axes, a
-free angle, circular rotation paths around a centre point, or radial paths from
-that centre. Each eligible span can be ordered ascending or descending by the
-same key used for thresholding.
+Bitonic Pixel Sorter sorts contiguous spans of pixels whose selected trigger
+key falls inside or outside a threshold range. Sorting can run on
+horizontal/vertical axes, a free angle, circular rotation paths around a centre
+point, radial paths from that centre, Archimedean swirl paths, or a user-chosen
+layer mask path (with open-end straight extensions). Each eligible span can be ordered
+ascending or descending by a separate sort criterion, and the sorted span can be
+cycled by an angle value.
 
 The current AE port contains:
 
@@ -28,6 +30,9 @@ The current AE port contains:
 - English, Japanese, Simplified Chinese and Korean parameter strings.
 - A self-contained CMake build that references only the Adobe After Effects SDK
   Examples tree plus vendored, header-only local helpers.
+- Swirl and Path use the shared CPU/GPU pixel-owned transformed path map so
+  each in-frame output pixel is owned once and rounded-domain holes or
+  collisions cannot destruct the image.
 
 Metal is implemented: it compiles and links into the universal `.plugin`, with
 the compute kernel embedded as runtime-compiled Metal source. It has been
@@ -37,20 +42,38 @@ validated on Apple Silicon Macs in After Effects 2023 through 2026.
 
 | Parameter | Meaning |
 | --- | --- |
-| Mode | Axis, Free Angle, Rotation, or Radial sorting. |
+| Mode | Axis, Free Angle, Rotation, Radial, Swirl, or Path sorting. |
 | Direction | Horizontal row sort or vertical column sort in Axis mode. |
 | Angle | Free Angle direction. |
-| Centre | Rotation/Radial centre point. |
-| Sort Criterion | Luminance, RGB Average, RGB Product, RGB Minimum, or RGB Maximum. |
+| Centre | Rotation/Radial/Swirl centre point. |
+| Swirl Amount | Twist rate for Swirl mode (radians per pixel of radius). |
+| Swirl Direction | Clockwise or counter-clockwise swirl. |
+| Path | Layer mask path used in Path mode. |
+| Path Direction | Sort along the path normal or tangent. |
+| Sort Criterion | Sort key: Luminance, RGB Average/Product/Minimum/Maximum, Red, Green, Blue, Alpha, Hue, or Saturation. |
+| Sort Trigger | Threshold key, with the same choices as Sort Criterion. |
+| Affect | Sort pixels inside or outside the threshold range. |
+| Cycle | Cyclic shift applied to each sorted run. |
 | Order | Ascending or descending key order. |
-| Threshold Min | Lower key bound for sortable pixels. |
-| Threshold Max | Upper key bound for sortable pixels. |
+| Threshold Min | Lower trigger-key bound. |
+| Threshold Max | Upper trigger-key bound. |
 
 The default luminance key follows the upstream weights:
 
 ```text
 0.298912 * R + 0.586611 * G + 0.114478 * B
 ```
+
+Swirl is classified as `phase = wrap(theta - signedAmount * radius)`, with
+`Swirl Amount` measured in radians per pixel of radius. `0` therefore uses the
+same line classification as Radial mode, and larger values form Archimedean
+spiral paths while sorting outward by radius.
+
+Path mode assigns every output pixel to the nearest segment of the sampled
+polyline. Open path endpoints inside the frame are extended along their tangent
+to the frame edge; closed paths are not extended. Self-intersections are handled
+deterministically by nearest-segment ownership, with ties resolved by lower
+arc length, then segment order, then pixel order.
 
 ### Repository Layout
 
@@ -193,10 +216,12 @@ Unity プロジェクトの表層を取り除いています。
 
 ### 概要
 
-Bitonic Pixel Sorter は、選択したカラーキーがしきい値範囲内に収まる
+Bitonic Pixel Sorter は、選択したトリガーキーがしきい値範囲の内側または外側にある
 連続ピクセル区間をソートします。水平/垂直の軸方向、自由角度、中心点を基準にした
-回転方向、中心点から外側へ伸びる放射方向に対応し、対象区間は同じキーの昇順または
-降順で並べ替えられます。
+回転方向、中心点から外側へ伸びる放射方向、アルキメデス螺旋、または
+ユーザー指定のマスクパス（オープンパスは両端を直線延長）に対応し、対象区間は
+独立したソート基準の昇順または降順で並べ替えられます。ソート後の各区間には角度指定の
+循環シフトも適用できます。
 
 現在の AE 移植版には次が含まれます。
 
@@ -205,6 +230,9 @@ Bitonic Pixel Sorter は、選択したカラーキーがしきい値範囲内�
 - 英語・日本語・簡体中国語・韓国語のパラメータ文字列。
 - Adobe After Effects SDK の Examples ツリーと、同梱のヘッダオンリー
   ローカルヘルパーのみを参照する自己完結型 CMake ビルド。
+- 螺旋とパスは CPU/GPU 共通の画素所有型変形パスマップを使い、フレーム内の
+  各出力画素を一度だけ所有することで、丸め domain の穴や衝突による破壊的
+  artefact を避けます。
 
 Metal は実装済みです。ユニバーサル `.plugin` としてコンパイル・リンクされ、
 コンピュートカーネルはランタイムコンパイルされる Metal ソースとして埋め込まれます。
@@ -214,20 +242,38 @@ Apple Silicon Mac 上の After Effects 2023〜2026 で検証済みです。
 
 | パラメータ | 説明 |
 | --- | --- |
-| モード | 軸方向、自由角度、回転、放射のソート方式。 |
+| モード | 軸方向、自由角度、回転、放射、螺旋、パスのソート方式。 |
 | 方向 | 軸方向モードでの水平ソート、または垂直ソート。 |
 | 角度 | 自由角度モードのソート方向。 |
-| 中心 | 回転/放射モードの中心点。 |
-| ソート基準 | 輝度、RGB平均、RGB積、RGB最小、RGB最大。 |
+| 中心 | 回転/放射/螺旋モードの中心点。 |
+| 螺旋量 | 螺旋モードの捩れ量（半径 1px あたりのラジアン）。 |
+| 回転方向 | 螺旋の時計回り / 反時計回り。 |
+| パス | パスモードで使うレイヤーマスクパス。 |
+| パス方向 | 法線方向またはタンジェント方向にソート。 |
+| ソート基準 | 並べ替えキー。輝度、RGB平均/積/最小/最大、赤、緑、青、アルファ、色相、彩度。 |
+| ソートトリガー | しきい値判定キー。選択肢はソート基準と同じ。 |
+| 影響 | しきい値内、またはしきい値外のどちらをソート対象にするか。 |
+| 循環 | ソート後の各 run に適用する循環シフト量。 |
 | 並び順 | 選択キーの昇順または降順。 |
-| しきい値 Min | ソート対象ピクセルのキー下限。 |
-| しきい値 Max | ソート対象ピクセルのキー上限。 |
+| しきい値 Min | トリガーキーの下限。 |
+| しきい値 Max | トリガーキーの上限。 |
 
 既定の輝度キーは上流と同じ重み付けを用います。
 
 ```text
 0.298912 * R + 0.586611 * G + 0.114478 * B
 ```
+
+螺旋は `phase = wrap(theta - signedAmount * radius)` として分類され、
+螺旋量は半径 1px あたりのラジアン量です。`0` では放射モードと同じ line
+分類になり、値を大きくすると半径方向に外へ進むアルキメデス螺旋として
+ソートされます。
+
+パスモードでは、全出力画素をサンプリング済み polyline の最近傍セグメントに
+所属させます。端点がフレーム内にあるオープンパスは端点 tangent 方向へ
+描画端まで延長し、クローズパスは延長しません。自己交差は最近傍セグメントの
+Voronoi 的な所属として扱い、等距離の場合は短い arc length、セグメント順、
+画素順で決定的に解決します。
 
 ### リポジトリ構成
 
@@ -368,7 +414,8 @@ Adobe After Effects 插件分支。算法与归属仍以原项目为准。本分
 ### 概述
 
 Bitonic Pixel Sorter 对所选颜色键落在阈值范围内的连续像素区间进行排序。它支持
-水平/垂直轴向、自由角度、围绕中心点的旋转路径，以及从中心点向外的放射路径。每个
+水平/垂直轴向、自由角度、围绕中心点的旋转路径、从中心点向外的放射路径、阿基米德螺旋，
+以及用户指定的蒙版路径（开放路径两端直线延长）。每个
 符合条件的区间可按同一键升序或降序排列。
 
 当前 AE 移植版包含：
@@ -386,10 +433,14 @@ Metal 已实现：可编译并链接为通用 `.plugin`，计算内核以运行�
 
 | 参数 | 含义 |
 | --- | --- |
-| 模式 | 轴向、自由角度、旋转或放射排序。 |
+| 模式 | 轴向、自由角度、旋转、放射、螺旋或路径排序。 |
 | 方向 | 轴向模式下的水平或垂直排序。 |
 | 角度 | 自由角度模式的排序方向。 |
-| 中心 | 旋转/放射模式的中心点。 |
+| 中心 | 旋转/放射/螺旋模式的中心点。 |
+| 螺旋量 | 螺旋模式的扭转量（每像素半径的弧度）。 |
+| 旋转方向 | 顺时针或逆时针螺旋。 |
+| 路径 | 路径模式使用的图层蒙版路径。 |
+| 路径方向 | 沿法线或切线方向排序。 |
 | 排序标准 | 亮度、RGB平均值、RGB乘积、RGB最小值或RGB最大值。 |
 | 顺序 | 按所选键升序或降序排列。 |
 | 阈值最小值 | 可排序像素的键下限。 |
@@ -538,7 +589,8 @@ Adobe After Effects 플러그인 포크입니다. 알고리즘과 귀속의 원�
 
 Bitonic Pixel Sorter는 선택한 색상 키가 임계값 범위 안에 들어가는 연속 픽셀 구간을
 정렬합니다. 수평/수직 축 방향, 자유 각도, 중심점 기준 회전 경로, 중심점에서 바깥쪽으로
-뻗는 방사 경로를 지원하며, 각 대상 구간은 같은 키 기준 오름차순 또는 내림차순으로
+뻗는 방사 경로, 아르키메데스 나선, 사용자 지정 마스크 패스(열린 패스는 양 끝을
+직선 연장)를 지원하며, 각 대상 구간은 같은 키 기준 오름차순 또는 내림차순으로
 정렬할 수 있습니다.
 
 현재 AE 포트에는 다음이 포함됩니다.
@@ -557,10 +609,14 @@ Metal은 구현되었습니다. 유니버설 `.plugin`으로 컴파일 및 링�
 
 | 매개변수 | 의미 |
 | --- | --- |
-| 모드 | 축 방향, 자유 각도, 회전, 방사 정렬. |
+| 모드 | 축 방향, 자유 각도, 회전, 방사, 나선, 패스 정렬. |
 | 방향 | 축 방향 모드의 수평 또는 수직 정렬. |
 | 각도 | 자유 각도 모드의 정렬 방향. |
-| 중심 | 회전/방사 모드의 중심점. |
+| 중심 | 회전/방사/나선 모드의 중심점. |
+| 나선량 | 나선 모드의 비틀림 양(반지름 1px당 라디안). |
+| 회전 방향 | 시계 방향 또는 반시계 방향 나선. |
+| 패스 | 패스 모드에서 사용하는 레이어 마스크 패스. |
+| 패스 방향 | 법선 또는 접선 방향으로 정렬. |
 | 정렬 기준 | 휘도, RGB 평균, RGB 곱, RGB 최솟값, RGB 최댓값. |
 | 정렬 순서 | 선택 키의 오름차순 또는 내림차순. |
 | 임계값 최소 | 정렬 대상 픽셀의 키 하한. |

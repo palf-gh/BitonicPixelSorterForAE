@@ -11,6 +11,7 @@
 */
 
 #include "BitonicPixelSorter.h"
+#include "BitonicPixelSorter_PathGeometry.h"
 
 #include <algorithm>
 #include <cmath>
@@ -27,7 +28,12 @@ inline float Saturate(float v) {
 }
 
 // Luma weights matching the upstream shader: 0.298912 R + 0.586611 G + 0.114478 B.
-inline float SortKey(float r, float g, float b, A_long criterion) {
+inline float SortKey(float r, float g, float b, float a, A_long criterion) {
+	r = Saturate(r);
+	g = Saturate(g);
+	b = Saturate(b);
+	a = Saturate(a);
+
 	switch (criterion) {
 	case BPS_CRITERION_RGB_AVERAGE:
 		return Saturate((r + g + b) * (1.0f / 3.0f));
@@ -41,6 +47,43 @@ inline float SortKey(float r, float g, float b, A_long criterion) {
 		const float rg = (r > g) ? r : g;
 		return Saturate((rg > b) ? rg : b);
 	}
+	case BPS_CRITERION_RED_CHANNEL:
+		return r;
+	case BPS_CRITERION_GREEN_CHANNEL:
+		return g;
+	case BPS_CRITERION_BLUE_CHANNEL:
+		return b;
+	case BPS_CRITERION_ALPHA_CHANNEL:
+		return a;
+	case BPS_CRITERION_HUE: {
+		const float maxRGB = (r > g) ? ((r > b) ? r : b) : ((g > b) ? g : b);
+		const float minRGB = (r < g) ? ((r < b) ? r : b) : ((g < b) ? g : b);
+		const float delta = maxRGB - minRGB;
+		if (delta <= 0.0f) {
+			return 0.0f;
+		}
+
+		float hue = 0.0f;
+		if (maxRGB == r) {
+			hue = (g - b) / delta;
+			if (hue < 0.0f) {
+				hue += 6.0f;
+			}
+		} else if (maxRGB == g) {
+			hue = ((b - r) / delta) + 2.0f;
+		} else {
+			hue = ((r - g) / delta) + 4.0f;
+		}
+		return Saturate(hue * (1.0f / 6.0f));
+	}
+	case BPS_CRITERION_SATURATION: {
+		const float maxRGB = (r > g) ? ((r > b) ? r : b) : ((g > b) ? g : b);
+		const float minRGB = (r < g) ? ((r < b) ? r : b) : ((g < b) ? g : b);
+		if (maxRGB <= 0.0f) {
+			return 0.0f;
+		}
+		return Saturate((maxRGB - minRGB) / maxRGB);
+	}
 	case BPS_CRITERION_LUMINANCE:
 	default:
 		return Saturate(0.298912f * r + 0.586611f * g + 0.114478f * b);
@@ -49,17 +92,17 @@ inline float SortKey(float r, float g, float b, A_long criterion) {
 
 inline float SortKeyUnit(const PF_Pixel8 &p, A_long criterion) {
 	const float inv = 1.0f / 255.0f;
-	return SortKey(p.red * inv, p.green * inv, p.blue * inv, criterion);
+	return SortKey(p.red * inv, p.green * inv, p.blue * inv, p.alpha * inv, criterion);
 }
 
 inline float SortKeyUnit(const PF_Pixel16 &p, A_long criterion) {
 	// After Effects 16-bit channels are 0..32768.
 	const float inv = 1.0f / 32768.0f;
-	return SortKey(p.red * inv, p.green * inv, p.blue * inv, criterion);
+	return SortKey(p.red * inv, p.green * inv, p.blue * inv, p.alpha * inv, criterion);
 }
 
 inline float SortKeyUnit(const PF_PixelFloat &p, A_long criterion) {
-	return SortKey(p.red, p.green, p.blue, criterion);
+	return SortKey(p.red, p.green, p.blue, p.alpha, criterion);
 }
 
 template <typename T>
@@ -99,6 +142,7 @@ struct LineScratch {
 	std::vector<T> sourceLine;
 	std::vector<T> sortedLine;
 	std::vector<float> keys;
+	std::vector<float> triggerKeys;
 	std::vector<unsigned char> validLine;
 	std::vector<Entry<T>> run;
 };
@@ -109,11 +153,18 @@ struct PathCoord {
 	bool valid;
 };
 
+struct MappedPixelCoord {
+	A_long x;
+	A_long y;
+	A_long pos;
+};
+
 template <typename T>
 struct PathScratch {
 	std::vector<T> sourceLine;
 	std::vector<T> sortedLine;
 	std::vector<float> keys;
+	std::vector<float> triggerKeys;
 	std::vector<unsigned char> validLine;
 	std::vector<PathCoord> coords;
 	std::vector<Entry<T>> run;
@@ -138,7 +189,103 @@ inline unsigned int WorkerCountFor(A_long lineCount) {
 }
 
 inline A_long RoundToLong(double value) {
-	return static_cast<A_long>(std::lround(value));
+	return static_cast<A_long>(std::floor(value + 0.5));
+}
+
+inline bool IsAffectedByThreshold(float triggerKey, const BitonicSorterParams &prm) {
+	const bool inside = triggerKey >= prm.thresholdMin && triggerKey <= prm.thresholdMax;
+	return (prm.affect == BPS_AFFECT_OUTSIDE_THRESHOLDS) ? !inside : inside;
+}
+
+inline size_t CycleShiftFor(size_t count, const BitonicSorterParams &prm) {
+	if (count <= 1) {
+		return 0;
+	}
+
+	const double turns = static_cast<double>(prm.cycleDegrees) / 360.0;
+	long long shift = static_cast<long long>(std::llround(turns * static_cast<double>(count)));
+	const long long n = static_cast<long long>(count);
+	shift %= n;
+	if (shift < 0) {
+		shift += n;
+	}
+	return static_cast<size_t>(shift);
+}
+
+template <typename T, typename Scratch>
+inline void SortRunIntoLine(Scratch &scratch,
+							A_long start,
+							const BitonicSorterParams &prm) {
+	if (scratch.run.size() <= 1) {
+		return;
+	}
+
+	if (prm.ascending) {
+		std::stable_sort(scratch.run.begin(), scratch.run.end(),
+			[](const Entry<T> &a, const Entry<T> &b) { return a.key < b.key; });
+	} else {
+		std::stable_sort(scratch.run.begin(), scratch.run.end(),
+			[](const Entry<T> &a, const Entry<T> &b) { return a.key > b.key; });
+	}
+
+	const size_t shift = CycleShiftFor(scratch.run.size(), prm);
+	for (size_t i = 0; i < scratch.run.size(); ++i) {
+		const size_t dest = (i + shift) % scratch.run.size();
+		scratch.sortedLine[static_cast<size_t>(start) + dest] =
+			scratch.sourceLine[static_cast<size_t>(scratch.run[i].index)];
+	}
+}
+
+// Sort a run whose members may be non-contiguous along the path (OOB positions
+// are omitted). `positions` lists path indices in traversal order.
+template <typename T, typename Scratch>
+inline void SortRunAtPositions(Scratch &scratch,
+							   const std::vector<A_long> &positions,
+							   const BitonicSorterParams &prm) {
+	if (positions.size() <= 1u) {
+		return;
+	}
+
+	scratch.run.clear();
+	scratch.run.reserve(positions.size());
+	for (A_long pos : positions) {
+		const size_t index = static_cast<size_t>(pos);
+		scratch.run.push_back(Entry<T>{scratch.keys[index], static_cast<uint32_t>(pos)});
+	}
+
+	if (prm.ascending) {
+		std::stable_sort(scratch.run.begin(), scratch.run.end(),
+			[](const Entry<T> &a, const Entry<T> &b) { return a.key < b.key; });
+	} else {
+		std::stable_sort(scratch.run.begin(), scratch.run.end(),
+			[](const Entry<T> &a, const Entry<T> &b) { return a.key > b.key; });
+	}
+
+	const size_t shift = CycleShiftFor(scratch.run.size(), prm);
+	for (size_t i = 0; i < scratch.run.size(); ++i) {
+		const size_t dest = (i + shift) % scratch.run.size();
+		const size_t dest_pos = static_cast<size_t>(positions[dest]);
+		scratch.sortedLine[dest_pos] =
+			scratch.sourceLine[static_cast<size_t>(scratch.run[i].index)];
+	}
+}
+
+// Build in-bounds path order from pos = 0 (angle start). Out-of-frame samples
+// are omitted but do not break runs, so the visible arc sorts as one continuous
+// sequence while the seam still follows the angle parameter.
+inline void BuildPathOrder(const std::vector<unsigned char> &validLine,
+						   A_long lineLen,
+						   std::vector<A_long> *pathP) {
+	pathP->clear();
+	if (lineLen <= 0) {
+		return;
+	}
+
+	for (A_long pos = 0; pos < lineLen; ++pos) {
+		if (validLine[static_cast<size_t>(pos)] != 0u) {
+			pathP->push_back(pos);
+		}
+	}
 }
 
 inline A_long RotationLineLength(A_long radius) {
@@ -157,12 +304,16 @@ inline A_long GenericLineCount(const BitonicSorterParams &prm) {
 		return prm.radialLength;
 	case BPS_MODE_RADIAL:
 		return prm.radialLineCount;
+	case BPS_MODE_SWIRL:
+	case BPS_MODE_PATH:
+		return prm.domainLineCount;
 	default:
 		return 0;
 	}
 }
 
 inline A_long GenericLineLength(const BitonicSorterParams &prm, A_long line) {
+	(void)line;
 	switch (prm.mode) {
 	case BPS_MODE_FREE_ANGLE:
 		return prm.freeLineLength;
@@ -170,6 +321,10 @@ inline A_long GenericLineLength(const BitonicSorterParams &prm, A_long line) {
 		return RotationLineLength(line);
 	case BPS_MODE_RADIAL:
 		return prm.radialLength;
+	case BPS_MODE_SWIRL:
+		return prm.radialLength;
+	case BPS_MODE_PATH:
+		return prm.domainMaxLineLength;
 	default:
 		return 0;
 	}
@@ -192,12 +347,19 @@ inline PathCoord GenericCoord(const BitonicSorterParams &prm,
 		coord.y = RoundToLong(p * prm.angleSin + q * prm.angleCos);
 	} else if (prm.mode == BPS_MODE_ROTATION) {
 		const A_long lineLen = GenericLineLength(prm, line);
+		// Path basis is (sin, -cos) so theta = 0 is top (North) at angle = 0.
+		// angleCos/angleSin then rotate that start around the centre.
 		const double theta = (lineLen <= 1)
 			? 0.0
 			: (2.0 * BPS_CPU_PI * static_cast<double>(pos)) /
 			  static_cast<double>(lineLen);
-		coord.x = RoundToLong(prm.centerX + static_cast<double>(line) * std::cos(theta));
-		coord.y = RoundToLong(prm.centerY + static_cast<double>(line) * std::sin(theta));
+		const double c = std::cos(theta);
+		const double s = std::sin(theta);
+		const double radius = static_cast<double>(line);
+		coord.x = RoundToLong(prm.centerX +
+			radius * (s * prm.angleCos + c * prm.angleSin));
+		coord.y = RoundToLong(prm.centerY +
+			radius * (s * prm.angleSin - c * prm.angleCos));
 	} else if (prm.mode == BPS_MODE_RADIAL) {
 		const double theta = (prm.radialLineCount <= 0)
 			? 0.0
@@ -205,10 +367,123 @@ inline PathCoord GenericCoord(const BitonicSorterParams &prm,
 			  static_cast<double>(prm.radialLineCount);
 		coord.x = RoundToLong(prm.centerX + static_cast<double>(pos) * std::cos(theta));
 		coord.y = RoundToLong(prm.centerY + static_cast<double>(pos) * std::sin(theta));
+	} else if (prm.mode == BPS_MODE_SWIRL) {
+		// Phase lines: phase = atan2 - angle - k*r (same as pixel classification).
+		// line indexes phase, pos is radius — same cost class as Radial.
+		const double r = static_cast<double>(pos);
+		const double phase = (prm.radialLineCount <= 1)
+			? 0.0
+			: (2.0 * BPS_CPU_PI * static_cast<double>(line)) /
+			  static_cast<double>(prm.radialLineCount);
+		const double theta =
+			phase + static_cast<double>(prm.swirlK) * r + prm.angleRadians;
+		coord.x = RoundToLong(prm.centerX + r * std::cos(theta));
+		coord.y = RoundToLong(prm.centerY + r * std::sin(theta));
+	} else if (prm.mode == BPS_MODE_PATH) {
+		A_long px = 0;
+		A_long py = 0;
+		if (!BPS_PathCoordForPos(prm, line, pos, &px, &py)) {
+			return coord;
+		}
+		coord.x = px;
+		coord.y = py;
 	}
 
 	coord.valid = coord.x >= 0 && coord.y >= 0 && coord.x < frameW && coord.y < frameH;
 	return coord;
+}
+
+inline bool GenericDomainPosForPixel(const BitonicSorterParams &prm,
+									 A_long x,
+									 A_long y,
+									 A_long *lineP,
+									 A_long *posP) {
+	if (!lineP || !posP) {
+		return false;
+	}
+
+	A_long line = 0;
+	A_long pos = 0;
+	if (prm.mode == BPS_MODE_FREE_ANGLE) {
+		const double p = static_cast<double>(x) * prm.angleCos +
+						 static_cast<double>(y) * prm.angleSin;
+		const double q = -static_cast<double>(x) * prm.angleSin +
+						  static_cast<double>(y) * prm.angleCos;
+		pos = RoundToLong(p) - prm.freePMin;
+		line = RoundToLong(q) - prm.freeQMin;
+	} else if (prm.mode == BPS_MODE_ROTATION) {
+		const double dx = static_cast<double>(x) - prm.centerX;
+		const double dy = static_cast<double>(y) - prm.centerY;
+		line = RoundToLong(std::sqrt(dx * dx + dy * dy));
+		const A_long lineLen = GenericLineLength(prm, line);
+		if (lineLen <= 1) {
+			pos = 0;
+		} else {
+			// Undo the start-angle rotation; basis is (sin, -cos) so
+			// theta = atan2(rx, -ry) with theta = 0 at top.
+			const double rx = dx * prm.angleCos + dy * prm.angleSin;
+			const double ry = -dx * prm.angleSin + dy * prm.angleCos;
+			double theta = std::atan2(rx, -ry);
+			if (theta < 0.0) {
+				theta += 2.0 * BPS_CPU_PI;
+			}
+			pos = RoundToLong((theta / (2.0 * BPS_CPU_PI)) *
+							  static_cast<double>(lineLen));
+			if (pos >= lineLen) {
+				pos -= lineLen;
+			}
+		}
+	} else if (prm.mode == BPS_MODE_RADIAL) {
+		const double dx = static_cast<double>(x) - prm.centerX;
+		const double dy = static_cast<double>(y) - prm.centerY;
+		const double radius = std::sqrt(dx * dx + dy * dy);
+		pos = RoundToLong(radius);
+		double theta = std::atan2(dy, dx);
+		if (theta < 0.0) {
+			theta += 2.0 * BPS_CPU_PI;
+		}
+		line = (prm.radialLineCount <= 1)
+			? 0
+			: RoundToLong((theta / (2.0 * BPS_CPU_PI)) *
+						  static_cast<double>(prm.radialLineCount));
+		if (line >= prm.radialLineCount) {
+			line -= prm.radialLineCount;
+		}
+	} else if (prm.mode == BPS_MODE_SWIRL) {
+		const double dx = static_cast<double>(x) - prm.centerX;
+		const double dy = static_cast<double>(y) - prm.centerY;
+		const double r = std::sqrt(dx * dx + dy * dy);
+		double theta = std::atan2(dy, dx) - prm.angleRadians;
+		theta -= static_cast<double>(prm.swirlK) * r;
+		theta = std::fmod(theta, 2.0 * BPS_CPU_PI);
+		if (theta < 0.0) {
+			theta += 2.0 * BPS_CPU_PI;
+		}
+		line = (prm.radialLineCount <= 1)
+			? 0
+			: RoundToLong((theta / (2.0 * BPS_CPU_PI)) *
+						  static_cast<double>(prm.radialLineCount));
+		if (line >= prm.radialLineCount) {
+			line -= prm.radialLineCount;
+		}
+		pos = RoundToLong(r);
+	} else if (prm.mode == BPS_MODE_PATH) {
+		return BPS_PathDomainPosForPixel(prm, x, y, lineP, posP);
+	} else {
+		return false;
+	}
+
+	if (line < 0 || line >= GenericLineCount(prm)) {
+		return false;
+	}
+	const A_long lineLen = GenericLineLength(prm, line);
+	if (pos < 0 || pos >= lineLen) {
+		return false;
+	}
+
+	*lineP = line;
+	*posP = pos;
+	return true;
 }
 
 // Sort each contiguous in-threshold span of every line by the selected key.
@@ -222,10 +497,8 @@ static void SortLines(PF_EffectWorld *inP, PF_EffectWorld *outP,
 					  A_long frameW,
 					  A_long frameH) {
 	const bool	horizontal = (prm.direction == BPS_DIR_HORIZONTAL);
-	const bool	ascending  = (prm.ascending != 0);
 	const A_long criterion = prm.criterion;
-	const float	tmin = prm.thresholdMin;
-	const float	tmax = prm.thresholdMax;
+	const A_long trigger = prm.trigger;
 
 	const A_long outW = outP->width;
 	const A_long outH = outP->height;
@@ -254,6 +527,7 @@ static void SortLines(PF_EffectWorld *inP, PF_EffectWorld *outP,
 		scratch.sourceLine.resize(static_cast<size_t>(lineLen));
 		scratch.sortedLine.resize(static_cast<size_t>(lineLen));
 		scratch.keys.resize(static_cast<size_t>(lineLen));
+		scratch.triggerKeys.resize(static_cast<size_t>(lineLen));
 		scratch.validLine.resize(static_cast<size_t>(lineLen));
 		scratch.run.reserve(static_cast<size_t>(lineLen));
 
@@ -276,11 +550,13 @@ static void SortLines(PF_EffectWorld *inP, PF_EffectWorld *outP,
 					scratch.sourceLine[index] = pixel;
 					scratch.sortedLine[index] = pixel;
 					scratch.keys[index] = SortKeyUnit(pixel, criterion);
+					scratch.triggerKeys[index] = SortKeyUnit(pixel, trigger);
 					scratch.validLine[index] = 1;
 				} else {
 					scratch.sourceLine[index] = T{};
 					scratch.sortedLine[index] = T{};
 					scratch.keys[index] = -1.0f;
+					scratch.triggerKeys[index] = -1.0f;
 					scratch.validLine[index] = 0;
 				}
 			}
@@ -289,34 +565,21 @@ static void SortLines(PF_EffectWorld *inP, PF_EffectWorld *outP,
 			while (k < lineLen) {
 				const size_t keyIndex = static_cast<size_t>(k);
 				const bool inBounds = scratch.validLine[keyIndex] != 0;
-				const float br = scratch.keys[keyIndex];
+				const float triggerKey = scratch.triggerKeys[keyIndex];
 
-				if (inBounds && br >= tmin && br <= tmax) {
+				if (inBounds && IsAffectedByThreshold(triggerKey, prm)) {
 					const A_long start = k;
 					scratch.run.clear();
 					while (k < lineLen) {
 						const size_t runIndex = static_cast<size_t>(k);
 						if (scratch.validLine[runIndex] == 0) break;
-						const float b = scratch.keys[runIndex];
-						if (b < tmin || b > tmax) break;
-						scratch.run.push_back(Entry<T>{b, static_cast<uint32_t>(k)});
+						if (!IsAffectedByThreshold(scratch.triggerKeys[runIndex], prm)) break;
+						scratch.run.push_back(Entry<T>{
+							scratch.keys[runIndex], static_cast<uint32_t>(k)});
 						++k;
 					}
 
-					if (scratch.run.size() > 1) {
-						if (ascending) {
-							std::stable_sort(scratch.run.begin(), scratch.run.end(),
-								[](const Entry<T> &a, const Entry<T> &b) { return a.key < b.key; });
-						} else {
-							std::stable_sort(scratch.run.begin(), scratch.run.end(),
-								[](const Entry<T> &a, const Entry<T> &b) { return a.key > b.key; });
-						}
-
-						for (size_t i = 0; i < scratch.run.size(); ++i) {
-							scratch.sortedLine[static_cast<size_t>(start) + i] =
-								scratch.sourceLine[static_cast<size_t>(scratch.run[i].index)];
-						}
-					}
+					SortRunIntoLine<T>(scratch, start, prm);
 				} else {
 					++k;
 				}
@@ -376,6 +639,97 @@ static void CopyInputToOutputRect(PF_EffectWorld *inP, PF_EffectWorld *outP) {
 }
 
 template <typename T>
+static void SortMappedPixels(PF_EffectWorld *inP, PF_EffectWorld *outP,
+							 const BitonicSorterParams &prm,
+							 A_long frameW,
+							 A_long frameH) {
+	CopyInputToOutputRect<T>(inP, outP);
+
+	const A_long lineCount = prm.domainLineCount;
+	if (lineCount <= 0 || frameW <= 0 || frameH <= 0 ||
+		!prm.mappedRecords || !prm.mappedLineOffsets ||
+		prm.mappedRecordCount <= 0) {
+		return;
+	}
+
+	const A_long criterion = prm.criterion;
+	const A_long trigger = prm.trigger;
+	LineScratch<T> scratch;
+
+	for (A_long line = 0; line < lineCount; ++line) {
+		const std::uint32_t begin = prm.mappedLineOffsets[line];
+		const std::uint32_t end = prm.mappedLineOffsets[line + 1];
+		if (end <= begin) {
+			continue;
+		}
+
+		const size_t lineLen = static_cast<size_t>(end - begin);
+		scratch.sourceLine.resize(lineLen);
+		scratch.sortedLine.resize(lineLen);
+		scratch.keys.resize(lineLen);
+		scratch.triggerKeys.resize(lineLen);
+		scratch.validLine.resize(lineLen);
+		scratch.run.clear();
+		scratch.run.reserve(lineLen);
+
+		for (size_t i = 0; i < lineLen; ++i) {
+			const BpsMappedPixelRecord &record =
+				prm.mappedRecords[static_cast<size_t>(begin) + i];
+			const A_long x = static_cast<A_long>(record.pixelIndex % frameW);
+			const A_long y = static_cast<A_long>(record.pixelIndex / frameW);
+			if (ContainsLayerPoint(inP, x, y)) {
+				const T pixel = *PixelAtLayer<T>(inP, x, y);
+				scratch.sourceLine[i] = pixel;
+				scratch.sortedLine[i] = pixel;
+				scratch.keys[i] = SortKeyUnit(pixel, criterion);
+				scratch.triggerKeys[i] = SortKeyUnit(pixel, trigger);
+				scratch.validLine[i] = 1u;
+			} else {
+				scratch.sourceLine[i] = T{};
+				scratch.sortedLine[i] = T{};
+				scratch.keys[i] = -1.0f;
+				scratch.triggerKeys[i] = -1.0f;
+				scratch.validLine[i] = 0u;
+			}
+		}
+
+		A_long k = 0;
+		const A_long lineLenLong = static_cast<A_long>(lineLen);
+		while (k < lineLenLong) {
+			const size_t keyIndex = static_cast<size_t>(k);
+			if (scratch.validLine[keyIndex] != 0u &&
+				IsAffectedByThreshold(scratch.triggerKeys[keyIndex], prm)) {
+				const A_long start = k;
+				scratch.run.clear();
+				while (k < lineLenLong) {
+					const size_t runIndex = static_cast<size_t>(k);
+					if (scratch.validLine[runIndex] == 0u ||
+						!IsAffectedByThreshold(scratch.triggerKeys[runIndex], prm)) {
+						break;
+					}
+					scratch.run.push_back(Entry<T>{
+						scratch.keys[runIndex], static_cast<uint32_t>(k)});
+					++k;
+				}
+				SortRunIntoLine<T>(scratch, start, prm);
+			} else {
+				++k;
+			}
+		}
+
+		for (size_t i = 0; i < lineLen; ++i) {
+			const BpsMappedPixelRecord &record =
+				prm.mappedRecords[static_cast<size_t>(begin) + i];
+			const A_long x = static_cast<A_long>(record.pixelIndex % frameW);
+			const A_long y = static_cast<A_long>(record.pixelIndex / frameW);
+			if (scratch.validLine[i] != 0u && ContainsLayerPoint(outP, x, y)) {
+				*PixelAtLayer<T>(outP, x, y) = scratch.sortedLine[i];
+			}
+		}
+	}
+}
+
+template <typename T>
 static void SortGenericPaths(PF_EffectWorld *inP, PF_EffectWorld *outP,
 							 const BitonicSorterParams &prm,
 							 A_long frameW,
@@ -387,93 +741,112 @@ static void SortGenericPaths(PF_EffectWorld *inP, PF_EffectWorld *outP,
 		return;
 	}
 
-	const bool ascending = (prm.ascending != 0);
 	const A_long criterion = prm.criterion;
-	const float tmin = prm.thresholdMin;
-	const float tmax = prm.thresholdMax;
+	const A_long trigger = prm.trigger;
+	std::vector<size_t> offsets(static_cast<size_t>(lineCount) + 1u, 0u);
+	for (A_long line = 0; line < lineCount; ++line) {
+		const A_long lineLen = GenericLineLength(prm, line);
+		offsets[static_cast<size_t>(line) + 1u] =
+			offsets[static_cast<size_t>(line)] +
+			static_cast<size_t>(lineLen > 0 ? lineLen : 0);
+	}
 
-	auto processLines = [&](A_long chunkStart, A_long chunkEnd) {
-		PathScratch<T> scratch;
-		scratch.run.reserve(static_cast<size_t>(prm.maxLineLength > 0 ? prm.maxLineLength : 1));
+	const size_t domainSize = offsets.back();
+	if (domainSize == 0u) {
+		return;
+	}
 
-		for (A_long line = chunkStart; line < chunkEnd; ++line) {
-			const A_long lineLen = GenericLineLength(prm, line);
-			if (lineLen <= 0) {
-				continue;
-			}
-			const size_t lineSize = static_cast<size_t>(lineLen);
-			scratch.sourceLine.resize(lineSize);
-			scratch.sortedLine.resize(lineSize);
-			scratch.keys.resize(lineSize);
-			scratch.validLine.resize(lineSize);
-			scratch.coords.resize(lineSize);
+	std::vector<T> domain(domainSize);
+	std::vector<unsigned char> domainValid(domainSize, 0u);
+	PathScratch<T> scratch;
+	scratch.run.reserve(static_cast<size_t>(prm.maxLineLength > 0 ? prm.maxLineLength : 1));
 
-			for (A_long k = 0; k < lineLen; ++k) {
-				const size_t index = static_cast<size_t>(k);
-				const PathCoord coord = GenericCoord(prm, line, k, frameW, frameH);
-				scratch.coords[index] = coord;
-				if (coord.valid && ContainsLayerPoint(inP, coord.x, coord.y)) {
-					const T pixel = *PixelAtLayer<T>(inP, coord.x, coord.y);
-					scratch.sourceLine[index] = pixel;
-					scratch.sortedLine[index] = pixel;
-					scratch.keys[index] = SortKeyUnit(pixel, criterion);
-					scratch.validLine[index] = 1;
-				} else {
-					scratch.sourceLine[index] = T{};
-					scratch.sortedLine[index] = T{};
-					scratch.keys[index] = -1.0f;
-					scratch.validLine[index] = 0;
-				}
-			}
+	// Forward path sampling. Out-of-frame samples are omitted from the path
+	// (not treated as run breaks), so a circle that clips the frame still sorts
+	// as one continuous arc — matching sample-plugin behaviour.
+	std::vector<A_long> path;
+	std::vector<A_long> run_positions;
+	path.reserve(static_cast<size_t>(prm.maxLineLength > 0 ? prm.maxLineLength : 1));
+	run_positions.reserve(path.capacity());
 
-			A_long k = 0;
-			while (k < lineLen) {
-				const size_t keyIndex = static_cast<size_t>(k);
-				const bool inBounds = scratch.validLine[keyIndex] != 0;
-				const float key = scratch.keys[keyIndex];
+	for (A_long line = 0; line < lineCount; ++line) {
+		const A_long lineLen = GenericLineLength(prm, line);
+		if (lineLen <= 0) {
+			continue;
+		}
 
-				if (inBounds && key >= tmin && key <= tmax) {
-					const A_long start = k;
-					scratch.run.clear();
-					while (k < lineLen) {
-						const size_t runIndex = static_cast<size_t>(k);
-						if (scratch.validLine[runIndex] == 0) break;
-						const float runKey = scratch.keys[runIndex];
-						if (runKey < tmin || runKey > tmax) break;
-						scratch.run.push_back(Entry<T>{runKey, static_cast<uint32_t>(k)});
-						++k;
-					}
+		const size_t lineSize = static_cast<size_t>(lineLen);
+		scratch.sourceLine.resize(lineSize);
+		scratch.sortedLine.resize(lineSize);
+		scratch.keys.resize(lineSize);
+		scratch.triggerKeys.resize(lineSize);
+		scratch.validLine.resize(lineSize);
 
-					if (scratch.run.size() > 1) {
-						if (ascending) {
-							std::stable_sort(scratch.run.begin(), scratch.run.end(),
-								[](const Entry<T> &a, const Entry<T> &b) { return a.key < b.key; });
-						} else {
-							std::stable_sort(scratch.run.begin(), scratch.run.end(),
-								[](const Entry<T> &a, const Entry<T> &b) { return a.key > b.key; });
-						}
-
-						for (size_t i = 0; i < scratch.run.size(); ++i) {
-							scratch.sortedLine[static_cast<size_t>(start) + i] =
-								scratch.sourceLine[static_cast<size_t>(scratch.run[i].index)];
-						}
-					}
-				} else {
-					++k;
-				}
-			}
-
-			for (A_long writeIndex = 0; writeIndex < lineLen; ++writeIndex) {
-				const PathCoord coord = scratch.coords[static_cast<size_t>(writeIndex)];
-				if (coord.valid && ContainsLayerPoint(outP, coord.x, coord.y)) {
-					*PixelAtLayer<T>(outP, coord.x, coord.y) =
-						scratch.sortedLine[static_cast<size_t>(writeIndex)];
-				}
+		for (A_long k = 0; k < lineLen; ++k) {
+			const size_t index = static_cast<size_t>(k);
+			const PathCoord coord = GenericCoord(prm, line, k, frameW, frameH);
+			if (coord.valid && ContainsLayerPoint(inP, coord.x, coord.y)) {
+				const T pixel = *PixelAtLayer<T>(inP, coord.x, coord.y);
+				scratch.sourceLine[index] = pixel;
+				scratch.sortedLine[index] = pixel;
+				scratch.keys[index] = SortKeyUnit(pixel, criterion);
+				scratch.triggerKeys[index] = SortKeyUnit(pixel, trigger);
+				scratch.validLine[index] = 1u;
+			} else {
+				scratch.sourceLine[index] = T{};
+				scratch.sortedLine[index] = T{};
+				scratch.keys[index] = -1.0f;
+				scratch.triggerKeys[index] = -1.0f;
+				scratch.validLine[index] = 0u;
 			}
 		}
-	};
 
-	processLines(0, lineCount);
+		BuildPathOrder(scratch.validLine, lineLen, &path);
+
+		run_positions.clear();
+		for (A_long pos : path) {
+			const size_t index = static_cast<size_t>(pos);
+			if (IsAffectedByThreshold(scratch.triggerKeys[index], prm)) {
+				run_positions.push_back(pos);
+			} else {
+				SortRunAtPositions<T>(scratch, run_positions, prm);
+				run_positions.clear();
+			}
+		}
+		SortRunAtPositions<T>(scratch, run_positions, prm);
+
+		const size_t base = offsets[static_cast<size_t>(line)];
+		for (A_long kWrite = 0; kWrite < lineLen; ++kWrite) {
+			const size_t index = static_cast<size_t>(kWrite);
+			const size_t dstIndex = base + index;
+			domain[dstIndex] = scratch.sortedLine[index];
+			domainValid[dstIndex] = scratch.validLine[index];
+		}
+	}
+
+	const A_long outLeft = outP->origin_x;
+	const A_long outTop = outP->origin_y;
+	const A_long outRight = outLeft + outP->width;
+	const A_long outBottom = outTop + outP->height;
+	for (A_long y = outTop; y < outBottom; ++y) {
+		for (A_long x = outLeft; x < outRight; ++x) {
+			if (!ContainsLayerPoint(outP, x, y)) {
+				continue;
+			}
+
+			A_long line = 0;
+			A_long pos = 0;
+			if (!GenericDomainPosForPixel(prm, x, y, &line, &pos)) {
+				continue;
+			}
+
+			const size_t domainIndex =
+				offsets[static_cast<size_t>(line)] + static_cast<size_t>(pos);
+			if (domainIndex < domain.size() && domainValid[domainIndex] != 0u) {
+				*PixelAtLayer<T>(outP, x, y) = domain[domainIndex];
+			}
+		}
+	}
 }
 
 } // namespace
@@ -495,6 +868,9 @@ PF_Err BPS_SortImageCPU(
 		if (paramsP->mode == BPS_MODE_AXIS) {
 			SortLines<PF_PixelFloat>(input_worldP, output_worldP, *paramsP,
 									  in_data->width, in_data->height);
+		} else if (paramsP->mode == BPS_MODE_PATH) {
+			SortMappedPixels<PF_PixelFloat>(input_worldP, output_worldP, *paramsP,
+											in_data->width, in_data->height);
 		} else {
 			SortGenericPaths<PF_PixelFloat>(input_worldP, output_worldP, *paramsP,
 											in_data->width, in_data->height);
@@ -504,6 +880,9 @@ PF_Err BPS_SortImageCPU(
 		if (paramsP->mode == BPS_MODE_AXIS) {
 			SortLines<PF_Pixel16>(input_worldP, output_worldP, *paramsP,
 								   in_data->width, in_data->height);
+		} else if (paramsP->mode == BPS_MODE_PATH) {
+			SortMappedPixels<PF_Pixel16>(input_worldP, output_worldP, *paramsP,
+										 in_data->width, in_data->height);
 		} else {
 			SortGenericPaths<PF_Pixel16>(input_worldP, output_worldP, *paramsP,
 										 in_data->width, in_data->height);
@@ -513,6 +892,9 @@ PF_Err BPS_SortImageCPU(
 		if (paramsP->mode == BPS_MODE_AXIS) {
 			SortLines<PF_Pixel8>(input_worldP, output_worldP, *paramsP,
 								  in_data->width, in_data->height);
+		} else if (paramsP->mode == BPS_MODE_PATH) {
+			SortMappedPixels<PF_Pixel8>(input_worldP, output_worldP, *paramsP,
+										in_data->width, in_data->height);
 		} else {
 			SortGenericPaths<PF_Pixel8>(input_worldP, output_worldP, *paramsP,
 										in_data->width, in_data->height);

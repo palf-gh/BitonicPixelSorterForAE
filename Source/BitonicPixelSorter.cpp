@@ -12,6 +12,7 @@
 
 #include "BitonicPixelSorter.h"
 #include "BitonicPixelSorter_GpuEligibility.h"
+#include "BitonicPixelSorter_PathGeometry.h"
 
 #if defined(BPS_RENDER_DIAG)
 	#include <chrono>
@@ -58,13 +59,23 @@ BPS_ResolvePathGeometry(PF_InData *in_data, BitonicSorterParams *paramsP)
 	const A_long frameW = in_data ? in_data->width : 0;
 	const A_long frameH = in_data ? in_data->height : 0;
 
+	// Path mode domain bounds are filled exclusively by BPS_BuildPathGeometry.
+	// Do not clear domainLineCount / path fields here or the map build sees an
+	// empty domain and Path mode becomes a no-op identity copy.
+	if (paramsP->mode == BPS_MODE_PATH) {
+		return;
+	}
+
 	paramsP->freePMin = 0;
 	paramsP->freeQMin = 0;
 	paramsP->freeLineLength = 0;
 	paramsP->freeLineCount = 0;
 	paramsP->radialLength = 0;
 	paramsP->radialLineCount = 0;
+	paramsP->swirlLineMin = 0;
 	paramsP->maxLineLength = 0;
+	paramsP->domainLineCount = 0;
+	paramsP->domainMaxLineLength = 0;
 
 	if (frameW <= 0 || frameH <= 0) {
 		return;
@@ -92,10 +103,14 @@ BPS_ResolvePathGeometry(PF_InData *in_data, BitonicSorterParams *paramsP)
 		paramsP->freeLineLength = static_cast<A_long>(std::floor(maxP)) - paramsP->freePMin + 1;
 		paramsP->freeLineCount = static_cast<A_long>(std::floor(maxQ)) - paramsP->freeQMin + 1;
 		paramsP->maxLineLength = paramsP->freeLineLength;
+		paramsP->domainLineCount = paramsP->freeLineCount;
+		paramsP->domainMaxLineLength = paramsP->freeLineLength;
 		return;
 	}
 
-	if (paramsP->mode == BPS_MODE_ROTATION || paramsP->mode == BPS_MODE_RADIAL) {
+	if (paramsP->mode == BPS_MODE_ROTATION ||
+		paramsP->mode == BPS_MODE_RADIAL ||
+		paramsP->mode == BPS_MODE_SWIRL) {
 		const double xs[4] = {0.0, static_cast<double>(frameW - 1), 0.0, static_cast<double>(frameW - 1)};
 		const double ys[4] = {0.0, 0.0, static_cast<double>(frameH - 1), static_cast<double>(frameH - 1)};
 		double maxRadius = 0.0;
@@ -111,17 +126,38 @@ BPS_ResolvePathGeometry(PF_InData *in_data, BitonicSorterParams *paramsP)
 		if (paramsP->radialLineCount < 1) {
 			paramsP->radialLineCount = 1;
 		}
+
+		if (paramsP->mode == BPS_MODE_SWIRL) {
+			// Same cost class as Radial: phase lines x radius samples, analytic
+			// domain sort (no host O(W*H) pixel map).
+			paramsP->swirlLineMin = 0;
+			paramsP->domainLineCount = paramsP->radialLineCount;
+			paramsP->maxLineLength = paramsP->radialLength;
+			if (paramsP->maxLineLength < 1) {
+				paramsP->maxLineLength = 1;
+			}
+			paramsP->domainMaxLineLength = paramsP->maxLineLength;
+			return;
+		}
+
 		paramsP->maxLineLength = (paramsP->mode == BPS_MODE_RADIAL)
 			? paramsP->radialLength
 			: static_cast<A_long>(std::ceil(2.0 * BPS_PI * radiusCeil));
 		if (paramsP->maxLineLength < 1) {
 			paramsP->maxLineLength = 1;
 		}
+		paramsP->domainLineCount = (paramsP->mode == BPS_MODE_RADIAL)
+			? paramsP->radialLineCount
+			: paramsP->radialLength;
+		paramsP->domainMaxLineLength = paramsP->maxLineLength;
 		return;
 	}
 
 	paramsP->maxLineLength =
 		(paramsP->direction == BPS_DIR_HORIZONTAL) ? frameW : frameH;
+	paramsP->domainLineCount =
+		(paramsP->direction == BPS_DIR_HORIZONTAL) ? frameH : frameW;
+	paramsP->domainMaxLineLength = paramsP->maxLineLength;
 }
 
 #if defined(BPS_RENDER_DIAG)
@@ -239,10 +275,55 @@ GlobalSetup(
 	PF_ParamDef		*params[],
 	PF_LayerDef		*output)
 {
+	PF_Err err = PF_Err_NONE;
+
+	(void)params;
+	(void)output;
+
 	out_data->my_version	= BPS_VERSION_PACKED;
 	out_data->out_flags		= OUT_FLAGS;
 	out_data->out_flags2	= OUT_FLAGS2;
 
+	// Register with AEGP so UpdateParamsUI can toggle stream visibility via
+	// AEGP_DynStreamFlag_HIDDEN (PF_PUI_INVISIBLE alone is not reliable).
+	if (in_data && in_data->pica_basicP) {
+		AEGP_SuiteHandler suites(in_data->pica_basicP);
+		if (suites.HandleSuite1() && suites.UtilitySuite5()) {
+			out_data->global_data =
+				suites.HandleSuite1()->host_new_handle(sizeof(BPS_GlobalData));
+			if (out_data->global_data) {
+				BPS_GlobalData *globalP = reinterpret_cast<BPS_GlobalData *>(
+					suites.HandleSuite1()->host_lock_handle(out_data->global_data));
+				if (globalP) {
+					globalP->plugin_id = 0;
+					ERR(suites.UtilitySuite5()->AEGP_RegisterWithAEGP(
+						NULL, NAME, &globalP->plugin_id));
+					suites.HandleSuite1()->host_unlock_handle(out_data->global_data);
+				}
+			}
+		}
+	}
+
+	return err;
+}
+
+static PF_Err
+GlobalSetdown(
+	PF_InData		*in_data,
+	PF_OutData		*out_data,
+	PF_ParamDef		*params[],
+	PF_LayerDef		*output)
+{
+	(void)out_data;
+	(void)params;
+	(void)output;
+
+	if (in_data && in_data->global_data && in_data->pica_basicP) {
+		AEGP_SuiteHandler suites(in_data->pica_basicP);
+		if (suites.HandleSuite1()) {
+			suites.HandleSuite1()->host_dispose_handle(in_data->global_data);
+		}
+	}
 	return PF_Err_NONE;
 }
 
@@ -256,16 +337,6 @@ ParamsSetup(
 {
 	PF_Err		err = PF_Err_NONE;
 	PF_ParamDef	def;
-
-	// Mode: first visible control. Its ID is appended for compatibility, but it
-	// is registered before older controls so it appears at the top of the ECW.
-	AEFX_CLR_STRUCT(def);
-	{
-		std::string name  = AELocalise::GetStringForAE(LocKey::STR_MODE_NAME, in_data);
-		std::string items = AELocalise::GetStringForAE(LocKey::STR_MODE_ITEMS, in_data);
-		def.flags = PF_ParamFlag_SUPERVISE | PF_ParamFlag_USE_VALUE_FOR_OLD_PROJECTS;
-		PF_ADD_POPUP(name.c_str(), 4, BPS_MODE_DFLT, items.c_str(), BPS_MODE);
-	}
 
 	// GPU acceleration status (read-only custom UI).
 	AEFX_CLR_STRUCT(def);
@@ -291,30 +362,48 @@ ParamsSetup(
 		}
 	}
 
-	// Direction (Horizontal / Vertical). Copy localised strings into std::string
-	// first: AELocalise::GetStringForAE returns a pointer into a shared thread-
-	// local buffer that the next call overwrites, so we must not hold two live.
+	// Mode. Its ID is appended for compatibility, but it is registered under
+	// GPU status so the UI can move without renumbering saved streams.
 	AEFX_CLR_STRUCT(def);
 	{
-		std::string name  = AELocalise::GetStringForAE(LocKey::STR_DIRECTION_NAME, in_data);
-		std::string items = AELocalise::GetStringForAE(LocKey::STR_DIRECTION_ITEMS, in_data);
-		PF_ADD_POPUP(name.c_str(), 2, BPS_DIRECTION_DFLT, items.c_str(), BPS_DIRECTION);
+		std::string name  = AELocalise::GetStringForAE(LocKey::STR_MODE_NAME, in_data);
+		std::string items = AELocalise::GetStringForAE(LocKey::STR_MODE_ITEMS, in_data);
+		def.flags = PF_ParamFlag_SUPERVISE | PF_ParamFlag_USE_VALUE_FOR_OLD_PROJECTS;
+		PF_ADD_POPUP(name.c_str(), 6, BPS_MODE_DFLT, items.c_str(), BPS_MODE);
 	}
 
-	// Free-angle direction.
+	// Order (Ascending / Descending) — placed directly below Mode.
 	AEFX_CLR_STRUCT(def);
 	{
-		std::string name = AELocalise::GetStringForAE(LocKey::STR_ANGLE_NAME, in_data);
-		def.flags = PF_ParamFlag_USE_VALUE_FOR_OLD_PROJECTS;
-		PF_ADD_ANGLE(name.c_str(), BPS_ANGLE_DFLT, BPS_ANGLE);
+		std::string name  = AELocalise::GetStringForAE(LocKey::STR_ORDER_NAME, in_data);
+		std::string items = AELocalise::GetStringForAE(LocKey::STR_ORDER_ITEMS, in_data);
+		PF_ADD_POPUP(name.c_str(), 2, BPS_ORDER_DFLT, items.c_str(), BPS_ORDER);
 	}
 
-	// Rotation / radial centre point.
+	// Threshold Min (trigger key lower bound, shown as a percentage).
 	AEFX_CLR_STRUCT(def);
 	{
-		std::string name = AELocalise::GetStringForAE(LocKey::STR_CENTER_NAME, in_data);
+		std::string name = AELocalise::GetStringForAE(LocKey::STR_THRESHOLD_MIN, in_data);
+		PF_ADD_FLOAT_SLIDERX(name.c_str(), 0, 100, 0, 100, BPS_THRESHOLD_MIN_DFLT,
+							 1, PF_ValueDisplayFlag_PERCENT, 0, BPS_THRESHOLD_MIN);
+	}
+
+	// Threshold Max (trigger key upper bound, shown as a percentage).
+	AEFX_CLR_STRUCT(def);
+	{
+		std::string name = AELocalise::GetStringForAE(LocKey::STR_THRESHOLD_MAX, in_data);
+		PF_ADD_FLOAT_SLIDERX(name.c_str(), 0, 100, 0, 100, BPS_THRESHOLD_MAX_DFLT,
+							 1, PF_ValueDisplayFlag_PERCENT, 0, BPS_THRESHOLD_MAX);
+	}
+
+	// Sort trigger (registered before criterion per user request).
+	AEFX_CLR_STRUCT(def);
+	{
+		std::string name  = AELocalise::GetStringForAE(LocKey::STR_SORT_TRIGGER_NAME, in_data);
+		std::string items = AELocalise::GetStringForAE(LocKey::STR_SORT_TRIGGER_ITEMS, in_data);
 		def.flags = PF_ParamFlag_USE_VALUE_FOR_OLD_PROJECTS;
-		PF_ADD_POINT(name.c_str(), BPS_CENTER_X_DFLT, BPS_CENTER_Y_DFLT, FALSE, BPS_CENTER);
+		PF_ADD_POPUP(name.c_str(), 11, BPS_SORT_TRIGGER_DFLT,
+					 items.c_str(), BPS_SORT_TRIGGER);
 	}
 
 	// Sort criterion.
@@ -323,32 +412,93 @@ ParamsSetup(
 		std::string name  = AELocalise::GetStringForAE(LocKey::STR_SORT_CRITERION_NAME, in_data);
 		std::string items = AELocalise::GetStringForAE(LocKey::STR_SORT_CRITERION_ITEMS, in_data);
 		def.flags = PF_ParamFlag_USE_VALUE_FOR_OLD_PROJECTS;
-		PF_ADD_POPUP(name.c_str(), 5, BPS_SORT_CRITERION_DFLT,
+		PF_ADD_POPUP(name.c_str(), 11, BPS_SORT_CRITERION_DFLT,
 					 items.c_str(), BPS_SORT_CRITERION);
 	}
 
-	// Order (Ascending / Descending).
+	// Affect (Inside / Outside thresholds).
 	AEFX_CLR_STRUCT(def);
 	{
-		std::string name  = AELocalise::GetStringForAE(LocKey::STR_ORDER_NAME, in_data);
-		std::string items = AELocalise::GetStringForAE(LocKey::STR_ORDER_ITEMS, in_data);
-		PF_ADD_POPUP(name.c_str(), 2, BPS_ORDER_DFLT, items.c_str(), BPS_ORDER);
+		std::string name  = AELocalise::GetStringForAE(LocKey::STR_AFFECT_NAME, in_data);
+		std::string items = AELocalise::GetStringForAE(LocKey::STR_AFFECT_ITEMS, in_data);
+		def.flags = PF_ParamFlag_USE_VALUE_FOR_OLD_PROJECTS;
+		PF_ADD_POPUP(name.c_str(), 2, BPS_AFFECT_DFLT, items.c_str(), BPS_AFFECT);
 	}
 
-	// Threshold Min (selected key lower bound, shown as a percentage).
+	// Per-run cycle amount.
 	AEFX_CLR_STRUCT(def);
 	{
-		std::string name = AELocalise::GetStringForAE(LocKey::STR_THRESHOLD_MIN, in_data);
-		PF_ADD_FLOAT_SLIDERX(name.c_str(), 0, 100, 0, 100, BPS_THRESHOLD_MIN_DFLT,
-							 1, PF_ValueDisplayFlag_PERCENT, 0, BPS_THRESHOLD_MIN);
+		std::string name = AELocalise::GetStringForAE(LocKey::STR_CYCLE_NAME, in_data);
+		def.flags = PF_ParamFlag_USE_VALUE_FOR_OLD_PROJECTS;
+		PF_ADD_ANGLE(name.c_str(), BPS_CYCLE_DFLT, BPS_CYCLE);
 	}
 
-	// Threshold Max (selected key upper bound, shown as a percentage).
+	// Direction (Horizontal / Vertical) — moved below sort controls. Copy
+	// localised strings into std::string first: AELocalise::GetStringForAE
+	// returns a pointer into a shared thread-local buffer that the next call
+	// overwrites, so we must not hold two live.
 	AEFX_CLR_STRUCT(def);
 	{
-		std::string name = AELocalise::GetStringForAE(LocKey::STR_THRESHOLD_MAX, in_data);
-		PF_ADD_FLOAT_SLIDERX(name.c_str(), 0, 100, 0, 100, BPS_THRESHOLD_MAX_DFLT,
-							 1, PF_ValueDisplayFlag_PERCENT, 0, BPS_THRESHOLD_MAX);
+		std::string name  = AELocalise::GetStringForAE(LocKey::STR_DIRECTION_NAME, in_data);
+		std::string items = AELocalise::GetStringForAE(LocKey::STR_DIRECTION_ITEMS, in_data);
+		PF_ADD_POPUP(name.c_str(), 2, BPS_DIRECTION_DFLT, items.c_str(), BPS_DIRECTION);
+	}
+
+	// Free-angle direction / Rotation start angle — initially hidden (Axis default).
+	// See .agents/skills/ae-initially-hidden-params/SKILL.md:
+	//   PF_PUI_INVISIBLE + COLLAPSE_TWIRLY at creation; AEGP HIDDEN for runtime.
+	AEFX_CLR_STRUCT(def);
+	{
+		std::string name = AELocalise::GetStringForAE(LocKey::STR_ANGLE_NAME, in_data);
+		def.flags = PF_ParamFlag_USE_VALUE_FOR_OLD_PROJECTS |
+					PF_ParamFlag_COLLAPSE_TWIRLY;
+		def.ui_flags = PF_PUI_INVISIBLE;
+		PF_ADD_ANGLE(name.c_str(), BPS_ANGLE_DFLT, BPS_ANGLE);
+	}
+
+	// Rotation / radial / swirl centre — same initial-hide policy as Angle.
+	AEFX_CLR_STRUCT(def);
+	{
+		std::string name = AELocalise::GetStringForAE(LocKey::STR_CENTER_NAME, in_data);
+		def.flags = PF_ParamFlag_USE_VALUE_FOR_OLD_PROJECTS |
+					PF_ParamFlag_COLLAPSE_TWIRLY;
+		def.ui_flags = PF_PUI_INVISIBLE;
+		PF_ADD_POINT(name.c_str(), BPS_CENTER_X_DFLT, BPS_CENTER_Y_DFLT, FALSE, BPS_CENTER);
+	}
+
+	// Swirl amount as angle: 360° = one turn to the farthest frame corner.
+	// Sign selects direction (positive CW, negative CCW). See initially-hidden skill.
+	AEFX_CLR_STRUCT(def);
+	{
+		std::string name = AELocalise::GetStringForAE(LocKey::STR_SWIRL_AMOUNT_NAME, in_data);
+		def.flags = PF_ParamFlag_USE_VALUE_FOR_OLD_PROJECTS |
+					PF_ParamFlag_COLLAPSE_TWIRLY;
+		def.ui_flags = PF_PUI_INVISIBLE;
+		PF_ADD_ANGLE(name.c_str(), BPS_SWIRL_AMOUNT_DFLT, BPS_SWIRL_AMOUNT);
+	}
+
+	// Path (layer mask). Hidden unless Mode is Path.
+	AEFX_CLR_STRUCT(def);
+	{
+		std::string name = AELocalise::GetStringForAE(LocKey::STR_PATH_NAME, in_data);
+		def.param_type = PF_Param_PATH;
+		def.uu.id = BPS_PATH;
+		PF_STRCPY(def.PF_DEF_NAME, name.c_str());
+		def.flags = PF_ParamFlag_USE_VALUE_FOR_OLD_PROJECTS;
+		def.ui_flags = PF_PUI_INVISIBLE;
+		def.u.path_d.dephault = 0;
+		PF_ADD_PARAM(in_data, -1, &def);
+	}
+
+	// Path direction (Normal / Tangent).
+	AEFX_CLR_STRUCT(def);
+	{
+		std::string name  = AELocalise::GetStringForAE(LocKey::STR_PATH_DIRECTION_NAME, in_data);
+		std::string items = AELocalise::GetStringForAE(LocKey::STR_PATH_DIRECTION_ITEMS, in_data);
+		def.flags = PF_ParamFlag_USE_VALUE_FOR_OLD_PROJECTS;
+		def.ui_flags = PF_PUI_INVISIBLE;
+		PF_ADD_POPUP(name.c_str(), 2, BPS_PATH_DIRECTION_DFLT, items.c_str(),
+					 BPS_PATH_DIRECTION);
 	}
 
 	if (!err) {
@@ -381,9 +531,48 @@ static void
 DisposePreRenderData(void *pre_render_dataPV)
 {
 	if (pre_render_dataPV) {
-		BitonicSorterParams *infoP = reinterpret_cast<BitonicSorterParams *>(pre_render_dataPV);
-		delete infoP;
+		BitonicPreRenderData *dataP =
+			reinterpret_cast<BitonicPreRenderData *>(pre_render_dataPV);
+		delete dataP;
 	}
+}
+
+//-----------------------------------------------------------------------------
+// Re-bind the params' host pointers after vector reallocation / cache lookup.
+// Path mode reads from the shared, cached BpsPathMap; other mapped modes read
+// from the pre-render data's own vectors.
+static void
+BPS_BindMappedPointers(BitonicPreRenderData *dataP)
+{
+	BitonicSorterParams *infoP = &dataP->params;
+
+	infoP->pathSamples = dataP->pathSamples.empty()
+		? nullptr : dataP->pathSamples.data();
+	infoP->pathSampleCount = static_cast<A_long>(dataP->pathSamples.size());
+
+	if (infoP->mode == BPS_MODE_PATH && dataP->pathMap) {
+		const BpsPathMap &m = *dataP->pathMap;
+		infoP->mappedRecords = m.records.empty() ? nullptr : m.records.data();
+		infoP->mappedLineOffsets =
+			m.lineOffsets.empty() ? nullptr : m.lineOffsets.data();
+		infoP->mappedWorkOffsets =
+			m.workOffsets.empty() ? nullptr : m.workOffsets.data();
+		infoP->mappedRecordCount = m.mappedRecordCount;
+		infoP->mappedWorkItemCount = m.mappedWorkItemCount;
+		infoP->maxLineLength = m.maxLineLength;
+		infoP->domainMaxLineLength = m.domainMaxLineLength;
+		return;
+	}
+
+	infoP->mappedRecords = dataP->mappedRecords.empty()
+		? nullptr : dataP->mappedRecords.data();
+	infoP->mappedLineOffsets = dataP->mappedLineOffsets.empty()
+		? nullptr : dataP->mappedLineOffsets.data();
+	infoP->mappedWorkOffsets = dataP->mappedWorkOffsets.empty()
+		? nullptr : dataP->mappedWorkOffsets.data();
+	infoP->mappedRecordCount = static_cast<A_long>(dataP->mappedRecords.size());
+	infoP->mappedWorkItemCount = dataP->mappedWorkOffsets.empty()
+		? 0 : static_cast<A_long>(dataP->mappedWorkOffsets.back());
 }
 
 //-----------------------------------------------------------------------------
@@ -399,10 +588,12 @@ PreRender(
 	PF_RenderRequest		req = raw_req;
 	PF_LRect				output_rect = BPS_ClipRectToFrame(req.rect, in_data);
 
-	BitonicSorterParams *infoP = new (std::nothrow) BitonicSorterParams();
-	if (!infoP) {
+	BitonicPreRenderData *dataP = new (std::nothrow) BitonicPreRenderData();
+	if (!dataP) {
 		return PF_Err_OUT_OF_MEMORY;
 	}
+	BitonicSorterParams *infoP = &dataP->params;
+	AEFX_CLR_STRUCT(*infoP);
 
 	PF_ParamDef cur_param;
 
@@ -410,7 +601,7 @@ PreRender(
 	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_MODE, in_data->current_time,
 						  in_data->time_step, in_data->time_scale, &cur_param));
 	infoP->mode = BPS_ClampPopup(cur_param.u.pd.value,
-								 BPS_MODE_AXIS, BPS_MODE_RADIAL, BPS_MODE_DFLT);
+								 BPS_MODE_AXIS, BPS_MODE_PATH, BPS_MODE_DFLT);
 
 	AEFX_CLR_STRUCT(cur_param);
 	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_DIRECTION, in_data->current_time,
@@ -429,8 +620,30 @@ PreRender(
 						  in_data->time_step, in_data->time_scale, &cur_param));
 	infoP->criterion = BPS_ClampPopup(cur_param.u.pd.value,
 									  BPS_CRITERION_LUMINANCE,
-									  BPS_CRITERION_RGB_MAXIMUM,
+									  BPS_CRITERION_SATURATION,
 									  BPS_SORT_CRITERION_DFLT);
+
+	AEFX_CLR_STRUCT(cur_param);
+	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_SORT_TRIGGER, in_data->current_time,
+						  in_data->time_step, in_data->time_scale, &cur_param));
+	infoP->trigger = BPS_ClampPopup(cur_param.u.pd.value,
+									BPS_CRITERION_LUMINANCE,
+									BPS_CRITERION_SATURATION,
+									BPS_SORT_TRIGGER_DFLT);
+
+	AEFX_CLR_STRUCT(cur_param);
+	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_AFFECT, in_data->current_time,
+						  in_data->time_step, in_data->time_scale, &cur_param));
+	infoP->affect = BPS_ClampPopup(cur_param.u.pd.value,
+								   BPS_AFFECT_INSIDE_THRESHOLDS,
+								   BPS_AFFECT_OUTSIDE_THRESHOLDS,
+								   BPS_AFFECT_DFLT);
+
+	AEFX_CLR_STRUCT(cur_param);
+	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_CYCLE, in_data->current_time,
+						  in_data->time_step, in_data->time_scale, &cur_param));
+	infoP->cycleDegrees = static_cast<float>(FIX_2_FLOAT(cur_param.u.ad.value));
+	infoP->cycleRadians = static_cast<float>(infoP->cycleDegrees * BPS_PI / 180.0);
 
 	AEFX_CLR_STRUCT(cur_param);
 	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_ANGLE, in_data->current_time,
@@ -443,13 +656,14 @@ PreRender(
 	infoP->downsampleX = BPS_RationalScale(in_data->downsample_x);
 	infoP->downsampleY = BPS_RationalScale(in_data->downsample_y);
 
+	// Point params are already in the current (downsampled) layer coordinate
+	// system. Do not multiply by downsample again or the centre drifts toward
+	// the top-left at draft / half resolution.
 	AEFX_CLR_STRUCT(cur_param);
 	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_CENTER, in_data->current_time,
 						  in_data->time_step, in_data->time_scale, &cur_param));
-	infoP->centerX = static_cast<float>(FIX_2_FLOAT(cur_param.u.td.x_value) *
-										infoP->downsampleX);
-	infoP->centerY = static_cast<float>(FIX_2_FLOAT(cur_param.u.td.y_value) *
-										infoP->downsampleY);
+	infoP->centerX = static_cast<float>(FIX_2_FLOAT(cur_param.u.td.x_value));
+	infoP->centerY = static_cast<float>(FIX_2_FLOAT(cur_param.u.td.y_value));
 
 	AEFX_CLR_STRUCT(cur_param);
 	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_THRESHOLD_MIN, in_data->current_time,
@@ -461,10 +675,62 @@ PreRender(
 						  in_data->time_step, in_data->time_scale, &cur_param));
 	infoP->thresholdMax = (float)(cur_param.u.fs_d.value / 100.0);
 
+	AEFX_CLR_STRUCT(cur_param);
+	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_SWIRL_AMOUNT, in_data->current_time,
+						  in_data->time_step, in_data->time_scale, &cur_param));
+	// Angle degrees: 360° = one turn to the farthest frame corner; sign = direction.
+	const float swirl_degrees = static_cast<float>(FIX_2_FLOAT(cur_param.u.ad.value));
+	{
+		const float xs[4] = {0.0f, static_cast<float>(in_data->width - 1),
+							 0.0f, static_cast<float>(in_data->width - 1)};
+		const float ys[4] = {0.0f, 0.0f, static_cast<float>(in_data->height - 1),
+							 static_cast<float>(in_data->height - 1)};
+		float max_radius = 1.0f;
+		for (int i = 0; i < 4; ++i) {
+			const float dx = xs[i] - infoP->centerX;
+			const float dy = ys[i] - infoP->centerY;
+			const float radius = std::sqrt(dx * dx + dy * dy);
+			if (radius > max_radius) {
+				max_radius = radius;
+			}
+		}
+		// phase = theta - swirlK * r; 360° => 2π at max_radius.
+		const float swirl_radians =
+			swirl_degrees * (static_cast<float>(BPS_PI) / 180.0f);
+		infoP->swirlK = swirl_radians / max_radius;
+	}
+
+	AEFX_CLR_STRUCT(cur_param);
+	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_PATH_DIRECTION, in_data->current_time,
+						  in_data->time_step, in_data->time_scale, &cur_param));
+	infoP->pathDirection = BPS_ClampPopup(cur_param.u.pd.value,
+										  BPS_PATH_DIR_NORMAL, BPS_PATH_DIR_TANGENT,
+										  BPS_PATH_DIRECTION_DFLT);
+
+	PF_PathID path_id = 0;
+	AEFX_CLR_STRUCT(cur_param);
+	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_PATH, in_data->current_time,
+						  in_data->time_step, in_data->time_scale, &cur_param));
+	path_id = cur_param.u.path_d.path_id;
+
+	if (!err && infoP->mode == BPS_MODE_PATH) {
+		ERR(BPS_BuildPathGeometry(in_data, out_data, path_id,
+								  infoP->pathDirection, infoP,
+								  &dataP->pathSamples));
+	}
+
 	BPS_ResolvePathGeometry(in_data, infoP);
+	// Path needs a pixel-owned map (closest-point lanes). The map is geometry-
+	// only, so it is cached and reused across frames and param tweaks; it is
+	// built (low-res Jump Flooding) only when the mask/frame actually changes.
+	// Swirl uses the analytic domain path (Radial/Rotation) — no host prepass.
+	if (!err && infoP->mode == BPS_MODE_PATH) {
+		dataP->pathMap =
+			BPS_AcquirePathMap(in_data->width, in_data->height, *infoP);
+	}
 
 	const BpsGpuEligibility gpu_eligibility =
-		BPS_EvaluateGpuEligibility(in_data, infoP->maxLineLength, output_rect);
+		BPS_EvaluateGpuEligibility(in_data, infoP->mode, infoP->maxLineLength, output_rect);
 	if (gpu_eligibility.render_possible) {
 		extraP->output->flags |= PF_RenderOutputFlag_GPU_RENDER_POSSIBLE;
 	}
@@ -472,7 +738,7 @@ PreRender(
 #if defined(BPS_RENDER_DIAG)
 	BPS_DiagLog(
 		"PreRender output_request=(%ld,%ld,%ld,%ld) clipped=(%ld,%ld,%ld,%ld) "
-		"gpu_possible=%d reason=%s frame=%ldx%ld mode=%ld direction=%ld criterion=%ld max_line=%ld",
+		"gpu_possible=%d reason=%s frame=%ldx%ld mode=%ld direction=%ld criterion=%ld trigger=%ld affect=%ld max_line=%ld",
 		static_cast<long>(raw_req.rect.left),
 		static_cast<long>(raw_req.rect.top),
 		static_cast<long>(raw_req.rect.right),
@@ -488,6 +754,8 @@ PreRender(
 		static_cast<long>(infoP->mode),
 		static_cast<long>(infoP->direction),
 		static_cast<long>(infoP->criterion),
+		static_cast<long>(infoP->trigger),
+		static_cast<long>(infoP->affect),
 		static_cast<long>(infoP->maxLineLength));
 #endif
 
@@ -515,13 +783,16 @@ PreRender(
 								   &in_result));
 
 	if (!err) {
+		// Re-bind the host pointers after any vector reallocation / cache lookup.
+		BPS_BindMappedPointers(dataP);
+
 		extraP->output->result_rect = output_rect;
 		extraP->output->max_result_rect = BPS_FrameRect(in_data);
 
-		extraP->output->pre_render_data = infoP;
+		extraP->output->pre_render_data = dataP;
 		extraP->output->delete_pre_render_data_func = DisposePreRenderData;
 	} else {
-		delete infoP;
+		delete dataP;
 	}
 
 	return err;
@@ -541,12 +812,14 @@ SmartRender(
 	PF_EffectWorld	*input_worldP  = NULL;
 	PF_EffectWorld	*output_worldP = NULL;
 
-	BitonicSorterParams *infoP =
-		reinterpret_cast<BitonicSorterParams *>(extraP->input->pre_render_data);
+	BitonicPreRenderData *dataP =
+		reinterpret_cast<BitonicPreRenderData *>(extraP->input->pre_render_data);
 
-	if (!infoP) {
+	if (!dataP) {
 		return PF_Err_INTERNAL_STRUCT_DAMAGED;
 	}
+	BitonicSorterParams *infoP = &dataP->params;
+	BPS_BindMappedPointers(dataP);
 
 	BPS_SetLastRenderUsedGpu(isGPU);
 
@@ -709,6 +982,9 @@ EffectMain(
 		case PF_Cmd_GLOBAL_SETUP:
 			err = GlobalSetup(in_data, out_data, params, output);
 			break;
+		case PF_Cmd_GLOBAL_SETDOWN:
+			err = GlobalSetdown(in_data, out_data, params, output);
+			break;
 		case PF_Cmd_PARAMS_SETUP:
 			err = ParamsSetup(in_data, out_data, params, output);
 			break;
@@ -734,6 +1010,13 @@ EffectMain(
 		case PF_Cmd_USER_CHANGED_PARAM:
 			err = UserChangedParam(in_data, out_data, params, output,
 								   reinterpret_cast<PF_UserChangedParamExtra *>(extra));
+			break;
+		case PF_Cmd_SEQUENCE_SETUP:
+		case PF_Cmd_SEQUENCE_RESETUP:
+			// Called when the effect is first applied (or re-applied) to a layer.
+			// Explicitly applying the initial visibility here ensures the angle
+			// dial never appears without its label on a fresh instance.
+			err = BPS_UpdateParamsUI(in_data, out_data, params, output);
 			break;
 		case PF_Cmd_UPDATE_PARAMS_UI:
 			err = BPS_UpdateParamsUI(in_data, out_data, params, output);

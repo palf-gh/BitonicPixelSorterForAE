@@ -1,8 +1,11 @@
 /*
 	BitonicPixelSorter_Kernel.hlsl
 
-	DirectX 12 compute shader for the AE GPU BGRA128 path. The descriptor order
-	matches Util/DirectXUtils: CBV(b0), UAV(u0), SRV(t0).
+	DirectX 12 compute shaders for the AE GPU BGRA128 path.
+	  main         - axis single-pass sort (CBV, UAV dst, SRV src)
+	  SortDomain   - non-axis pass 1 (CBV, UAV domain+keys, SRV src)
+	  ApplyDomain  - non-axis pass 2 (CBV, UAV dst, SRV src, SRV domain)
+	Descriptor order matches Util/DirectXUtils: CBV(b0), UAV(u0..), SRV(t0..).
 */
 
 #define MAX_THREADS 256u
@@ -14,11 +17,25 @@
 #define BPS_MODE_FREE_ANGLE 2
 #define BPS_MODE_ROTATION 3
 #define BPS_MODE_RADIAL 4
+#define BPS_MODE_SWIRL 5
+#define BPS_MODE_PATH 6
+#define BPS_PATH_DIR_NORMAL 1
+#define BPS_PATH_DIR_TANGENT 2
+#define BPS_SWIRL_K_EPS 1.0e-4f
 
 #define BPS_CRITERION_RGB_AVERAGE 2
 #define BPS_CRITERION_RGB_PRODUCT 3
 #define BPS_CRITERION_RGB_MINIMUM 4
 #define BPS_CRITERION_RGB_MAXIMUM 5
+#define BPS_CRITERION_RED_CHANNEL 6
+#define BPS_CRITERION_GREEN_CHANNEL 7
+#define BPS_CRITERION_BLUE_CHANNEL 8
+#define BPS_CRITERION_ALPHA_CHANNEL 9
+#define BPS_CRITERION_HUE 10
+#define BPS_CRITERION_SATURATION 11
+
+#define BPS_AFFECT_INSIDE_THRESHOLDS 1
+#define BPS_AFFECT_OUTSIDE_THRESHOLDS 2
 
 cbuffer BitonicParams : register(b0)
 {
@@ -36,21 +53,58 @@ cbuffer BitonicParams : register(b0)
 	int direction;
 	int ordering;
 	int criterion;
+	int trigger;
+	int affect;
+	float cycleDegrees;
 	int lineCount;
 	int freePMin;
 	int freeQMin;
 	int freeLineLength;
 	int radialLength;
+	int domainStride;
 	float thresholdMin;
 	float thresholdMax;
 	float angleCos;
 	float angleSin;
 	float centerX;
 	float centerY;
+	float swirlK;
+	int swirlLineMin;
+	int pathDirection;
+	int pathSMin;
+	int pathNMin;
+	int pathSampleCount;
+};
+
+struct BpsPathSampleGpu
+{
+	float x;
+	float y;
+	float s;
+	float tx;
+	float ty;
 };
 
 RWByteAddressBuffer sortTex : register(u0);
+RWByteAddressBuffer keysTex : register(u1);
+RWByteAddressBuffer mappedKeysTex : register(u2);
 ByteAddressBuffer srcTex : register(t0);
+ByteAddressBuffer pathTex : register(t1);
+ByteAddressBuffer domainTex : register(t2);
+ByteAddressBuffer mappedWorkOffsetsTex : register(t3);
+
+BpsPathSampleGpu LoadPathSample(uint index)
+{
+	// Five tightly-packed floats (20 bytes) per sample.
+	const uint base = index * 20u;
+	BpsPathSampleGpu sample;
+	sample.x = asfloat(pathTex.Load(base + 0u));
+	sample.y = asfloat(pathTex.Load(base + 4u));
+	sample.s = asfloat(pathTex.Load(base + 8u));
+	sample.tx = asfloat(pathTex.Load(base + 12u));
+	sample.ty = asfloat(pathTex.Load(base + 16u));
+	return sample;
+}
 
 // scratchKey + scratchIndex already use the full 32 KB groupshared budget that
 // Direct3D 12 hard-caps per group, so the span metadata reuses scratchIndex[0..3]
@@ -72,22 +126,95 @@ void StorePixel(RWByteAddressBuffer buf, uint index, float4 value)
 	buf.Store4(index * 16u, asuint(value));
 }
 
-float BpsSortKey(float4 c)
+uint LoadMappedPixelIndex(uint index)
+{
+	return pathTex.Load(index * 8u + 4u);
+}
+
+uint LoadMappedLineOffset(uint index)
+{
+	return domainTex.Load(index * 4u);
+}
+
+uint LoadMappedWorkOffset(uint index)
+{
+	return mappedWorkOffsetsTex.Load(index * 4u);
+}
+
+float BpsSortKey(float4 c, int keyCriterion)
 {
 	// BGRA: R=.z, G=.y, B=.x
-	if (criterion == BPS_CRITERION_RGB_AVERAGE) {
+	if (keyCriterion == BPS_CRITERION_RGB_AVERAGE) {
 		return saturate((c.z + c.y + c.x) * (1.0f / 3.0f));
 	}
-	if (criterion == BPS_CRITERION_RGB_PRODUCT) {
+	if (keyCriterion == BPS_CRITERION_RGB_PRODUCT) {
 		return saturate(c.z * c.y * c.x);
 	}
-	if (criterion == BPS_CRITERION_RGB_MINIMUM) {
+	if (keyCriterion == BPS_CRITERION_RGB_MINIMUM) {
 		return saturate(min(min(c.z, c.y), c.x));
 	}
-	if (criterion == BPS_CRITERION_RGB_MAXIMUM) {
+	if (keyCriterion == BPS_CRITERION_RGB_MAXIMUM) {
 		return saturate(max(max(c.z, c.y), c.x));
 	}
+	if (keyCriterion == BPS_CRITERION_RED_CHANNEL) {
+		return saturate(c.z);
+	}
+	if (keyCriterion == BPS_CRITERION_GREEN_CHANNEL) {
+		return saturate(c.y);
+	}
+	if (keyCriterion == BPS_CRITERION_BLUE_CHANNEL) {
+		return saturate(c.x);
+	}
+	if (keyCriterion == BPS_CRITERION_ALPHA_CHANNEL) {
+		return saturate(c.w);
+	}
+	if (keyCriterion == BPS_CRITERION_HUE || keyCriterion == BPS_CRITERION_SATURATION) {
+		const float r = saturate(c.z);
+		const float g = saturate(c.y);
+		const float b = saturate(c.x);
+		const float maxRGB = max(max(r, g), b);
+		const float minRGB = min(min(r, g), b);
+		const float delta = maxRGB - minRGB;
+		if (keyCriterion == BPS_CRITERION_SATURATION) {
+			return maxRGB <= 0.0f ? 0.0f : saturate(delta / maxRGB);
+		}
+		if (delta <= 0.0f) {
+			return 0.0f;
+		}
+		float hue = 0.0f;
+		if (maxRGB == r) {
+			hue = (g - b) / delta;
+			if (hue < 0.0f) {
+				hue += 6.0f;
+			}
+		} else if (maxRGB == g) {
+			hue = ((b - r) / delta) + 2.0f;
+		} else {
+			hue = ((r - g) / delta) + 4.0f;
+		}
+		return saturate(hue * (1.0f / 6.0f));
+	}
 	return saturate(0.298912f * c.z + 0.586611f * c.y + 0.114478f * c.x);
+}
+
+bool BpsIsAffected(float triggerKey)
+{
+	const bool inside = triggerKey >= thresholdMin && triggerKey <= thresholdMax;
+	return affect == BPS_AFFECT_OUTSIDE_THRESHOLDS ? !inside : inside;
+}
+
+uint BpsCycleShift(uint count)
+{
+	if (count <= 1u) {
+		return 0u;
+	}
+	int shift = (int)floor((cycleDegrees / 360.0f) * (float)count + 0.5f);
+	const int n = (int)count;
+	shift %= n;
+	if (shift < 0) {
+		shift += n;
+	}
+	return (uint)shift;
 }
 
 uint BpsNextPow2(uint value)
@@ -129,6 +256,94 @@ uint BpsRotationLineLength(uint radius)
 	return length == 0u ? 1u : length;
 }
 
+void BpsNormaliseTangent(inout float tx, inout float ty)
+{
+	const float len = sqrt(tx * tx + ty * ty);
+	if (len > 1.0e-6f) {
+		tx /= len;
+		ty /= len;
+	} else {
+		tx = 1.0f;
+		ty = 0.0f;
+	}
+}
+
+bool BpsPathEvalAtS(float s, out float x, out float y, out float tx, out float ty)
+{
+	if (pathSampleCount < 2) {
+		x = 0.0f; y = 0.0f; tx = 1.0f; ty = 0.0f;
+		return false;
+	}
+	const BpsPathSampleGpu first = LoadPathSample(0u);
+	const BpsPathSampleGpu last = LoadPathSample((uint)(pathSampleCount - 1));
+	if (s <= first.s) {
+		x = first.x; y = first.y;
+		tx = first.tx; ty = first.ty;
+		return true;
+	}
+	if (s >= last.s) {
+		x = last.x; y = last.y;
+		tx = last.tx; ty = last.ty;
+		return true;
+	}
+	for (int i = 0; i < pathSampleCount - 1; ++i) {
+		const BpsPathSampleGpu a = LoadPathSample((uint)i);
+		const BpsPathSampleGpu b = LoadPathSample((uint)(i + 1));
+		if (s < a.s || s > b.s) {
+			continue;
+		}
+		const float seg = b.s - a.s;
+		const float t = seg > 1.0e-6f ? ((s - a.s) / seg) : 0.0f;
+		x = a.x + (b.x - a.x) * t;
+		y = a.y + (b.y - a.y) * t;
+		tx = a.tx + (b.tx - a.tx) * t;
+		ty = a.ty + (b.ty - a.ty) * t;
+		BpsNormaliseTangent(tx, ty);
+		return true;
+	}
+	x = 0.0f; y = 0.0f; tx = 1.0f; ty = 0.0f;
+	return false;
+}
+
+bool BpsPathClosest(float px, float py, out float sOut, out float nOut)
+{
+	if (pathSampleCount < 2) {
+		sOut = 0.0f;
+		nOut = 0.0f;
+		return false;
+	}
+	float bestDist2 = 1.0e30f;
+	float bestS = LoadPathSample(0u).s;
+	float bestN = 0.0f;
+	for (int i = 0; i < pathSampleCount - 1; ++i) {
+		const BpsPathSampleGpu a = LoadPathSample((uint)i);
+		const BpsPathSampleGpu b = LoadPathSample((uint)(i + 1));
+		const float abx = b.x - a.x;
+		const float aby = b.y - a.y;
+		const float abLen2 = abx * abx + aby * aby;
+		float t = 0.0f;
+		if (abLen2 > 1.0e-6f) {
+			t = saturate(((px - a.x) * abx + (py - a.y) * aby) / abLen2);
+		}
+		const float cx = a.x + abx * t;
+		const float cy = a.y + aby * t;
+		const float dx = px - cx;
+		const float dy = py - cy;
+		const float dist2 = dx * dx + dy * dy;
+		if (dist2 < bestDist2) {
+			bestDist2 = dist2;
+			bestS = a.s + (b.s - a.s) * t;
+			float tx = a.tx + (b.tx - a.tx) * t;
+			float ty = a.ty + (b.ty - a.ty) * t;
+			BpsNormaliseTangent(tx, ty);
+			bestN = -ty * dx + tx * dy;
+		}
+	}
+	sOut = bestS;
+	nOut = bestN;
+	return true;
+}
+
 uint BpsLineSize(uint gid)
 {
 	if (mode == BPS_MODE_FREE_ANGLE) {
@@ -139,6 +354,12 @@ uint BpsLineSize(uint gid)
 	}
 	if (mode == BPS_MODE_RADIAL) {
 		return (uint)radialLength;
+	}
+	if (mode == BPS_MODE_SWIRL) {
+		return (uint)(radialLength > 0 ? radialLength : 1);
+	}
+	if (mode == BPS_MODE_PATH) {
+		return (uint)(radialLength > 0 ? radialLength : 1);
 	}
 	return direction != 0 ? (uint)width : (uint)height;
 }
@@ -154,13 +375,45 @@ bool BpsCoordForPos(uint gid, uint pos, out int x, out int y)
 		const uint lineLen = BpsRotationLineLength(gid);
 		const float theta = lineLen <= 1u ? 0.0f :
 			(BPS_TWO_PI * (float)pos) / (float)lineLen;
-		x = BpsRoundToInt(centerX + (float)gid * cos(theta));
-		y = BpsRoundToInt(centerY + (float)gid * sin(theta));
+		const float c = cos(theta);
+		const float s = sin(theta);
+		const float radius = (float)gid;
+		x = BpsRoundToInt(centerX + radius * (s * angleCos + c * angleSin));
+		y = BpsRoundToInt(centerY + radius * (s * angleSin - c * angleCos));
 	} else if (mode == BPS_MODE_RADIAL) {
 		const float denom = lineCount <= 0 ? 1.0f : (float)lineCount;
 		const float theta = (BPS_TWO_PI * (float)gid) / denom;
 		x = BpsRoundToInt(centerX + (float)pos * cos(theta));
 		y = BpsRoundToInt(centerY + (float)pos * sin(theta));
+	} else if (mode == BPS_MODE_SWIRL) {
+		const float r = (float)pos;
+		const float denom = lineCount <= 0 ? 1.0f : (float)lineCount;
+		const float phase = (BPS_TWO_PI * (float)gid) / denom;
+		const float angle = atan2(angleSin, angleCos);
+		const float theta = phase + swirlK * r + angle;
+		x = BpsRoundToInt(centerX + r * cos(theta));
+		y = BpsRoundToInt(centerY + r * sin(theta));
+	} else if (mode == BPS_MODE_PATH) {
+		float s = 0.0f;
+		float n = 0.0f;
+		if (pathDirection == BPS_PATH_DIR_NORMAL) {
+			s = (float)(pathSMin + (int)gid);
+			n = (float)(pathNMin + (int)pos);
+		} else {
+			n = (float)(pathNMin + (int)gid);
+			s = (float)(pathSMin + (int)pos);
+		}
+		float px = 0.0f;
+		float py = 0.0f;
+		float tx = 1.0f;
+		float ty = 0.0f;
+		if (!BpsPathEvalAtS(s, px, py, tx, ty)) {
+			x = 0;
+			y = 0;
+			return false;
+		}
+		x = BpsRoundToInt(px + n * (-ty));
+		y = BpsRoundToInt(py + n * tx);
 	} else {
 		const int lineLayer = direction != 0 ? outputOriginY + (int)gid : outputOriginX + (int)gid;
 		x = direction != 0 ? (int)pos : lineLayer;
@@ -191,7 +444,132 @@ uint DstIndexXY(int x, int y)
 	return (uint)((x - outputOriginX) + (y - outputOriginY) * dstPitch);
 }
 
-[RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=1)),DescriptorTable(SRV(t0,numDescriptors=1))")]
+uint DomainIndex(uint gid, uint pos)
+{
+	return (uint)((int)gid * domainStride + (int)pos);
+}
+
+void StoreUint(RWByteAddressBuffer buf, uint index, uint value)
+{
+	buf.Store(index * 4u, value);
+}
+
+uint LoadUint(ByteAddressBuffer buf, uint index)
+{
+	return buf.Load(index * 4u);
+}
+
+uint LoadUintUAV(RWByteAddressBuffer buf, uint index)
+{
+	return buf.Load(index * 4u);
+}
+
+void StoreFloat(RWByteAddressBuffer buf, uint index, float value)
+{
+	buf.Store(index * 4u, asuint(value));
+}
+
+float LoadFloat(RWByteAddressBuffer buf, uint index)
+{
+	return asfloat(buf.Load(index * 4u));
+}
+
+bool BpsDomainPosForPixel(int x, int y, out int domainLine, out int domainPos)
+{
+	domainLine = 0;
+	domainPos = 0;
+
+	if (mode == BPS_MODE_FREE_ANGLE) {
+		const float p = (float)x * angleCos + (float)y * angleSin;
+		const float q = -(float)x * angleSin + (float)y * angleCos;
+		domainPos = BpsRoundToInt(p) - freePMin;
+		domainLine = BpsRoundToInt(q) - freeQMin;
+	} else if (mode == BPS_MODE_ROTATION) {
+		const float dx = (float)x - centerX;
+		const float dy = (float)y - centerY;
+		domainLine = BpsRoundToInt(sqrt(dx * dx + dy * dy));
+		const uint lineLen = BpsRotationLineLength((uint)max(domainLine, 0));
+		if (lineLen <= 1u) {
+			domainPos = 0;
+		} else {
+			// Inverse of (sin, -cos) basis: theta = atan2(rx, -ry).
+			const float rx = dx * angleCos + dy * angleSin;
+			const float ry = -dx * angleSin + dy * angleCos;
+			float theta = atan2(rx, -ry);
+			if (theta < 0.0f) {
+				theta += BPS_TWO_PI;
+			}
+			domainPos = BpsRoundToInt((theta / BPS_TWO_PI) * (float)lineLen);
+			if (domainPos >= (int)lineLen) {
+				domainPos -= (int)lineLen;
+			}
+		}
+	} else if (mode == BPS_MODE_RADIAL) {
+		const float dx = (float)x - centerX;
+		const float dy = (float)y - centerY;
+		domainPos = BpsRoundToInt(sqrt(dx * dx + dy * dy));
+		float theta = atan2(dy, dx);
+		if (theta < 0.0f) {
+			theta += BPS_TWO_PI;
+		}
+		domainLine = lineCount <= 1 ? 0 :
+			BpsRoundToInt((theta / BPS_TWO_PI) * (float)lineCount);
+		if (domainLine >= lineCount) {
+			domainLine -= lineCount;
+		}
+	} else if (mode == BPS_MODE_SWIRL) {
+		const float dx = (float)x - centerX;
+		const float dy = (float)y - centerY;
+		const float r = sqrt(dx * dx + dy * dy);
+		const float angle = atan2(angleSin, angleCos);
+		float phase = atan2(dy, dx) - angle - swirlK * r;
+		phase = fmod(phase, BPS_TWO_PI);
+		if (phase < 0.0f) {
+			phase += BPS_TWO_PI;
+		}
+		domainLine = lineCount <= 1 ? 0 :
+			BpsRoundToInt((phase / BPS_TWO_PI) * (float)lineCount);
+		if (domainLine >= lineCount) {
+			domainLine -= lineCount;
+		}
+		domainPos = BpsRoundToInt(r);
+	} else if (mode == BPS_MODE_PATH) {
+		float s = 0.0f;
+		float n = 0.0f;
+		if (!BpsPathClosest((float)x, (float)y, s, n)) {
+			return false;
+		}
+		if (pathDirection == BPS_PATH_DIR_NORMAL) {
+			domainLine = BpsRoundToInt(s) - pathSMin;
+			domainPos = BpsRoundToInt(n) - pathNMin;
+		} else {
+			domainLine = BpsRoundToInt(n) - pathNMin;
+			domainPos = BpsRoundToInt(s) - pathSMin;
+		}
+	} else {
+		return false;
+	}
+
+	if (domainLine < 0 || domainLine >= lineCount) {
+		return false;
+	}
+
+	int lineLen = 0;
+	if (mode == BPS_MODE_FREE_ANGLE) {
+		lineLen = freeLineLength;
+	} else if (mode == BPS_MODE_ROTATION) {
+		lineLen = (int)BpsRotationLineLength((uint)domainLine);
+	} else {
+		lineLen = radialLength;
+	}
+
+	if (domainPos < 0 || domainPos >= lineLen || domainPos >= domainStride) {
+		return false;
+	}
+	return true;
+}
+
+[RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=1)),DescriptorTable(SRV(t0,numDescriptors=2))")]
 [numthreads(256, 1, 1)]
 void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 {
@@ -219,8 +597,8 @@ void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 				int x = 0;
 				int y = 0;
 				if (BpsCoordForPos(gid, spanStart, x, y) && SrcInWorld(x, y)) {
-					float br = BpsSortKey(LoadPixel(srcTex, SrcIndexXY(x, y)));
-					if (thresholdMin <= br && br <= thresholdMax) {
+					float br = BpsSortKey(LoadPixel(srcTex, SrcIndexXY(x, y)), trigger);
+					if (BpsIsAffected(br)) {
 						break;
 					}
 				}
@@ -234,8 +612,8 @@ void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 				if (!BpsCoordForPos(gid, spanEnd, x, y) || !SrcInWorld(x, y)) {
 					break;
 				}
-				float br = BpsSortKey(LoadPixel(srcTex, SrcIndexXY(x, y)));
-				if (br < thresholdMin || br > thresholdMax) {
+				float br = BpsSortKey(LoadPixel(srcTex, SrcIndexXY(x, y)), trigger);
+				if (!BpsIsAffected(br)) {
 					break;
 				}
 				spanEnd++;
@@ -270,7 +648,7 @@ void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 				const bool valid = BpsCoordForPos(gid, pos, x, y) && SrcInWorld(x, y);
 				const uint srcIndex = valid ? SrcIndexXY(x, y) : 0xffffffffu;
 				scratchKey[loadIndex] = valid
-					? BpsSortKey(LoadPixel(srcTex, srcIndex))
+					? BpsSortKey(LoadPixel(srcTex, srcIndex), criterion)
 					: (ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX);
 				scratchIndex[loadIndex] = srcIndex;
 			} else {
@@ -307,17 +685,336 @@ void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 			}
 		}
 
-		for (uint writeIndex = gtid; writeIndex < spanSize; writeIndex += MAX_THREADS) {
-			const uint pos = spanStart + writeIndex;
-			int x = 0;
-			int y = 0;
-			if (BpsCoordForPos(gid, pos, x, y) &&
-				DstInWorld(x, y) && scratchIndex[writeIndex] != 0xffffffffu) {
-				StorePixel(sortTex, DstIndexXY(x, y), LoadPixel(srcTex, scratchIndex[writeIndex]));
-			}
+	for (uint writeIndex = gtid; writeIndex < spanSize; writeIndex += MAX_THREADS) {
+		const uint pos = spanStart + writeIndex;
+		const uint shift = BpsCycleShift(spanSize);
+		const uint sortedIndex = (writeIndex + spanSize - shift) % spanSize;
+		int x = 0;
+		int y = 0;
+		if (BpsCoordForPos(gid, pos, x, y) &&
+			DstInWorld(x, y) && scratchIndex[sortedIndex] != 0xffffffffu) {
+			StorePixel(sortTex, DstIndexXY(x, y), LoadPixel(srcTex, scratchIndex[sortedIndex]));
 		}
+	}
 		GroupMemoryBarrierWithGroupSync();
 
 		cursor = spanEnd + 1u;
+	}
+}
+
+// Non-axis pass 1: forward path sampling into domain, then sort runs.
+groupshared uint s_spanStart;
+groupshared uint s_spanEnd;
+groupshared uint s_spanSize;
+groupshared uint s_sortSize;
+groupshared uint s_pathLen;
+
+[RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=2)),DescriptorTable(SRV(t0,numDescriptors=2))")]
+[numthreads(256, 1, 1)]
+void SortDomain(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
+{
+	const uint gid = groupID.x;
+	const uint gtid = groupThreadID.x;
+	const uint size = BpsLineSize(gid);
+	if (size == 0u || domainStride <= 0 || (int)size > domainStride) {
+		return;
+	}
+
+	for (uint pos = gtid; pos < size; pos += MAX_THREADS) {
+		int x = 0;
+		int y = 0;
+		const bool valid = BpsCoordForPos(gid, pos, x, y) && SrcInWorld(x, y);
+		StoreUint(sortTex, DomainIndex(gid, pos), valid ? SrcIndexXY(x, y) : 0xffffffffu);
+	}
+	AllMemoryBarrierWithGroupSync();
+
+	if (gtid == 0u) {
+		uint pathLen = 0u;
+		for (uint pos = 0u; pos < size; ++pos) {
+			if (LoadUintUAV(sortTex, DomainIndex(gid, pos)) != 0xffffffffu) {
+				StoreFloat(keysTex, DomainIndex(gid, pathLen), asfloat(pos));
+				pathLen++;
+			}
+		}
+		s_pathLen = pathLen;
+	}
+	AllMemoryBarrierWithGroupSync();
+
+	const uint pathLen = s_pathLen;
+	uint cursor = 0u;
+	while (cursor < pathLen) {
+		if (gtid == 0u) {
+			uint runStart = cursor;
+			while (runStart < pathLen) {
+				const uint pos = asuint(LoadFloat(keysTex, DomainIndex(gid, runStart)));
+				const uint srcIndex = LoadUintUAV(sortTex, DomainIndex(gid, pos));
+				const float br = BpsSortKey(LoadPixel(srcTex, srcIndex), trigger);
+				if (BpsIsAffected(br)) {
+					break;
+				}
+				runStart++;
+			}
+			uint runEnd = runStart;
+			while (runEnd < pathLen) {
+				const uint pos = asuint(LoadFloat(keysTex, DomainIndex(gid, runEnd)));
+				const uint srcIndex = LoadUintUAV(sortTex, DomainIndex(gid, pos));
+				const float br = BpsSortKey(LoadPixel(srcTex, srcIndex), trigger);
+				if (!BpsIsAffected(br)) {
+					break;
+				}
+				runEnd++;
+			}
+			s_spanStart = runStart;
+			s_spanEnd = runEnd;
+			s_spanSize = runEnd - runStart;
+			s_sortSize = BpsNextPow2(s_spanSize);
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		const uint runStart = s_spanStart;
+		const uint runEnd = s_spanEnd;
+		const uint spanSize = s_spanSize;
+		const uint sortSize = s_sortSize;
+
+		if (runStart >= pathLen || spanSize == 0u) {
+			break;
+		}
+
+		const bool ascending = ordering != 0;
+		for (uint loadIndex = gtid; loadIndex < sortSize; loadIndex += MAX_THREADS) {
+			const uint work = DomainIndex(gid, size + loadIndex);
+			if (loadIndex < spanSize) {
+				const uint pos = asuint(LoadFloat(keysTex, DomainIndex(gid, runStart + loadIndex)));
+				const uint srcIndex = LoadUintUAV(sortTex, DomainIndex(gid, pos));
+				StoreUint(sortTex, work, srcIndex);
+				StoreFloat(keysTex, work, BpsSortKey(LoadPixel(srcTex, srcIndex), criterion));
+			} else {
+				StoreUint(sortTex, work, 0xffffffffu);
+				StoreFloat(keysTex, work, ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX);
+			}
+		}
+		AllMemoryBarrierWithGroupSync();
+
+		for (uint k = 2u; k <= sortSize; k <<= 1) {
+			for (uint j = k >> 1; j > 0u; j >>= 1) {
+				for (uint sortIndex = gtid; sortIndex < sortSize; sortIndex += MAX_THREADS) {
+					const uint partner = sortIndex ^ j;
+					if (partner > sortIndex) {
+						bool stageAscending = (sortIndex & k) == 0u;
+						if (!ascending) {
+							stageAscending = !stageAscending;
+						}
+
+						const uint slotA = DomainIndex(gid, size + sortIndex);
+						const uint slotB = DomainIndex(gid, size + partner);
+						const float keyA = LoadFloat(keysTex, slotA);
+						const float keyB = LoadFloat(keysTex, slotB);
+						const uint indexA = LoadUintUAV(sortTex, slotA);
+						const uint indexB = LoadUintUAV(sortTex, slotB);
+						const bool before = BpsBefore(keyA, indexA, keyB, indexB);
+						if (before != stageAscending) {
+							StoreFloat(keysTex, slotA, keyB);
+							StoreFloat(keysTex, slotB, keyA);
+							StoreUint(sortTex, slotA, indexB);
+							StoreUint(sortTex, slotB, indexA);
+						}
+					}
+				}
+				AllMemoryBarrierWithGroupSync();
+			}
+		}
+
+		const uint shift = BpsCycleShift(spanSize);
+		for (uint writeIndex = gtid; writeIndex < spanSize; writeIndex += MAX_THREADS) {
+			const uint sortedIndex = (writeIndex + spanSize - shift) % spanSize;
+			const uint pos = asuint(LoadFloat(keysTex, DomainIndex(gid, runStart + writeIndex)));
+			StoreUint(sortTex, DomainIndex(gid, pos),
+				LoadUintUAV(sortTex, DomainIndex(gid, size + sortedIndex)));
+		}
+		AllMemoryBarrierWithGroupSync();
+
+		cursor = runEnd + 1u;
+	}
+}
+
+// Non-axis pass 2: gather via inverse domain lookup.
+[RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=1)),DescriptorTable(SRV(t0,numDescriptors=3))")]
+[numthreads(16, 16, 1)]
+void ApplyDomain(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+	const int ox = (int)dispatchThreadID.x;
+	const int oy = (int)dispatchThreadID.y;
+	if (ox >= outputWidth || oy >= outputHeight) {
+		return;
+	}
+
+	const int x = outputOriginX + ox;
+	const int y = outputOriginY + oy;
+	const uint dstIndex = (uint)(ox + oy * dstPitch);
+
+	float4 pixel = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	if (SrcInWorld(x, y)) {
+		pixel = LoadPixel(srcTex, SrcIndexXY(x, y));
+	}
+
+	int domainLine = 0;
+	int domainPos = 0;
+	if (BpsDomainPosForPixel(x, y, domainLine, domainPos)) {
+		const uint srcIndex = LoadUint(domainTex, (uint)(domainLine * domainStride + domainPos));
+		if (srcIndex != 0xffffffffu) {
+			pixel = LoadPixel(srcTex, srcIndex);
+		}
+	}
+
+	StorePixel(sortTex, dstIndex, pixel);
+}
+
+[RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=1)),DescriptorTable(SRV(t0,numDescriptors=1))")]
+[numthreads(16, 16, 1)]
+void CopyInput(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+	const int ox = (int)dispatchThreadID.x;
+	const int oy = (int)dispatchThreadID.y;
+	if (ox >= outputWidth || oy >= outputHeight) {
+		return;
+	}
+
+	const int x = outputOriginX + ox;
+	const int y = outputOriginY + oy;
+	const uint dstIndex = (uint)(ox + oy * dstPitch);
+	float4 pixel = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	if (SrcInWorld(x, y)) {
+		pixel = LoadPixel(srcTex, SrcIndexXY(x, y));
+	}
+	StorePixel(sortTex, dstIndex, pixel);
+}
+
+[RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=3)),DescriptorTable(SRV(t0,numDescriptors=4))")]
+[numthreads(256, 1, 1)]
+void SortMapped(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
+{
+	const uint mappedLine = groupID.x;
+	const uint gtid = groupThreadID.x;
+	if ((int)mappedLine >= lineCount) {
+		return;
+	}
+
+	const uint begin = LoadMappedLineOffset(mappedLine);
+	const uint end = LoadMappedLineOffset(mappedLine + 1u);
+	const uint lineSize = end - begin;
+	if (lineSize == 0u) {
+		return;
+	}
+
+	const uint workBase = LoadMappedWorkOffset(mappedLine);
+	const bool ascending = ordering != 0;
+
+	for (uint i = gtid; i < lineSize; i += MAX_THREADS) {
+		const uint pixelIndex = LoadMappedPixelIndex(begin + i);
+		const int x = (int)(pixelIndex % (uint)width);
+		const int y = (int)(pixelIndex / (uint)width);
+		StoreUint(keysTex, workBase + i,
+			SrcInWorld(x, y) ? SrcIndexXY(x, y) : 0xffffffffu);
+	}
+	AllMemoryBarrierWithGroupSync();
+
+	uint cursor = 0u;
+	while (cursor < lineSize) {
+		if (gtid == 0u) {
+			uint runStart = cursor;
+			while (runStart < lineSize) {
+				const uint srcIndex = LoadUintUAV(keysTex, workBase + runStart);
+				if (srcIndex != 0xffffffffu) {
+					const float br = BpsSortKey(LoadPixel(srcTex, srcIndex), trigger);
+					if (BpsIsAffected(br)) {
+						break;
+					}
+				}
+				runStart++;
+			}
+
+			uint runEnd = runStart;
+			while (runEnd < lineSize) {
+				const uint srcIndex = LoadUintUAV(keysTex, workBase + runEnd);
+				if (srcIndex == 0xffffffffu) {
+					break;
+				}
+				const float br = BpsSortKey(LoadPixel(srcTex, srcIndex), trigger);
+				if (!BpsIsAffected(br)) {
+					break;
+				}
+				runEnd++;
+			}
+
+			s_spanStart = runStart;
+			s_spanEnd = runEnd;
+			s_spanSize = runEnd - runStart;
+			s_sortSize = BpsNextPow2(s_spanSize);
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		const uint runStart = s_spanStart;
+		const uint runEnd = s_spanEnd;
+		const uint spanSize = s_spanSize;
+		const uint sortSize = s_sortSize;
+		if (runStart >= lineSize || spanSize == 0u) {
+			break;
+		}
+
+		const uint sortBase = workBase + lineSize;
+		for (uint loadIndex = gtid; loadIndex < sortSize; loadIndex += MAX_THREADS) {
+			if (loadIndex < spanSize) {
+				const uint srcIndex = LoadUintUAV(keysTex, workBase + runStart + loadIndex);
+				StoreUint(keysTex, sortBase + loadIndex, srcIndex);
+				StoreFloat(mappedKeysTex, sortBase + loadIndex,
+					BpsSortKey(LoadPixel(srcTex, srcIndex), criterion));
+			} else {
+				StoreUint(keysTex, sortBase + loadIndex, 0xffffffffu);
+				StoreFloat(mappedKeysTex, sortBase + loadIndex,
+					ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX);
+			}
+		}
+		AllMemoryBarrierWithGroupSync();
+
+		for (uint k = 2u; k <= sortSize; k <<= 1) {
+			for (uint j = k >> 1; j > 0u; j >>= 1) {
+				for (uint sortIndex = gtid; sortIndex < sortSize; sortIndex += MAX_THREADS) {
+					const uint partner = sortIndex ^ j;
+					if (partner > sortIndex) {
+						bool stageAscending = (sortIndex & k) == 0u;
+						if (!ascending) {
+							stageAscending = !stageAscending;
+						}
+						const float keyA = LoadFloat(mappedKeysTex, sortBase + sortIndex);
+						const float keyB = LoadFloat(mappedKeysTex, sortBase + partner);
+						const uint indexA = LoadUintUAV(keysTex, sortBase + sortIndex);
+						const uint indexB = LoadUintUAV(keysTex, sortBase + partner);
+						const bool before = BpsBefore(keyA, indexA, keyB, indexB);
+						if (before != stageAscending) {
+							StoreFloat(mappedKeysTex, sortBase + sortIndex, keyB);
+							StoreFloat(mappedKeysTex, sortBase + partner, keyA);
+							StoreUint(keysTex, sortBase + sortIndex, indexB);
+							StoreUint(keysTex, sortBase + partner, indexA);
+						}
+					}
+				}
+				AllMemoryBarrierWithGroupSync();
+			}
+		}
+
+		const uint shift = BpsCycleShift(spanSize);
+		for (uint writeIndex = gtid; writeIndex < spanSize; writeIndex += MAX_THREADS) {
+			const uint sortedIndex = (writeIndex + spanSize - shift) % spanSize;
+			const uint srcIndex = LoadUintUAV(keysTex, sortBase + sortedIndex);
+			const uint pixelIndex = LoadMappedPixelIndex(begin + runStart + writeIndex);
+			const int x = (int)(pixelIndex % (uint)width);
+			const int y = (int)(pixelIndex / (uint)width);
+			if (srcIndex != 0xffffffffu && DstInWorld(x, y)) {
+				StorePixel(sortTex, DstIndexXY(x, y), LoadPixel(srcTex, srcIndex));
+			}
+		}
+		AllMemoryBarrierWithGroupSync();
+
+		cursor = runEnd + 1u;
 	}
 }
