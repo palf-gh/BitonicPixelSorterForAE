@@ -1,8 +1,8 @@
 /*
 	BitonicPixelSorter_UI.cpp
 
-	Effect Controls custom UI for the GPU acceleration status readout.
-	Draws localised coloured text using the shared GPU eligibility predicate.
+	Effect Controls custom UI for the GPU acceleration status readout, and
+	mode-dependent parameter visibility (Direction / Angle / Centre).
 */
 
 #include "BitonicPixelSorter.h"
@@ -12,6 +12,7 @@
 #include "AEFX_SuiteHelper.h"
 #include <adobesdk/DrawbotSuite.h>
 
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -24,6 +25,42 @@
 #include "Localise/AELocalise.h"
 
 namespace {
+
+static A_long
+BPS_ClampPopupForUI(A_long value, A_long min_value, A_long max_value, A_long default_value)
+{
+	return (value >= min_value && value <= max_value) ? value : default_value;
+}
+
+static A_long
+BPS_MaxLineLengthForUI(PF_InData *in_data, PF_ParamDef *params[])
+{
+	if (!in_data || !params ||
+		BPS_RenderWidth(in_data) <= 0 || BPS_RenderHeight(in_data) <= 0) {
+		return 0;
+	}
+
+	const A_long mode = params[BPS_UI_MODE]
+		? BPS_ClampPopupForUI(params[BPS_UI_MODE]->u.pd.value,
+							  BPS_MODE_AXIS, BPS_MODE_PATH, BPS_MODE_DFLT)
+		: BPS_MODE_DFLT;
+
+	if (mode == BPS_MODE_AXIS) {
+		const A_long direction = params[BPS_UI_DIRECTION]
+			? BPS_ClampPopupForUI(params[BPS_UI_DIRECTION]->u.pd.value,
+								  BPS_DIR_HORIZONTAL, BPS_DIR_VERTICAL,
+								  BPS_DIRECTION_DFLT)
+			: BPS_DIRECTION_DFLT;
+		const A_long render_w = BPS_RenderWidth(in_data);
+		const A_long render_h = BPS_RenderHeight(in_data);
+		return (direction == BPS_DIR_HORIZONTAL) ? render_w : render_h;
+	}
+
+	// Non-axis GPU eligibility is gated on frame size, not path length.
+	const A_long render_w = BPS_RenderWidth(in_data);
+	const A_long render_h = BPS_RenderHeight(in_data);
+	return render_w > render_h ? render_w : render_h;
+}
 
 static void
 BPS_CopyUtf8ToDrawbotUtf16(const char *utf8, std::vector<DRAWBOT_UTF16Char> *out)
@@ -172,7 +209,7 @@ BPS_DrawGpuStatus(
 	PF_Err err = PF_Err_NONE;
 	PF_Err err2 = PF_Err_NONE;
 
-	if (!params || !params[BPS_GPU_STATUS] || !params[BPS_DIRECTION]) {
+	if (!params || !params[BPS_UI_GPU_STATUS] || !params[BPS_UI_MODE]) {
 		return PF_Err_BAD_CALLBACK_PARAM;
 	}
 
@@ -207,9 +244,13 @@ BPS_DrawGpuStatus(
 	ERR(drawbot_suites.drawbot_suiteP->GetSurface(drawing_ref, &surface_ref));
 
 	if (!err && PF_EA_CONTROL == event_extra->effect_win.area) {
-		const A_long direction = params[BPS_DIRECTION]->u.pd.value;
+		const A_long max_line_length = BPS_MaxLineLengthForUI(in_data, params);
+		const A_long mode = params[BPS_UI_MODE]
+			? BPS_ClampPopupForUI(params[BPS_UI_MODE]->u.pd.value,
+								  BPS_MODE_AXIS, BPS_MODE_PATH, BPS_MODE_DFLT)
+			: BPS_MODE_DFLT;
 		const BpsGpuEligibility eligibility = BPS_EvaluateGpuEligibility(
-			in_data, direction, BPS_FrameRect(in_data));
+			in_data, mode, max_line_length, BPS_FrameRect(in_data));
 
 		const bool last_render_used_gpu = BPS_LastRenderUsedGpu();
 		bool draw_second_line = false;
@@ -288,6 +329,66 @@ BPS_DrawGpuStatus(
 	return err;
 }
 
+// Hide/show a parameter stream via AEGP_DynStreamFlag_HIDDEN only.
+// Initial hide (ParamsSetup) uses PF_PUI_INVISIBLE + COLLAPSE_TWIRLY for ANGLE /
+// POINT controls; never toggle PF_PUI_INVISIBLE here via PF_UpdateParamUI
+// (Premiere-only per SDK). See .agents/skills/ae-initially-hidden-params.
+//
+// When an ANGLE / POINT is shown, clear COLLAPSE_TWIRLY through PF_UpdateParamUI
+// so the dial appears expanded. Keep COLLAPSE_TWIRLY while hidden so a first
+// paint never leaves an orphan dial.
+static PF_Err
+BPS_SetParamVisible(
+	PF_InData *in_data,
+	PF_OutData *out_data,
+	PF_ParamDef *params[],
+	AEGP_SuiteHandler &suites,
+	AEGP_PluginID plugin_id,
+	AEGP_EffectRefH effectH,
+	A_long index,
+	bool visible)
+{
+	if (index <= BPS_UI_INPUT || index >= BPS_UI_NUM_PARAMS || !params[index]) {
+		return PF_Err_NONE;
+	}
+
+	PF_Err err = PF_Err_NONE;
+
+	if (plugin_id && effectH && suites.StreamSuite2() &&
+		suites.DynamicStreamSuite2()) {
+		AEGP_StreamRefH streamH = NULL;
+		if (!suites.StreamSuite2()->AEGP_GetNewEffectStreamByIndex(
+				plugin_id, effectH, index, &streamH) &&
+			streamH) {
+			err = suites.DynamicStreamSuite2()->AEGP_SetDynamicStreamFlag(
+				streamH, AEGP_DynStreamFlag_HIDDEN, FALSE, !visible);
+			suites.StreamSuite2()->AEGP_DisposeStream(streamH);
+		}
+	}
+
+	// Expand / collapse the control region for dial-style params.
+	const PF_ParamType type = params[index]->param_type;
+	if (!err && in_data && out_data &&
+		(type == PF_Param_ANGLE || type == PF_Param_POINT ||
+		 type == PF_Param_POINT_3D)) {
+		PF_ParamDef def = *params[index];
+		if (visible) {
+			def.flags &= ~static_cast<A_long>(PF_ParamFlag_COLLAPSE_TWIRLY);
+		} else {
+			def.flags |= PF_ParamFlag_COLLAPSE_TWIRLY;
+		}
+		// Cosmetic only; do not touch ui_flags (no PF_PUI_INVISIBLE on AE).
+		AEFX_SuiteScoper<PF_ParamUtilsSuite3> param_utils(
+			in_data, kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3, out_data);
+		err = param_utils->PF_UpdateParamUI(in_data->effect_ref, index, &def);
+		if (!err) {
+			params[index]->flags = def.flags;
+		}
+	}
+
+	return err;
+}
+
 } // namespace
 
 PF_Err
@@ -321,9 +422,58 @@ BPS_UpdateParamsUI(
 	PF_ParamDef		*params[],
 	PF_LayerDef		*output)
 {
-	(void)in_data;
 	(void)out_data;
-	(void)params;
 	(void)output;
-	return PF_Err_NONE;
+
+	if (!in_data || !params || !in_data->pica_basicP || !params[BPS_UI_MODE]) {
+		return PF_Err_NONE;
+	}
+
+	AEGP_SuiteHandler suites(in_data->pica_basicP);
+
+	const A_long mode = BPS_ClampPopupForUI(params[BPS_UI_MODE]->u.pd.value,
+										   BPS_MODE_AXIS, BPS_MODE_PATH,
+										   BPS_MODE_DFLT);
+
+	AEGP_PluginID plugin_id = 0;
+	if (in_data->global_data && suites.HandleSuite1()) {
+		BPS_GlobalData *globalP = reinterpret_cast<BPS_GlobalData *>(
+			suites.HandleSuite1()->host_lock_handle(in_data->global_data));
+		if (globalP) {
+			plugin_id = globalP->plugin_id;
+		}
+		suites.HandleSuite1()->host_unlock_handle(in_data->global_data);
+	}
+
+	AEGP_EffectRefH effectH = NULL;
+	if (plugin_id && suites.PFInterfaceSuite1()) {
+		(void)suites.PFInterfaceSuite1()->AEGP_GetNewEffectForEffect(
+			plugin_id, in_data->effect_ref, &effectH);
+	}
+
+	PF_Err err = PF_Err_NONE;
+	ERR(BPS_SetParamVisible(in_data, out_data, params, suites, plugin_id, effectH,
+							BPS_UI_DIRECTION, mode == BPS_MODE_AXIS));
+	// Angle: Free Angle direction, or Rotation path start offset.
+	ERR(BPS_SetParamVisible(in_data, out_data, params, suites, plugin_id, effectH,
+							BPS_UI_ANGLE,
+							mode == BPS_MODE_FREE_ANGLE ||
+								mode == BPS_MODE_ROTATION));
+	ERR(BPS_SetParamVisible(in_data, out_data, params, suites, plugin_id, effectH,
+							BPS_UI_CENTER,
+							mode == BPS_MODE_ROTATION ||
+								mode == BPS_MODE_RADIAL ||
+								mode == BPS_MODE_SWIRL));
+	ERR(BPS_SetParamVisible(in_data, out_data, params, suites, plugin_id, effectH,
+							BPS_UI_SWIRL_AMOUNT, mode == BPS_MODE_SWIRL));
+	ERR(BPS_SetParamVisible(in_data, out_data, params, suites, plugin_id, effectH,
+							BPS_UI_PATH, mode == BPS_MODE_PATH));
+	ERR(BPS_SetParamVisible(in_data, out_data, params, suites, plugin_id, effectH,
+							BPS_UI_PATH_DIRECTION, mode == BPS_MODE_PATH));
+
+	if (effectH && suites.EffectSuite2()) {
+		suites.EffectSuite2()->AEGP_DisposeEffect(effectH);
+	}
+
+	return err;
 }

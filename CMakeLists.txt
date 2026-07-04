@@ -151,6 +151,8 @@ set(SOURCES
 	Source/BitonicPixelSorter_CPU.cpp
 	Source/BitonicPixelSorter_GPU.cpp
 	Source/BitonicPixelSorter_GpuHost.cpp
+	Source/BitonicPixelSorter_PathGeometry.cpp
+	Source/BitonicPixelSorter_PathGeometry.h
 	Localise/AELocalise.h
 	Localise/AE_SDK.h
 	Localise/LocKeys.h
@@ -195,49 +197,70 @@ if(BPS_HLSL_AVAILABLE)
 		"${AESDK_ROOT}/Util/DirectXUtils.cpp")
 	set(BPS_HLSL_KERNEL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/GPU/BitonicPixelSorter_Kernel.hlsl")
 	set(BPS_DIRECTX_ASSET_BUILD_DIR "${BPS_GENERATED_DIR}/DirectX_Assets")
-	set(BPS_DIRECTX_CSO "${BPS_DIRECTX_ASSET_BUILD_DIR}/BitonicSortKernel.cso")
-	set(BPS_DIRECTX_RS  "${BPS_DIRECTX_ASSET_BUILD_DIR}/BitonicSortKernel.rs")
-	set(BPS_DIRECTX_CSO_HEADER "${BPS_GENERATED_DIR}/BitonicSortKernel.cso.h")
-	set(BPS_DIRECTX_RS_HEADER  "${BPS_GENERATED_DIR}/BitonicSortKernel.rs.h")
-	add_custom_command(
-		OUTPUT "${BPS_DIRECTX_CSO}" "${BPS_DIRECTX_RS}"
-		COMMAND ${CMAKE_COMMAND} -E make_directory "${BPS_DIRECTX_ASSET_BUILD_DIR}"
-		COMMAND "${BPS_DXC_EXECUTABLE}"
-			"${BPS_HLSL_KERNEL_SOURCE}"
-			-E main
-			-Fo "${BPS_DIRECTX_CSO}"
-			-Frs "${BPS_DIRECTX_RS}"
-			-T cs_6_5
-			-ignore-line-directives
-		DEPENDS "${BPS_HLSL_KERNEL_SOURCE}"
-		COMMENT "Compiling DirectX HLSL kernel..."
-		VERBATIM)
-	add_custom_command(
-		OUTPUT "${BPS_DIRECTX_CSO_HEADER}"
-		COMMAND "${Python3_EXECUTABLE}"
-			"${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.py"
-			-i "${BPS_DIRECTX_CSO}"
-			-o "${BPS_DIRECTX_CSO_HEADER}"
-			-n kBitonicSortKernel_cso
-		DEPENDS "${BPS_DIRECTX_CSO}"
-		COMMENT "Embedding DirectX CSO..."
-		VERBATIM)
-	add_custom_command(
-		OUTPUT "${BPS_DIRECTX_RS_HEADER}"
-		COMMAND "${Python3_EXECUTABLE}"
-			"${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.py"
-			-i "${BPS_DIRECTX_RS}"
-			-o "${BPS_DIRECTX_RS_HEADER}"
-			-n kBitonicSortKernel_rs
-		DEPENDS "${BPS_DIRECTX_RS}"
-		COMMENT "Embedding DirectX root signature..."
-		VERBATIM)
-	add_custom_target(${PROJECT_NAME}_directx_shaders
-		DEPENDS
-			"${BPS_DIRECTX_CSO}"
-			"${BPS_DIRECTX_RS}"
+
+	# Axis single-pass, non-axis domain sort, and non-axis apply entry points.
+	set(BPS_DIRECTX_SHADER_ENTRIES
+		"main|BitonicSortKernel"
+		"SortDomain|BitonicSortDomain"
+		"ApplyDomain|BitonicApplyDomain"
+		"CopyInput|BitonicCopyInput"
+		"SortMapped|BitonicSortMapped"
+		"BuildPathClassifyCount|BitonicBuildPathClassifyCount"
+		"BuildPathScatterRecords|BitonicBuildPathScatterRecords"
+		"BuildPathSortRecords|BitonicBuildPathSortRecords")
+
+	set(BPS_DIRECTX_SHADER_HEADERS "")
+	foreach(entry ${BPS_DIRECTX_SHADER_ENTRIES})
+		string(REPLACE "|" ";" entry_parts "${entry}")
+		list(GET entry_parts 0 entry_name)
+		list(GET entry_parts 1 asset_name)
+
+		set(BPS_DIRECTX_CSO "${BPS_DIRECTX_ASSET_BUILD_DIR}/${asset_name}.cso")
+		set(BPS_DIRECTX_RS  "${BPS_DIRECTX_ASSET_BUILD_DIR}/${asset_name}.rs")
+		set(BPS_DIRECTX_CSO_HEADER "${BPS_GENERATED_DIR}/${asset_name}.cso.h")
+		set(BPS_DIRECTX_RS_HEADER  "${BPS_GENERATED_DIR}/${asset_name}.rs.h")
+
+		add_custom_command(
+			OUTPUT "${BPS_DIRECTX_CSO}" "${BPS_DIRECTX_RS}"
+			COMMAND ${CMAKE_COMMAND} -E make_directory "${BPS_DIRECTX_ASSET_BUILD_DIR}"
+			COMMAND "${BPS_DXC_EXECUTABLE}"
+				"${BPS_HLSL_KERNEL_SOURCE}"
+				-E ${entry_name}
+				-Fo "${BPS_DIRECTX_CSO}"
+				-Frs "${BPS_DIRECTX_RS}"
+				-T cs_6_5
+				-ignore-line-directives
+			DEPENDS "${BPS_HLSL_KERNEL_SOURCE}"
+			COMMENT "Compiling DirectX HLSL entry ${entry_name}..."
+			VERBATIM)
+		add_custom_command(
+			OUTPUT "${BPS_DIRECTX_CSO_HEADER}"
+			COMMAND "${Python3_EXECUTABLE}"
+				"${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.py"
+				-i "${BPS_DIRECTX_CSO}"
+				-o "${BPS_DIRECTX_CSO_HEADER}"
+				-n k${asset_name}_cso
+			DEPENDS "${BPS_DIRECTX_CSO}"
+			COMMENT "Embedding DirectX CSO ${asset_name}..."
+			VERBATIM)
+		add_custom_command(
+			OUTPUT "${BPS_DIRECTX_RS_HEADER}"
+			COMMAND "${Python3_EXECUTABLE}"
+				"${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.py"
+				-i "${BPS_DIRECTX_RS}"
+				-o "${BPS_DIRECTX_RS_HEADER}"
+				-n k${asset_name}_rs
+			DEPENDS "${BPS_DIRECTX_RS}"
+			COMMENT "Embedding DirectX root signature ${asset_name}..."
+			VERBATIM)
+
+		list(APPEND BPS_DIRECTX_SHADER_HEADERS
 			"${BPS_DIRECTX_CSO_HEADER}"
 			"${BPS_DIRECTX_RS_HEADER}")
+	endforeach()
+
+	add_custom_target(${PROJECT_NAME}_directx_shaders
+		DEPENDS ${BPS_DIRECTX_SHADER_HEADERS})
 endif()
 
 #------------------------------------------------------------------------------
@@ -468,6 +491,14 @@ elseif(APPLE)
 		COMMAND ${CMAKE_COMMAND} -E copy
 			"$<IF:$<CONFIG:Debug>,${PIPL_RSRC_DEBUG},${PIPL_RSRC_RELEASE}>"
 			"$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/Contents/Resources/BitonicPixelSorterPiPL.rsrc"
+		# Bump the bundle directory mtime. AE's PluginCache keys off the .plugin
+		# folder timestamp; updating only Contents/MacOS leaves the bundle mtime
+		# stale, so AE keeps the cached PiPL (version mismatch 84601/88601).
+		COMMAND ${CMAKE_COMMAND} -E touch
+			"$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>"
+			"$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/Contents"
+			"$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/Contents/MacOS"
+			"$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/Contents/Resources"
 		COMMAND xattr -cr "$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>"
 		# Ad-hoc code-sign the assembled bundle. The linker only applies a minimal
 		# "linker-signed" signature to the Mach-O; it does NOT produce a

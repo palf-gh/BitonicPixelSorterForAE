@@ -49,20 +49,22 @@
 #define BPS_LEGACY_PLUGIN_API_SUBVERS	27
 
 //-----------------------------------------------------------------------------
-// Version (stage: DEVELOP 0, PRERELEASE 1, ALPHA 2, BETA 3, RELEASE 4 in PF_VERSION;
-// PiPL uses PF_Stage_DEVELOP=0 ... RELEASE=3 numeric below)
+// Version (PF_Stage: DEVELOP=0, ALPHA=1, BETA=2, RELEASE=3)
 //-----------------------------------------------------------------------------
 #define	MAJOR_VERSION	1
-#define	MINOR_VERSION	0
+#define	MINOR_VERSION	1
 #define	BUG_VERSION		0
 #define	STAGE_VERSION	3		// PF_Stage_RELEASE (numeric, so the PiPL preprocessor needs no AE enums)
 #define	BUILD_VERSION	1
 
-// Packed version, identical bit layout to PF_VERSION() in AE_EffectVers.h.
+// Packed version, identical bit layout to PF_VERSION() in AE_Effect.h.
 // Used by the PiPL resource (AE_Effect_Version) and GlobalSetup (my_version).
 // PiPLtool's expression parser does not accept shifts or the 'L' suffix, so this
-// is a precomputed literal. For (1,0,0,3,1): (1<<19)|(3<<9)|1 = 525825.
-#define	BPS_VERSION_PACKED	525825
+// is a precomputed literal.
+// PF_VERSION(1,1,0,3,1):
+//   vers<<19 | subvers<<15 | bugvers<<11 | stage<<9 | build
+//   = (1<<19)|(1<<15)|(0<<11)|(3<<9)|1 = 558593.
+#define	BPS_VERSION_PACKED	558593
 
 //-----------------------------------------------------------------------------
 // Global out-flags (see AE_Effect.h). Written as explicit integer literals so
@@ -79,7 +81,7 @@
 // along a line, so an output pixel depends on its neighbours (not independent).
 #define OUT_FLAGS		100696064
 
-// OUT_FLAGS2 = PF_OutFlag2_SUPPORTS_SMART_RENDER (1<<10 = 1024)
+// OUT_FLAGS2 base = PF_OutFlag2_SUPPORTS_SMART_RENDER (1<<10 = 1024)
 //   | PF_OutFlag2_FLOAT_COLOR_AWARE (1<<12 = 4096)
 //   | PF_OutFlag2_SUPPORTS_THREADED_RENDERING (1<<27 = 134217728)
 //   = 134222848.
@@ -87,23 +89,19 @@
 // Threaded rendering advertises AE Multi-Frame Rendering support. PreRender and
 // SmartRender can run on non-main threads concurrently with the UI, so render
 // code must remain per-call/stateless or explicitly synchronised.
-#define OUT_FLAGS2_BASE	134222848
-
-#if defined(BPS_HAS_CUDA) || defined(BPS_HAS_OPENCL) || defined(BPS_HAS_HLSL) || defined(BPS_HAS_METAL)
-	// PF_OutFlag2_SUPPORTS_GPU_RENDER_F32 (1<<25) = 33554432.
-	#define OUT_FLAGS2_GPU 33554432
-#else
-	#define OUT_FLAGS2_GPU 0
-#endif
-
+//
+// Precomputed literals only: Rez must not see addition expressions, or PiPL
+// and GlobalSetup can disagree and AE reports a version mismatch (84601).
 #if defined(BPS_HAS_HLSL)
-	// PF_OutFlag2_SUPPORTS_DIRECTX_RENDERING (1<<29) = 536870912.
-	#define OUT_FLAGS2_DIRECTX 536870912
+	// base (134222848) | GPU (1<<25 = 33554432) | DirectX (1<<29 = 536870912)
+	// = 704648192.
+	#define OUT_FLAGS2		704648192
+#elif defined(BPS_HAS_CUDA) || defined(BPS_HAS_OPENCL) || defined(BPS_HAS_METAL)
+	// base | GPU (1<<25 = 33554432)
+	#define OUT_FLAGS2		167777280
 #else
-	#define OUT_FLAGS2_DIRECTX 0
+	#define OUT_FLAGS2		134222848
 #endif
-
-#define OUT_FLAGS2		(OUT_FLAGS2_BASE + OUT_FLAGS2_GPU + OUT_FLAGS2_DIRECTX)
 
 #endif // BITONIC_PIXEL_SORTER_TARGET_H
 // clang-format on
