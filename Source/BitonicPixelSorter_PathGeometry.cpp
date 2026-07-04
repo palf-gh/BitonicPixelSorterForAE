@@ -24,12 +24,16 @@
 */
 
 #include "BitonicPixelSorter_PathGeometry.h"
+#include "BitonicPixelSorter_GpuEligibility.h"
 
 #include "AEFX_SuiteHelper.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -58,6 +62,63 @@ inline std::uint32_t NextPow2U32(std::uint32_t value)
 	value |= value >> 8;
 	value |= value >> 16;
 	return value + 1u;
+}
+
+inline std::uint32_t SortableFloatKey(float value)
+{
+	// Match the previous comparator for ordinary finite values while giving the
+	// radix pass a monotonic unsigned representation. Canonicalise signed zero so
+	// -0 and +0 still tie and fall through to pixelIndex.
+	if (value == 0.0f) {
+		value = 0.0f;
+	}
+	std::uint32_t bits = 0;
+	std::memcpy(&bits, &value, sizeof(bits));
+	return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+}
+
+inline std::uint64_t MappedRecordSortKey(const BpsMappedPixelRecord &record)
+{
+	return (static_cast<std::uint64_t>(SortableFloatKey(record.posKey)) << 32) |
+		static_cast<std::uint64_t>(record.pixelIndex);
+}
+
+void RadixSortMappedRecordSpan(
+	BpsMappedPixelRecord *first,
+	std::uint32_t count,
+	std::vector<BpsMappedPixelRecord> *scratchP)
+{
+	if (!first || !scratchP || count <= 1u) {
+		return;
+	}
+
+	scratchP->resize(count);
+	BpsMappedPixelRecord *src = first;
+	BpsMappedPixelRecord *dst = scratchP->data();
+
+	for (unsigned int shift = 0; shift < 64u; shift += 8u) {
+		std::uint32_t buckets[256] = {};
+		for (std::uint32_t i = 0; i < count; ++i) {
+			const std::uint64_t key = MappedRecordSortKey(src[i]);
+			++buckets[static_cast<unsigned int>((key >> shift) & 0xffu)];
+		}
+
+		std::uint32_t running = 0;
+		for (std::uint32_t &bucket : buckets) {
+			const std::uint32_t size = bucket;
+			bucket = running;
+			running += size;
+		}
+
+		for (std::uint32_t i = 0; i < count; ++i) {
+			const std::uint64_t key = MappedRecordSortKey(src[i]);
+			const unsigned int bucket =
+				static_cast<unsigned int>((key >> shift) & 0xffu);
+			dst[buckets[bucket]++] = src[i];
+		}
+
+		std::swap(src, dst);
+	}
 }
 
 inline float WrapPositiveRadians(float value)
@@ -215,31 +276,135 @@ void ResolvePathDomainBounds(BitonicSorterParams *paramsP, float diag)
 	paramsP->maxLineLength = paramsP->domainMaxLineLength;
 }
 
-// Extend both open ends as straight half-lines by `extend` along the end
-// tangents, so pixels beyond the path endpoints still project onto a segment.
-void ExtendOpenEnds(std::vector<BpsPathSample> *samplesP, float extend)
+// Distance along the ray P + t*D (unit D) to exit the inclusive frame box.
+// Returns a small positive epsilon if the ray does not exit (degenerate).
+float RayExitDistance(float px, float py, float dx, float dy,
+					  float x0, float y0, float x1, float y1)
 {
-	if (!samplesP || samplesP->size() < 2u || extend <= kEps) {
+	float t_exit = std::numeric_limits<float>::infinity();
+	if (dx > kEps) {
+		t_exit = (std::min)(t_exit, (x1 - px) / dx);
+	} else if (dx < -kEps) {
+		t_exit = (std::min)(t_exit, (x0 - px) / dx);
+	}
+	if (dy > kEps) {
+		t_exit = (std::min)(t_exit, (y1 - py) / dy);
+	} else if (dy < -kEps) {
+		t_exit = (std::min)(t_exit, (y0 - py) / dy);
+	}
+	if (!(t_exit > kEps) || t_exit > 1.0e12f) {
+		return kEps;
+	}
+	return t_exit;
+}
+
+// Extend both open ends along the end tangents to the frame edge. The extended
+// rays are part of the path so pixels past the authored endpoints still belong
+// to the path's local (s, n) coordinate system. End is extended first, then
+// start, so indices stay simple.
+void ExtendOpenEndsToFrameEdges(std::vector<BpsPathSample> *samplesP,
+								float frame_w, float frame_h)
+{
+	if (!samplesP || samplesP->size() < 2u || frame_w <= 1.0f || frame_h <= 1.0f) {
 		return;
 	}
 
-	const BpsPathSample first = samplesP->front();
-	BpsPathSample start_ext = first;
-	start_ext.x = first.x - first.tx * extend;
-	start_ext.y = first.y - first.ty * extend;
-	start_ext.s = first.s - extend;
-	start_ext.tx = first.tx;
-	start_ext.ty = first.ty;
-	samplesP->insert(samplesP->begin(), start_ext);
+	const float x0 = 0.0f;
+	const float y0 = 0.0f;
+	const float x1 = frame_w - 1.0f;
+	const float y1 = frame_h - 1.0f;
 
-	const BpsPathSample last = samplesP->back();
-	BpsPathSample end_ext = last;
-	end_ext.x = last.x + last.tx * extend;
-	end_ext.y = last.y + last.ty * extend;
-	end_ext.s = last.s + extend;
-	end_ext.tx = last.tx;
-	end_ext.ty = last.ty;
-	samplesP->push_back(end_ext);
+	// --- End ray (append) ---
+	{
+		const BpsPathSample last = samplesP->back();
+		// Extend along the path's actual arrival direction (the last polyline
+		// segment). The stored per-sample tangent can be stale or degenerate,
+		// which would open a corner at the endpoint and fan the sort; the segment
+		// direction is always collinear with how the path reaches its end.
+		float tx = last.tx;
+		float ty = last.ty;
+		if (samplesP->size() >= 2u) {
+			const BpsPathSample &prev = (*samplesP)[samplesP->size() - 2u];
+			tx = last.x - prev.x;
+			ty = last.y - prev.y;
+		}
+		NormaliseTangent(&tx, &ty);
+		const float t_exit = RayExitDistance(
+			last.x, last.y, tx, ty, x0, y0, x1, y1);
+		if (t_exit > kEps) {
+			const float to_x = last.x + tx * t_exit;
+			const float to_y = last.y + ty * t_exit;
+			const float dx = to_x - last.x;
+			const float dy = to_y - last.y;
+			const float len = std::sqrt(dx * dx + dy * dy);
+			const A_long steps = (std::max)(
+				static_cast<A_long>(1), static_cast<A_long>(std::ceil(len)));
+			for (A_long k = 1; k <= steps; ++k) {
+				const float t = static_cast<float>(k) / static_cast<float>(steps);
+				BpsPathSample s = last;
+				s.x = last.x + dx * t;
+				s.y = last.y + dy * t;
+				s.s = last.s + len * t;
+				s.tx = tx;
+				s.ty = ty;
+				samplesP->push_back(s);
+			}
+		}
+	}
+
+	// --- Start ray (prepend), outward = -T ---
+	{
+		// Original start is still the first sample (we only appended).
+		const BpsPathSample first = samplesP->front();
+		// Departure direction from the first polyline segment; outward is -T.
+		float tx = first.tx;
+		float ty = first.ty;
+		if (samplesP->size() >= 2u) {
+			const BpsPathSample &second = (*samplesP)[1];
+			tx = second.x - first.x;
+			ty = second.y - first.y;
+		}
+		NormaliseTangent(&tx, &ty);
+		const float t_exit = RayExitDistance(
+			first.x, first.y, -tx, -ty, x0, y0, x1, y1);
+		if (t_exit > kEps) {
+			const float to_x = first.x - tx * t_exit;
+			const float to_y = first.y - ty * t_exit;
+			const float dx = to_x - first.x;
+			const float dy = to_y - first.y;
+			const float len = std::sqrt(dx * dx + dy * dy);
+			const A_long steps = (std::max)(
+				static_cast<A_long>(1), static_cast<A_long>(std::ceil(len)));
+			std::vector<BpsPathSample> prefix;
+			prefix.reserve(static_cast<size_t>(steps));
+			for (A_long k = steps; k >= 1; --k) {
+				const float t = static_cast<float>(k) / static_cast<float>(steps);
+				BpsPathSample s = first;
+				s.x = first.x + dx * t;
+				s.y = first.y + dy * t;
+				// Temporary s; renumbered below.
+				s.s = -len * t;
+				s.tx = tx;
+				s.ty = ty;
+				prefix.push_back(s);
+			}
+			samplesP->insert(samplesP->begin(), prefix.begin(), prefix.end());
+		}
+	}
+
+	// Renumber arc length so the path is continuous and starts at s = 0.
+	if (!samplesP->empty()) {
+		float s = 0.0f;
+		samplesP->front().s = 0.0f;
+		for (size_t i = 1u; i < samplesP->size(); ++i) {
+			const BpsPathSample &prev = (*samplesP)[i - 1u];
+			BpsPathSample &sample = (*samplesP)[i];
+			const float dx = sample.x - prev.x;
+			const float dy = sample.y - prev.y;
+			s += std::sqrt(dx * dx + dy * dy);
+			sample.s = s;
+		}
+	}
 }
 
 // Flatten one cubic Bezier segment into arc-length samples.
@@ -286,6 +451,16 @@ void SampleCubicSegment(std::vector<BpsPathSample> *samplesP,
 		float ty = 3.0f * uu * (p1y - p0y) +
 				   6.0f * u * t * (p2y - p1y) +
 				   3.0f * tt * (p3y - p2y);
+		// The cubic derivative vanishes at the ends of a straight or degenerate
+		// segment (p1==p0, p2==p3), which happens at every corner vertex. Fall
+		// back to the chord so endpoint/corner tangents keep the real segment
+		// direction rather than NormaliseTangent's generic (1,0): a stray (1,0)
+		// here makes the open-end extension shoot off horizontally and fan the
+		// sort around the corner it opens at the endpoint.
+		if (tx * tx + ty * ty < kEps) {
+			tx = p3x - p0x;
+			ty = p3y - p0y;
+		}
 		NormaliseTangent(&tx, &ty);
 		if (*have_prev) {
 			const float dx = x - *prev_x;
@@ -472,6 +647,69 @@ bool SamplePathFromAegpMask(PF_InData *in_data,
 	(void)suites.StreamSuite5()->AEGP_DisposeStreamValue(&outline_val);
 	(void)suites.StreamSuite5()->AEGP_DisposeStream(streamH);
 	(void)suites.MaskSuite6()->AEGP_DisposeMask(maskH);
+	return ok;
+}
+
+// Effect path-parameter checkout (PF_PathQuerySuite). Coordinates are already
+// in the effect layer's top-left space for both raster and vector layers.
+bool SamplePathFromEffectParam(PF_InData *in_data,
+							   AEGP_SuiteHandler &suites,
+							   PF_PathID path_id,
+							   std::vector<BpsPathSample> *samplesP,
+							   PF_Boolean *open_out)
+{
+	samplesP->clear();
+	if (!in_data || path_id == 0 ||
+		!suites.PathQuerySuite1() || !suites.PathDataSuite1()) {
+		return false;
+	}
+
+	PF_PathOutlinePtr pathP = nullptr;
+	PF_PathID checkout_id = path_id;
+	PF_Err path_err = suites.PathQuerySuite1()->PF_CheckoutPath(
+		in_data->effect_ref,
+		checkout_id,
+		in_data->current_time,
+		in_data->time_step,
+		in_data->time_scale,
+		&pathP);
+
+	if ((path_err || !pathP) && path_id > 0) {
+		path_err = PF_Err_NONE;
+		pathP = nullptr;
+		for (A_long index_try = 0; index_try < 2 && !pathP; ++index_try) {
+			const A_long index = (index_try == 0) ? (path_id - 1) : path_id;
+			if (index < 0) {
+				continue;
+			}
+			PF_PathID unique_id = 0;
+			if (suites.PathQuerySuite1()->PF_PathInfo(
+					in_data->effect_ref, index, &unique_id) != PF_Err_NONE ||
+				unique_id == 0) {
+				continue;
+			}
+			checkout_id = unique_id;
+			path_err = suites.PathQuerySuite1()->PF_CheckoutPath(
+				in_data->effect_ref,
+				checkout_id,
+				in_data->current_time,
+				in_data->time_step,
+				in_data->time_scale,
+				&pathP);
+			if (path_err) {
+				pathP = nullptr;
+			}
+		}
+	}
+
+	if (!pathP) {
+		return false;
+	}
+
+	const bool ok = SamplePathFromPfOutline(
+		in_data->effect_ref, suites.PathDataSuite1(), pathP, samplesP, open_out);
+	(void)suites.PathQuerySuite1()->PF_CheckinPath(
+		in_data->effect_ref, checkout_id, FALSE, pathP);
 	return ok;
 }
 
@@ -899,11 +1137,19 @@ void ComputePathField(
 
 	// Seed: walk every polyline segment at <= 1px spacing and splat each sample
 	// into the grid cell it lands in, keeping the anchor-closest seed per cell.
+	// Open-end extensions meet the frame edge; clamp so boundary seeds are kept.
 	auto splat = [&](float fx, float fy, float sv, float tvx, float tvy) {
-		const A_long cx = RoundToLong(fx / scale);
-		const A_long cy = RoundToLong(fy / scale);
-		if (cx < 0 || cy < 0 || cx >= gridW || cy >= gridH) {
-			return;
+		A_long cx = RoundToLong(fx / scale);
+		A_long cy = RoundToLong(fy / scale);
+		if (cx < 0) {
+			cx = 0;
+		} else if (cx >= gridW) {
+			cx = gridW - 1;
+		}
+		if (cy < 0) {
+			cy = 0;
+		} else if (cy >= gridH) {
+			cy = gridH - 1;
 		}
 		const size_t idx = static_cast<size_t>(cy) *
 			static_cast<size_t>(gridW) + static_cast<size_t>(cx);
@@ -1092,23 +1338,18 @@ void BuildPathMap(
 	}
 	mapP->workOffsets[static_cast<size_t>(lane_count)] = work_offset;
 
-	// Phase 3: lay each lane's slots out in `order` (parallel, contiguous sort).
+	// Phase 3: lay each lane's slots out in `order` (parallel linear radix sort).
 	RunParallel(workers, [&](unsigned int t) {
+		std::vector<BpsMappedPixelRecord> scratch;
 		for (A_long lane = static_cast<A_long>(t); lane < lane_count;
 			 lane += static_cast<A_long>(workers)) {
 			const std::uint32_t b0 = mapP->lineOffsets[static_cast<size_t>(lane)];
 			const std::uint32_t b1 =
 				mapP->lineOffsets[static_cast<size_t>(lane) + 1u];
-			std::sort(mapP->records.begin() + b0, mapP->records.begin() + b1,
-				[](const BpsMappedPixelRecord &a, const BpsMappedPixelRecord &b) {
-					if (a.posKey < b.posKey) {
-						return true;
-					}
-					if (a.posKey > b.posKey) {
-						return false;
-					}
-					return a.pixelIndex < b.pixelIndex;
-				});
+			const std::uint32_t len = b1 - b0;
+			if (len > 1u) {
+				RadixSortMappedRecordSpan(mapP->records.data() + b0, len, &scratch);
+			}
 		}
 	});
 
@@ -1133,7 +1374,7 @@ inline std::uint64_t HashBytes(std::uint64_t seed, const void *data, size_t len)
 // Geometry-only key: identical key => identical pixel map, regardless of the
 // image, time, or sort parameters. Covers frame size, direction, closure, the
 // resolved domain, and the flattened/extended polyline itself.
-std::uint64_t PathMapKey(A_long frameW, A_long frameH, const BitonicSorterParams &prm)
+std::uint64_t ComputePathMapKey(A_long frameW, A_long frameH, const BitonicSorterParams &prm)
 {
 	std::uint64_t h = 1469598103934665603ull;
 	const A_long header[] = {
@@ -1162,6 +1403,14 @@ constexpr size_t kPathMapCacheCapacity = 4;
 
 } // namespace
 
+std::uint64_t BPS_PathMapKey(
+	A_long frameW,
+	A_long frameH,
+	const BitonicSorterParams &prm)
+{
+	return ComputePathMapKey(frameW, frameH, prm);
+}
+
 std::shared_ptr<const BpsPathMap> BPS_AcquirePathMap(
 	A_long frameW,
 	A_long frameH,
@@ -1173,7 +1422,7 @@ std::shared_ptr<const BpsPathMap> BPS_AcquirePathMap(
 		return nullptr;
 	}
 
-	const std::uint64_t key = PathMapKey(frameW, frameH, prm);
+	const std::uint64_t key = BPS_PathMapKey(frameW, frameH, prm);
 
 	{
 		std::lock_guard<std::mutex> lock(g_pathMapCacheMutex);
@@ -1238,8 +1487,8 @@ PF_Err BPS_BuildPathGeometry(
 	paramsP->domainMaxLineLength = 0;
 	paramsP->maxLineLength = 0;
 
-	const A_long frameW = in_data ? in_data->width : 0;
-	const A_long frameH = in_data ? in_data->height : 0;
+	const A_long frameW = BPS_RenderWidth(in_data);
+	const A_long frameH = BPS_RenderHeight(in_data);
 	const float diag = (frameW > 0 && frameH > 0)
 		? std::sqrt(static_cast<float>(frameW) * static_cast<float>(frameW) +
 					static_cast<float>(frameH) * static_cast<float>(frameH))
@@ -1264,58 +1513,18 @@ PF_Err BPS_BuildPathGeometry(
 
 	PF_Boolean openB = TRUE;
 
-	// 1) PathMaster / Projector pattern: AEGP layer mask outline (preferred).
-	if (!SamplePathFromAegpMask(in_data, suites, plugin_id, path_id,
-								samplesP, &openB)) {
-		// 2) PathMaster Render pattern: PF_CheckoutPath + PathDataSuite with
-		//    effect_ref (never NULL — PathMaster always passes effect_ref).
+	// Prefer the AEGP layer mask outline (correct drawn-mask geometry, tangents
+	// relative to position), then fall back to the effect path parameter. This
+	// matches the cfc4bcd ordering; preferring the PF param sampled a different
+	// path and produced a completely wrong shape.
+	const char *dbgSrc = "none";
+	if (SamplePathFromAegpMask(in_data, suites, plugin_id, path_id,
+							   samplesP, &openB)) {
+		dbgSrc = "AEGP_mask";
+	} else {
 		samplesP->clear();
-		if (suites.PathQuerySuite1() && suites.PathDataSuite1()) {
-			PF_PathOutlinePtr pathP = nullptr;
-			PF_PathID checkout_id = path_id;
-			PF_Err path_err = suites.PathQuerySuite1()->PF_CheckoutPath(
-				in_data->effect_ref,
-				checkout_id,
-				in_data->current_time,
-				in_data->time_step,
-				in_data->time_scale,
-				&pathP);
-
-			if ((path_err || !pathP) && path_id > 0) {
-				path_err = PF_Err_NONE;
-				pathP = nullptr;
-				for (A_long index_try = 0; index_try < 2 && !pathP; ++index_try) {
-					const A_long index = (index_try == 0) ? (path_id - 1) : path_id;
-					if (index < 0) {
-						continue;
-					}
-					PF_PathID unique_id = 0;
-					if (suites.PathQuerySuite1()->PF_PathInfo(
-							in_data->effect_ref, index, &unique_id) != PF_Err_NONE ||
-						unique_id == 0) {
-						continue;
-					}
-					checkout_id = unique_id;
-					path_err = suites.PathQuerySuite1()->PF_CheckoutPath(
-						in_data->effect_ref,
-						checkout_id,
-						in_data->current_time,
-						in_data->time_step,
-						in_data->time_scale,
-						&pathP);
-					if (path_err) {
-						pathP = nullptr;
-					}
-				}
-			}
-
-			if (pathP) {
-				(void)SamplePathFromPfOutline(
-					in_data->effect_ref, suites.PathDataSuite1(), pathP,
-					samplesP, &openB);
-				(void)suites.PathQuerySuite1()->PF_CheckinPath(
-					in_data->effect_ref, checkout_id, FALSE, pathP);
-			}
+		if (SamplePathFromEffectParam(in_data, suites, path_id, samplesP, &openB)) {
+			dbgSrc = "PF_param";
 		}
 	}
 
@@ -1325,36 +1534,82 @@ PF_Err BPS_BuildPathGeometry(
 		return PF_Err_NONE;
 	}
 
-	// Mask geometry is full-resolution; render space may be downsampled. Scale
-	// the polyline into render space only when the samples clearly sit outside
-	// the current frame (matches the PathMaster feather-scaling convention).
-	{
-		const float dsx = paramsP->downsampleX > 0.0f ? paramsP->downsampleX : 1.0f;
-		const float dsy = paramsP->downsampleY > 0.0f ? paramsP->downsampleY : 1.0f;
-		float max_x = samplesP->front().x;
-		float max_y = samplesP->front().y;
-		for (const BpsPathSample &sample : *samplesP) {
-			max_x = (std::max)(max_x, sample.x);
-			max_y = (std::max)(max_y, sample.y);
-		}
-		const bool looks_full_res =
-			max_x > static_cast<float>(frameW) * 1.25f ||
-			max_y > static_cast<float>(frameH) * 1.25f;
-		if (looks_full_res && (dsx < 0.999f || dsy < 0.999f)) {
-			const float s_scale = (std::min)(dsx, dsy);
-			for (BpsPathSample &sample : *samplesP) {
-				sample.x *= dsx;
-				sample.y *= dsy;
-				sample.s *= s_scale;
-				sample.tx *= dsx;
-				sample.ty *= dsy;
-				NormaliseTangent(&sample.tx, &sample.ty);
+	// Map mask vertices into effect-buffer space (top-left origin).
+	// Footage layers: anchor is typically (W/2, H/2) ⇒ identity.
+	// Shape/text layers: default anchor is (0, 0) at the layer centre ⇒ + (W/2, H/2).
+	// buffer = mask - anchor + (W/2, H/2)
+	if (plugin_id && suites.PFInterfaceSuite1() && suites.StreamSuite5() &&
+		suites.LayerSuite5()) {
+		AEGP_LayerH layerH = NULL;
+		if (suites.PFInterfaceSuite1()->AEGP_GetEffectLayer(
+				in_data->effect_ref, &layerH) == A_Err_NONE &&
+			layerH) {
+			AEGP_StreamRefH anchor_streamH = NULL;
+			if (suites.StreamSuite5()->AEGP_GetNewLayerStream(
+					plugin_id, layerH, AEGP_LayerStream_ANCHORPOINT,
+					&anchor_streamH) == A_Err_NONE &&
+				anchor_streamH) {
+				A_Time timeT;
+				timeT.value = in_data->current_time;
+				timeT.scale = in_data->time_scale;
+				AEGP_StreamValue2 anchor_val;
+				AEFX_CLR_STRUCT(anchor_val);
+				if (suites.StreamSuite5()->AEGP_GetNewStreamValue(
+						plugin_id, anchor_streamH, AEGP_LTimeMode_LayerTime,
+						&timeT, TRUE, &anchor_val) == A_Err_NONE) {
+					const float anchor_x =
+						static_cast<float>(anchor_val.val.two_d.x);
+					const float anchor_y =
+						static_cast<float>(anchor_val.val.two_d.y);
+					const float ox =
+						0.5f * static_cast<float>(in_data->width) - anchor_x;
+					const float oy =
+						0.5f * static_cast<float>(in_data->height) - anchor_y;
+					if (std::fabs(ox) > 1.0e-3f || std::fabs(oy) > 1.0e-3f) {
+						for (BpsPathSample &sample : *samplesP) {
+							sample.x += ox;
+							sample.y += oy;
+						}
+					}
+					(void)suites.StreamSuite5()->AEGP_DisposeStreamValue(
+						&anchor_val);
+				}
+				(void)suites.StreamSuite5()->AEGP_DisposeStream(anchor_streamH);
 			}
+		}
+	}
+
+	// Mask geometry is authored in full-resolution layer space. Path mode sorts
+	// in the current render space, so apply AE's downsample ratio unconditionally
+	// and rebuild arc length after any non-uniform scale.
+	const float dsx = paramsP->downsampleX > 0.0f ? paramsP->downsampleX : 1.0f;
+	const float dsy = paramsP->downsampleY > 0.0f ? paramsP->downsampleY : 1.0f;
+	if (std::fabs(dsx - 1.0f) > 1.0e-6f ||
+		std::fabs(dsy - 1.0f) > 1.0e-6f) {
+		for (BpsPathSample &sample : *samplesP) {
+			sample.x *= dsx;
+			sample.y *= dsy;
+			sample.tx *= dsx;
+			sample.ty *= dsy;
+			NormaliseTangent(&sample.tx, &sample.ty);
+		}
+		float s = 0.0f;
+		samplesP->front().s = 0.0f;
+		for (size_t i = 1u; i < samplesP->size(); ++i) {
+			const BpsPathSample &prev = (*samplesP)[i - 1u];
+			BpsPathSample &sample = (*samplesP)[i];
+			const float dx = sample.x - prev.x;
+			const float dy = sample.y - prev.y;
+			s += std::sqrt(dx * dx + dy * dy);
+			sample.s = s;
 		}
 	}
 
 	const bool closed = (openB == FALSE);
 	paramsP->pathClosed = closed ? 1 : 0;
+
+	const float frame_w = static_cast<float>(frameW);
+	const float frame_h = static_cast<float>(frameH);
 
 	if (closed) {
 		// Close the polyline back to the first vertex so the seam has a segment
@@ -1371,10 +1626,46 @@ PF_Err BPS_BuildPathGeometry(
 		}
 		paramsP->pathLength = samplesP->back().s;
 	} else {
-		// pathLength is the raw arc length; open ends are then extended so the
-		// local coordinate system covers the whole frame (s < 0 and s > length).
+		// Open ends: extend along end tangents to the frame edge, then the
+		// whole polyline (authored path + rays) is the sort path.
+		// --- TEMP DEBUG DUMP (Path open-end diagnosis) ---
+		const BpsPathSample dbgAuthFirst = samplesP->front();
+		const BpsPathSample dbgAuthSecond = (*samplesP)[1];
+		const BpsPathSample dbgAuthLast = samplesP->back();
+		const BpsPathSample dbgAuthPrev = (*samplesP)[samplesP->size() - 2u];
+		const A_long dbgAuthCount = static_cast<A_long>(samplesP->size());
+		ExtendOpenEndsToFrameEdges(samplesP, frame_w, frame_h);
 		paramsP->pathLength = samplesP->back().s;
-		ExtendOpenEnds(samplesP, diag > kEps ? diag : 1.0f);
+		{
+			const char *tmp = std::getenv("TEMP");
+			char path[1024];
+			std::snprintf(path, sizeof(path), "%s\\bps_pathdump.txt",
+						  tmp ? tmp : ".");
+			FILE *fp = std::fopen(path, "w");
+			if (fp) {
+				std::fprintf(fp, "frame WxH = %ld x %ld  dir=%ld  source=%s\n",
+							 (long)frameW, (long)frameH, (long)paramsP->pathDirection, dbgSrc);
+				std::fprintf(fp, "authored count=%ld\n", (long)dbgAuthCount);
+				std::fprintf(fp, "auth FIRST  (%.1f,%.1f) tan(%.3f,%.3f)\n",
+							 dbgAuthFirst.x, dbgAuthFirst.y, dbgAuthFirst.tx, dbgAuthFirst.ty);
+				std::fprintf(fp, "auth SECOND (%.1f,%.1f)  dir(second-first)=(%.3f,%.3f)\n",
+							 dbgAuthSecond.x, dbgAuthSecond.y,
+							 dbgAuthSecond.x - dbgAuthFirst.x, dbgAuthSecond.y - dbgAuthFirst.y);
+				std::fprintf(fp, "auth PREV   (%.1f,%.1f)  dir(last-prev)=(%.3f,%.3f)\n",
+							 dbgAuthPrev.x, dbgAuthPrev.y,
+							 dbgAuthLast.x - dbgAuthPrev.x, dbgAuthLast.y - dbgAuthPrev.y);
+				std::fprintf(fp, "auth LAST   (%.1f,%.1f) tan(%.3f,%.3f)\n",
+							 dbgAuthLast.x, dbgAuthLast.y, dbgAuthLast.tx, dbgAuthLast.ty);
+				std::fprintf(fp, "-- after extend: count=%ld --\n",
+							 (long)samplesP->size());
+				std::fprintf(fp, "ext  FIRST  (%.1f,%.1f)  <- start extension target\n",
+							 samplesP->front().x, samplesP->front().y);
+				std::fprintf(fp, "ext  LAST   (%.1f,%.1f)  <- end extension target\n",
+							 samplesP->back().x, samplesP->back().y);
+				std::fclose(fp);
+			}
+		}
+		// --- END TEMP DEBUG DUMP ---
 	}
 
 	paramsP->pathSamples = samplesP->data();

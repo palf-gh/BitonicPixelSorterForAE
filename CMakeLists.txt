@@ -204,7 +204,10 @@ if(BPS_HLSL_AVAILABLE)
 		"SortDomain|BitonicSortDomain"
 		"ApplyDomain|BitonicApplyDomain"
 		"CopyInput|BitonicCopyInput"
-		"SortMapped|BitonicSortMapped")
+		"SortMapped|BitonicSortMapped"
+		"BuildPathClassifyCount|BitonicBuildPathClassifyCount"
+		"BuildPathScatterRecords|BitonicBuildPathScatterRecords"
+		"BuildPathSortRecords|BitonicBuildPathSortRecords")
 
 	set(BPS_DIRECTX_SHADER_HEADERS "")
 	foreach(entry ${BPS_DIRECTX_SHADER_ENTRIES})

@@ -28,13 +28,42 @@ inline A_long BPS_ClampLong(A_long value, A_long lo, A_long hi)
 	return value < lo ? lo : (value > hi ? hi : value);
 }
 
+// PF_InData width/height are full-resolution layer size (not downsampled).
+// SmartFX checkout rects, GPU buffers and path samples after downsample live in
+// current render space — use these helpers for that space.
+inline A_long BPS_RenderWidth(const PF_InData *in_data)
+{
+	if (!in_data || in_data->width <= 0) {
+		return 0;
+	}
+	const PF_RationalScale &s = in_data->downsample_x;
+	if (s.num <= 0 || s.den <= 0) {
+		return in_data->width;
+	}
+	return static_cast<A_long>(
+		(static_cast<long long>(in_data->width) * s.num) / s.den);
+}
+
+inline A_long BPS_RenderHeight(const PF_InData *in_data)
+{
+	if (!in_data || in_data->height <= 0) {
+		return 0;
+	}
+	const PF_RationalScale &s = in_data->downsample_y;
+	if (s.num <= 0 || s.den <= 0) {
+		return in_data->height;
+	}
+	return static_cast<A_long>(
+		(static_cast<long long>(in_data->height) * s.num) / s.den);
+}
+
 inline PF_LRect BPS_FrameRect(const PF_InData *in_data)
 {
 	PF_LRect rect;
 	rect.left = 0;
 	rect.top = 0;
-	rect.right = in_data ? in_data->width : 0;
-	rect.bottom = in_data ? in_data->height : 0;
+	rect.right = BPS_RenderWidth(in_data);
+	rect.bottom = BPS_RenderHeight(in_data);
 	return rect;
 }
 
@@ -45,10 +74,12 @@ inline PF_LRect BPS_ClipRectToFrame(PF_LRect rect, const PF_InData *in_data)
 		return rect;
 	}
 
-	rect.left = BPS_ClampLong(rect.left, 0, in_data->width);
-	rect.right = BPS_ClampLong(rect.right, 0, in_data->width);
-	rect.top = BPS_ClampLong(rect.top, 0, in_data->height);
-	rect.bottom = BPS_ClampLong(rect.bottom, 0, in_data->height);
+	const A_long frame_w = BPS_RenderWidth(in_data);
+	const A_long frame_h = BPS_RenderHeight(in_data);
+	rect.left = BPS_ClampLong(rect.left, 0, frame_w);
+	rect.right = BPS_ClampLong(rect.right, 0, frame_w);
+	rect.top = BPS_ClampLong(rect.top, 0, frame_h);
+	rect.bottom = BPS_ClampLong(rect.bottom, 0, frame_h);
 	if (rect.right < rect.left) {
 		rect.right = rect.left;
 	}
@@ -60,11 +91,15 @@ inline PF_LRect BPS_ClipRectToFrame(PF_LRect rect, const PF_InData *in_data)
 
 inline bool BPS_IsFullFrameRequest(const PF_LRect &rect, const PF_InData *in_data)
 {
-	return in_data &&
-		   rect.left <= 0 &&
+	if (!in_data) {
+		return false;
+	}
+	const A_long frame_w = BPS_RenderWidth(in_data);
+	const A_long frame_h = BPS_RenderHeight(in_data);
+	return rect.left <= 0 &&
 		   rect.top <= 0 &&
-		   rect.right >= in_data->width &&
-		   rect.bottom >= in_data->height;
+		   rect.right >= frame_w &&
+		   rect.bottom >= frame_h;
 }
 
 void BPS_RecordHostVersion(const char *host_version);

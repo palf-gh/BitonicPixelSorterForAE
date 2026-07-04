@@ -71,6 +71,18 @@ struct BitonicSortParams {
 	int height;
 	int inputOriginX;
 	int inputOriginY;
+	int inputWidth;
+	int inputHeight;
+	int criterionPitch;
+	int criterionOriginX;
+	int criterionOriginY;
+	int criterionWidth;
+	int criterionHeight;
+	int triggerPitch;
+	int triggerOriginX;
+	int triggerOriginY;
+	int triggerWidth;
+	int triggerHeight;
 	int outputOriginX;
 	int outputOriginY;
 	int outputWidth;
@@ -97,6 +109,8 @@ struct BitonicSortParams {
 	float swirlK;
 	int   swirlLineMin;
 	int   pathDirection;
+	int   pathClosed;
+	float pathLength;
 	int   pathSMin;
 	int   pathNMin;
 	int   pathSampleCount;
@@ -178,6 +192,71 @@ inline bool bps_is_affected(float triggerKey, float thresholdMin, float threshol
 	return affect == BPS_AFFECT_OUTSIDE_THRESHOLDS ? !inside : inside;
 }
 
+struct BpsKeySource {
+	device const float4 *tex;
+	int pitch;
+	int originX;
+	int originY;
+	int width;
+	int height;
+};
+
+inline bool bps_key_in_world(BpsKeySource src, int x, int y)
+{
+	return x >= src.originX && y >= src.originY &&
+		   x < src.originX + src.width && y < src.originY + src.height;
+}
+
+inline float bps_sample_key(BpsKeySource src, int x, int y, int keyCriterion)
+{
+	if (!bps_key_in_world(src, x, y)) {
+		return -1.0f;
+	}
+	const uint idx = (uint)((x - src.originX) + (y - src.originY) * src.pitch);
+	return bps_sort_key(src.tex[idx], keyCriterion);
+}
+
+inline float bps_sample_key_from_src_index(
+	BpsKeySource src,
+	int srcPitch,
+	int inputOriginX,
+	int inputOriginY,
+	uint srcIndex,
+	int keyCriterion)
+{
+	if (srcIndex == 0xffffffffu) {
+		return -1.0f;
+	}
+	const int x = (int)(srcIndex % (uint)srcPitch) + inputOriginX;
+	const int y = (int)(srcIndex / (uint)srcPitch) + inputOriginY;
+	return bps_sample_key(src, x, y, keyCriterion);
+}
+
+inline BpsKeySource bps_criterion_src(device const float4 *tex, constant BitonicSortParams &p)
+{
+	BpsKeySource src;
+	src.tex = tex;
+	src.pitch = p.criterionPitch;
+	src.originX = p.criterionOriginX;
+	src.originY = p.criterionOriginY;
+	src.width = p.criterionWidth;
+	src.height = p.criterionHeight;
+	return src;
+}
+
+inline BpsKeySource bps_trigger_src(device const float4 *tex, constant BitonicSortParams &p)
+{
+	BpsKeySource src;
+	src.tex = tex;
+	src.pitch = p.triggerPitch;
+	src.originX = p.triggerOriginX;
+	src.originY = p.triggerOriginY;
+	src.width = p.triggerWidth;
+	src.height = p.triggerHeight;
+	return src;
+}
+
+
 inline uint bps_cycle_shift(uint count, float cycleDegrees)
 {
 	if (count <= 1u) return 0u;
@@ -205,6 +284,14 @@ inline bool bps_before(float keyA, uint indexA, float keyB, uint indexB)
 	if (keyA < keyB) return true;
 	if (keyA > keyB) return false;
 	return indexA < indexB;
+}
+
+inline bool bps_record_before(const BpsMappedPixelRecordGpu a,
+							  const BpsMappedPixelRecordGpu b)
+{
+	if (a.posKey < b.posKey) return true;
+	if (a.posKey > b.posKey) return false;
+	return a.pixelIndex < b.pixelIndex;
 }
 
 inline int bps_round_to_int(float value)
@@ -298,6 +385,45 @@ inline bool bps_path_closest(device const BpsPathSampleGpu *samples, int sampleC
 	return true;
 }
 
+inline float bps_wrap_arc_length(float s, float length)
+{
+	if (length <= 1.0e-6f) return s;
+	float w = fmod(s, length);
+	if (w < 0.0f) w += length;
+	return w;
+}
+
+inline bool bps_path_lane_order(constant BitonicSortParams &p,
+								float s, float n,
+								thread int *lineP,
+								thread float *orderP)
+{
+	const bool closed = (p.pathClosed != 0) && p.pathLength > 1.0e-6f;
+	const float sLocal = closed ? bps_wrap_arc_length(s, p.pathLength) : s;
+	int line = 0;
+	float order = 0.0f;
+	if (p.pathDirection == BPS_PATH_DIR_TANGENT) {
+		line = bps_round_to_int(n) - p.pathNMin;
+		order = sLocal;
+	} else {
+		if (closed) {
+			const int bins = p.lineCount > 0 ? p.lineCount : 1;
+			int q = bps_round_to_int(sLocal) % bins;
+			if (q < 0) q += bins;
+			line = q;
+		} else {
+			line = bps_round_to_int(s) - p.pathSMin;
+		}
+		order = n;
+	}
+	if (line < 0 || line >= p.lineCount) {
+		return false;
+	}
+	*lineP = line;
+	*orderP = order;
+	return true;
+}
+
 inline uint bps_line_size(constant BitonicSortParams &p, uint gid)
 {
 	if (p.mode == BPS_MODE_FREE_ANGLE) return (uint)p.freeLineLength;
@@ -371,7 +497,7 @@ inline bool bps_coord_for_pos(constant BitonicSortParams &p,
 inline bool bps_src_in_world(constant BitonicSortParams &p, int x, int y)
 {
 	return x >= p.inputOriginX && y >= p.inputOriginY &&
-		x < p.inputOriginX + p.width && y < p.inputOriginY + p.height;
+		x < p.inputOriginX + p.inputWidth && y < p.inputOriginY + p.inputHeight;
 }
 
 inline bool bps_dst_in_world(constant BitonicSortParams &p, int x, int y)
@@ -476,8 +602,10 @@ inline bool bps_domain_pos_for_pixel(constant BitonicSortParams &p,
 kernel void BitonicSortKernel(
 	device const float4       *srcTex  [[buffer(0)]],
 	device float4             *sortTex [[buffer(1)]],
-	constant BitonicSortParams &p      [[buffer(2)]],
-	device const BpsPathSampleGpu *pathSamples [[buffer(3)]],
+	device const float4       *criterionTex [[buffer(2)]],
+	device const float4       *triggerTex [[buffer(3)]],
+	constant BitonicSortParams &p      [[buffer(4)]],
+	device const BpsPathSampleGpu *pathSamples [[buffer(5)]],
 	uint gid  [[threadgroup_position_in_grid]],
 	uint gtid [[thread_position_in_threadgroup]])
 {
@@ -496,13 +624,16 @@ kernel void BitonicSortKernel(
 		return;
 	}
 
-	// Copy source pixels that belong to this line's output range.
+	// Always write every destination pixel. Partial input worlds (common with
+	// alpha / adjustment layers) must not leave stale frame data behind.
 	for (uint pos = gtid; pos < size; pos += MAX_THREADS) {
 		int x = 0;
 		int y = 0;
 		if (bps_coord_for_pos(p, pathSamples, gid, pos, &x, &y) &&
-			bps_src_in_world(p, x, y) && bps_dst_in_world(p, x, y)) {
-			sortTex[bps_dst_index_xy(p, x, y)] = srcTex[bps_src_index_xy(p, x, y)];
+			bps_dst_in_world(p, x, y)) {
+			sortTex[bps_dst_index_xy(p, x, y)] = bps_src_in_world(p, x, y)
+				? srcTex[bps_src_index_xy(p, x, y)]
+				: float4(0.0f, 0.0f, 0.0f, 0.0f);
 		}
 	}
 	threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -518,7 +649,7 @@ kernel void BitonicSortKernel(
 				int y = 0;
 				if (bps_coord_for_pos(p, pathSamples, gid, spanStart, &x, &y) &&
 					bps_src_in_world(p, x, y)) {
-					float br = bps_sort_key(srcTex[bps_src_index_xy(p, x, y)], p.trigger);
+					float br = bps_sample_key(bps_trigger_src(triggerTex, p), x, y, p.trigger);
 					if (bps_is_affected(br, p.thresholdMin, p.thresholdMax, p.affect)) break;
 				}
 				spanStart++;
@@ -530,7 +661,7 @@ kernel void BitonicSortKernel(
 				int y = 0;
 				if (!bps_coord_for_pos(p, pathSamples, gid, spanEnd, &x, &y) ||
 					!bps_src_in_world(p, x, y)) break;
-				float br = bps_sort_key(srcTex[bps_src_index_xy(p, x, y)], p.trigger);
+				float br = bps_sample_key(bps_trigger_src(triggerTex, p), x, y, p.trigger);
 				if (!bps_is_affected(br, p.thresholdMin, p.thresholdMax, p.affect)) break;
 				spanEnd++;
 			}
@@ -566,7 +697,7 @@ kernel void BitonicSortKernel(
 					bps_src_in_world(p, x, y);
 				const uint srcIndex = valid ? bps_src_index_xy(p, x, y) : 0xffffffffu;
 				scratchKey[i] = valid
-					? bps_sort_key(srcTex[srcIndex], p.criterion)
+					? bps_sample_key(bps_criterion_src(criterionTex, p), x, y, p.criterion)
 					: (ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX);
 				scratchIndex[i] = srcIndex;
 			} else {
@@ -621,10 +752,12 @@ kernel void BitonicSortKernel(
 
 kernel void BitonicSortDomainKernel(
 	device const float4       *srcTex  [[buffer(0)]],
-	device uint               *domain  [[buffer(1)]],
-	device float              *keys    [[buffer(2)]],
-	constant BitonicSortParams &p      [[buffer(3)]],
-	device const BpsPathSampleGpu *pathSamples [[buffer(4)]],
+	device const float4       *criterionTex [[buffer(1)]],
+	device const float4       *triggerTex [[buffer(2)]],
+	device uint               *domain  [[buffer(3)]],
+	device float              *keys    [[buffer(4)]],
+	constant BitonicSortParams &p      [[buffer(5)]],
+	device const BpsPathSampleGpu *pathSamples [[buffer(6)]],
 	uint gid  [[threadgroup_position_in_grid]],
 	uint gtid [[thread_position_in_threadgroup]])
 {
@@ -671,7 +804,7 @@ kernel void BitonicSortDomainKernel(
 			while (runStart < pathLen) {
 				const uint pos = as_type<uint>(keys[(uint)((int)gid * stride + (int)runStart)]);
 				const uint srcIndex = domain[(uint)((int)gid * stride + (int)pos)];
-				const float br = bps_sort_key(srcTex[srcIndex], p.trigger);
+				const float br = bps_sample_key_from_src_index(bps_trigger_src(triggerTex, p), p.srcPitch, p.inputOriginX, p.inputOriginY, srcIndex, p.trigger);
 				if (bps_is_affected(br, p.thresholdMin, p.thresholdMax, p.affect)) break;
 				runStart++;
 			}
@@ -679,7 +812,7 @@ kernel void BitonicSortDomainKernel(
 			while (runEnd < pathLen) {
 				const uint pos = as_type<uint>(keys[(uint)((int)gid * stride + (int)runEnd)]);
 				const uint srcIndex = domain[(uint)((int)gid * stride + (int)pos)];
-				const float br = bps_sort_key(srcTex[srcIndex], p.trigger);
+				const float br = bps_sample_key_from_src_index(bps_trigger_src(triggerTex, p), p.srcPitch, p.inputOriginX, p.inputOriginY, srcIndex, p.trigger);
 				if (!bps_is_affected(br, p.thresholdMin, p.thresholdMax, p.affect)) break;
 				runEnd++;
 			}
@@ -707,7 +840,7 @@ kernel void BitonicSortDomainKernel(
 					keys[(uint)((int)gid * stride + (int)(runStart + i))]);
 				const uint srcIndex = domain[(uint)((int)gid * stride + (int)pos)];
 				domain[work] = srcIndex;
-				keys[work] = bps_sort_key(srcTex[srcIndex], p.criterion);
+				keys[work] = bps_sample_key_from_src_index(bps_criterion_src(criterionTex, p), p.srcPitch, p.inputOriginX, p.inputOriginY, srcIndex, p.criterion);
 			} else {
 				domain[work] = 0xffffffffu;
 				keys[work] = ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX;
@@ -819,15 +952,132 @@ kernel void BitonicCopyInputKernel(
 	sortTex[dstIndex] = pixel;
 }
 
+kernel void BitonicBuildPathClassifyCountKernel(
+	device const BpsPathSampleGpu *pathSamples [[buffer(0)]],
+	device int               *laneOf     [[buffer(1)]],
+	device float             *keyOf      [[buffer(2)]],
+	device atomic_uint       *laneCounts [[buffer(3)]],
+	constant BitonicSortParams &p        [[buffer(4)]],
+	uint2 gid [[thread_position_in_grid]])
+{
+	const int x = (int)gid.x;
+	const int y = (int)gid.y;
+	if (x >= p.width || y >= p.height) {
+		return;
+	}
+
+	const uint pidx = (uint)(y * p.width + x);
+	laneOf[pidx] = -1;
+
+	float s = 0.0f;
+	float n = 0.0f;
+	if (!bps_path_closest(pathSamples, p.pathSampleCount, (float)x, (float)y, &s, &n)) {
+		return;
+	}
+
+	int lane = 0;
+	float order = 0.0f;
+	if (!bps_path_lane_order(p, s, n, &lane, &order)) {
+		return;
+	}
+	laneOf[pidx] = lane;
+	keyOf[pidx] = order;
+	atomic_fetch_add_explicit(&laneCounts[lane], 1u, memory_order_relaxed);
+}
+
+kernel void BitonicBuildPathScatterRecordsKernel(
+	device const int         *laneOf      [[buffer(0)]],
+	device const float       *keyOf       [[buffer(1)]],
+	device atomic_uint       *laneCursors [[buffer(2)]],
+	device BpsMappedPixelRecordGpu *records [[buffer(3)]],
+	constant BitonicSortParams &p         [[buffer(4)]],
+	uint2 gid [[thread_position_in_grid]])
+{
+	const int x = (int)gid.x;
+	const int y = (int)gid.y;
+	if (x >= p.width || y >= p.height) {
+		return;
+	}
+
+	const uint pidx = (uint)(y * p.width + x);
+	const int lane = laneOf[pidx];
+	if (lane < 0) {
+		return;
+	}
+	const uint dst = atomic_fetch_add_explicit(
+		&laneCursors[lane], 1u, memory_order_relaxed);
+	records[dst].posKey = keyOf[pidx];
+	records[dst].pixelIndex = pidx;
+}
+
+kernel void BitonicBuildPathSortRecordsKernel(
+	device BpsMappedPixelRecordGpu *records [[buffer(0)]],
+	device BpsMappedPixelRecordGpu *workRecords [[buffer(1)]],
+	device const uint         *lineOffsets [[buffer(2)]],
+	device const uint         *workOffsets [[buffer(3)]],
+	constant BitonicSortParams &p          [[buffer(4)]],
+	uint mapLine [[threadgroup_position_in_grid]],
+	uint gtid [[thread_position_in_threadgroup]])
+{
+	if ((int)mapLine >= p.lineCount) {
+		return;
+	}
+	const uint begin = lineOffsets[mapLine];
+	const uint end = lineOffsets[mapLine + 1u];
+	const uint lineSize = end - begin;
+	if (lineSize <= 1u) {
+		return;
+	}
+
+	const uint sortSize = bps_next_pow2(lineSize);
+	const uint sortBase = workOffsets[mapLine] + lineSize;
+	for (uint i = gtid; i < sortSize; i += MAX_THREADS) {
+		if (i < lineSize) {
+			workRecords[sortBase + i] = records[begin + i];
+		} else {
+			workRecords[sortBase + i].posKey = BPS_FLOAT_MAX;
+			workRecords[sortBase + i].pixelIndex = 0xffffffffu;
+		}
+	}
+	threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+	for (uint k = 2u; k <= sortSize; k <<= 1) {
+		for (uint j = k >> 1; j > 0u; j >>= 1) {
+			for (uint i = gtid; i < sortSize; i += MAX_THREADS) {
+				const uint partner = i ^ j;
+				if (partner > i) {
+					const uint slotA = sortBase + i;
+					const uint slotB = sortBase + partner;
+					const BpsMappedPixelRecordGpu a = workRecords[slotA];
+					const BpsMappedPixelRecordGpu b = workRecords[slotB];
+					const bool stageAscending = (i & k) == 0u;
+					const bool before = bps_record_before(a, b);
+					if (before != stageAscending) {
+						workRecords[slotA] = b;
+						workRecords[slotB] = a;
+					}
+				}
+			}
+			threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+		}
+	}
+
+	for (uint i = gtid; i < lineSize; i += MAX_THREADS) {
+		records[begin + i] = workRecords[sortBase + i];
+	}
+}
+
 kernel void BitonicSortMappedKernel(
 	device const float4       *srcTex  [[buffer(0)]],
 	device float4             *sortTex [[buffer(1)]],
-	device uint               *domain  [[buffer(2)]],
-	device float              *keys    [[buffer(3)]],
-	constant BitonicSortParams &p      [[buffer(4)]],
-	device const BpsMappedPixelRecordGpu *records [[buffer(5)]],
-	device const uint         *lineOffsets [[buffer(6)]],
-	device const uint         *workOffsets [[buffer(7)]],
+	device const float4       *criterionTex [[buffer(2)]],
+	device const float4       *triggerTex [[buffer(3)]],
+	device uint               *domain  [[buffer(4)]],
+	device float              *keys    [[buffer(5)]],
+	constant BitonicSortParams &p      [[buffer(6)]],
+	device const BpsMappedPixelRecordGpu *records [[buffer(7)]],
+	device const uint         *lineOffsets [[buffer(8)]],
+	device const uint         *workOffsets [[buffer(9)]],
 	uint mappedLine [[threadgroup_position_in_grid]],
 	uint gtid [[thread_position_in_threadgroup]])
 {
@@ -867,7 +1117,7 @@ kernel void BitonicSortMappedKernel(
 			while (runStart < lineSize) {
 				const uint srcIndex = domain[workBase + runStart];
 				if (srcIndex != 0xffffffffu) {
-					const float br = bps_sort_key(srcTex[srcIndex], p.trigger);
+					const float br = bps_sample_key_from_src_index(bps_trigger_src(triggerTex, p), p.srcPitch, p.inputOriginX, p.inputOriginY, srcIndex, p.trigger);
 					if (bps_is_affected(br, p.thresholdMin, p.thresholdMax, p.affect)) break;
 				}
 				runStart++;
@@ -876,7 +1126,7 @@ kernel void BitonicSortMappedKernel(
 			while (runEnd < lineSize) {
 				const uint srcIndex = domain[workBase + runEnd];
 				if (srcIndex == 0xffffffffu) break;
-				const float br = bps_sort_key(srcTex[srcIndex], p.trigger);
+				const float br = bps_sample_key_from_src_index(bps_trigger_src(triggerTex, p), p.srcPitch, p.inputOriginX, p.inputOriginY, srcIndex, p.trigger);
 				if (!bps_is_affected(br, p.thresholdMin, p.thresholdMax, p.affect)) break;
 				runEnd++;
 			}
@@ -900,7 +1150,7 @@ kernel void BitonicSortMappedKernel(
 			if (i < spanSize) {
 				const uint srcIndex = domain[workBase + runStart + i];
 				domain[sortBase + i] = srcIndex;
-				keys[sortBase + i] = bps_sort_key(srcTex[srcIndex], p.criterion);
+				keys[sortBase + i] = bps_sample_key_from_src_index(bps_criterion_src(criterionTex, p), p.srcPitch, p.inputOriginX, p.inputOriginY, srcIndex, p.criterion);
 			} else {
 				domain[sortBase + i] = 0xffffffffu;
 				keys[sortBase + i] = ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX;

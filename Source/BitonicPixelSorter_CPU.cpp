@@ -11,6 +11,7 @@
 */
 
 #include "BitonicPixelSorter.h"
+#include "BitonicPixelSorter_GpuEligibility.h"
 #include "BitonicPixelSorter_PathGeometry.h"
 
 #include <algorithm>
@@ -103,6 +104,16 @@ inline float SortKeyUnit(const PF_Pixel16 &p, A_long criterion) {
 
 inline float SortKeyUnit(const PF_PixelFloat &p, A_long criterion) {
 	return SortKey(p.red, p.green, p.blue, p.alpha, criterion);
+}
+
+// Sample a sort/trigger key from an optional source world at layer coordinates.
+// Out-of-bounds samples return -1 so threshold runs treat them as unaffected.
+template <typename T>
+inline float SampleKeyAt(PF_EffectWorld *worldP, A_long x, A_long y, A_long keyCriterion) {
+	if (!worldP || !ContainsLayerPoint(worldP, x, y)) {
+		return -1.0f;
+	}
+	return SortKeyUnit(*PixelAtLayer<T>(worldP, x, y), keyCriterion);
 }
 
 template <typename T>
@@ -493,6 +504,7 @@ inline bool GenericDomainPosForPixel(const BitonicSorterParams &prm,
 // honoured for both input dependency data and output writes.
 template <typename T>
 static void SortLines(PF_EffectWorld *inP, PF_EffectWorld *outP,
+					  PF_EffectWorld *criterionP, PF_EffectWorld *triggerP,
 					  const BitonicSorterParams &prm,
 					  A_long frameW,
 					  A_long frameH) {
@@ -549,8 +561,8 @@ static void SortLines(PF_EffectWorld *inP, PF_EffectWorld *outP,
 					const T pixel = *PixelAtLayer<T>(inP, x, y);
 					scratch.sourceLine[index] = pixel;
 					scratch.sortedLine[index] = pixel;
-					scratch.keys[index] = SortKeyUnit(pixel, criterion);
-					scratch.triggerKeys[index] = SortKeyUnit(pixel, trigger);
+					scratch.keys[index] = SampleKeyAt<T>(criterionP, x, y, criterion);
+					scratch.triggerKeys[index] = SampleKeyAt<T>(triggerP, x, y, trigger);
 					scratch.validLine[index] = 1;
 				} else {
 					scratch.sourceLine[index] = T{};
@@ -640,6 +652,7 @@ static void CopyInputToOutputRect(PF_EffectWorld *inP, PF_EffectWorld *outP) {
 
 template <typename T>
 static void SortMappedPixels(PF_EffectWorld *inP, PF_EffectWorld *outP,
+							 PF_EffectWorld *criterionP, PF_EffectWorld *triggerP,
 							 const BitonicSorterParams &prm,
 							 A_long frameW,
 							 A_long frameH) {
@@ -681,8 +694,8 @@ static void SortMappedPixels(PF_EffectWorld *inP, PF_EffectWorld *outP,
 				const T pixel = *PixelAtLayer<T>(inP, x, y);
 				scratch.sourceLine[i] = pixel;
 				scratch.sortedLine[i] = pixel;
-				scratch.keys[i] = SortKeyUnit(pixel, criterion);
-				scratch.triggerKeys[i] = SortKeyUnit(pixel, trigger);
+				scratch.keys[i] = SampleKeyAt<T>(criterionP, x, y, criterion);
+				scratch.triggerKeys[i] = SampleKeyAt<T>(triggerP, x, y, trigger);
 				scratch.validLine[i] = 1u;
 			} else {
 				scratch.sourceLine[i] = T{};
@@ -731,6 +744,7 @@ static void SortMappedPixels(PF_EffectWorld *inP, PF_EffectWorld *outP,
 
 template <typename T>
 static void SortGenericPaths(PF_EffectWorld *inP, PF_EffectWorld *outP,
+							 PF_EffectWorld *criterionP, PF_EffectWorld *triggerP,
 							 const BitonicSorterParams &prm,
 							 A_long frameW,
 							 A_long frameH) {
@@ -807,8 +821,10 @@ static void SortGenericPaths(PF_EffectWorld *inP, PF_EffectWorld *outP,
 				const T pixel = *PixelAtLayer<T>(inP, coord.x, coord.y);
 				scratch.sourceLine[index] = pixel;
 				scratch.sortedLine[index] = pixel;
-				scratch.keys[index] = SortKeyUnit(pixel, criterion);
-				scratch.triggerKeys[index] = SortKeyUnit(pixel, trigger);
+				scratch.keys[index] =
+					SampleKeyAt<T>(criterionP, coord.x, coord.y, criterion);
+				scratch.triggerKeys[index] =
+					SampleKeyAt<T>(triggerP, coord.x, coord.y, trigger);
 				scratch.validLine[index] = 1u;
 			} else {
 				scratch.sourceLine[index] = T{};
@@ -878,47 +894,65 @@ PF_Err BPS_SortImageCPU(
 	PF_PixelFormat		pixel_format,
 	PF_EffectWorld		*input_worldP,
 	PF_EffectWorld		*output_worldP,
+	PF_EffectWorld		*criterion_worldP,
+	PF_EffectWorld		*trigger_worldP,
 	const BitonicSorterParams *paramsP)
 {
 	if (!input_worldP || !output_worldP || !paramsP) {
 		return PF_Err_BAD_CALLBACK_PARAM;
 	}
 
+	if (!criterion_worldP) {
+		criterion_worldP = input_worldP;
+	}
+	if (!trigger_worldP) {
+		trigger_worldP = input_worldP;
+	}
+
 	switch (pixel_format) {
 	case PF_PixelFormat_ARGB128:
 		if (paramsP->mode == BPS_MODE_AXIS) {
-			SortLines<PF_PixelFloat>(input_worldP, output_worldP, *paramsP,
-									  in_data->width, in_data->height);
+			SortLines<PF_PixelFloat>(input_worldP, output_worldP,
+									  criterion_worldP, trigger_worldP, *paramsP,
+									  BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
 		} else if (paramsP->mode == BPS_MODE_PATH) {
-			SortMappedPixels<PF_PixelFloat>(input_worldP, output_worldP, *paramsP,
-											in_data->width, in_data->height);
+			SortMappedPixels<PF_PixelFloat>(input_worldP, output_worldP,
+											criterion_worldP, trigger_worldP, *paramsP,
+											BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
 		} else {
-			SortGenericPaths<PF_PixelFloat>(input_worldP, output_worldP, *paramsP,
-											in_data->width, in_data->height);
+			SortGenericPaths<PF_PixelFloat>(input_worldP, output_worldP,
+											criterion_worldP, trigger_worldP, *paramsP,
+											BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
 		}
 		break;
 	case PF_PixelFormat_ARGB64:
 		if (paramsP->mode == BPS_MODE_AXIS) {
-			SortLines<PF_Pixel16>(input_worldP, output_worldP, *paramsP,
-								   in_data->width, in_data->height);
+			SortLines<PF_Pixel16>(input_worldP, output_worldP,
+								   criterion_worldP, trigger_worldP, *paramsP,
+								   BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
 		} else if (paramsP->mode == BPS_MODE_PATH) {
-			SortMappedPixels<PF_Pixel16>(input_worldP, output_worldP, *paramsP,
-										 in_data->width, in_data->height);
+			SortMappedPixels<PF_Pixel16>(input_worldP, output_worldP,
+										 criterion_worldP, trigger_worldP, *paramsP,
+										 BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
 		} else {
-			SortGenericPaths<PF_Pixel16>(input_worldP, output_worldP, *paramsP,
-										 in_data->width, in_data->height);
+			SortGenericPaths<PF_Pixel16>(input_worldP, output_worldP,
+										 criterion_worldP, trigger_worldP, *paramsP,
+										 BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
 		}
 		break;
 	case PF_PixelFormat_ARGB32:
 		if (paramsP->mode == BPS_MODE_AXIS) {
-			SortLines<PF_Pixel8>(input_worldP, output_worldP, *paramsP,
-								  in_data->width, in_data->height);
+			SortLines<PF_Pixel8>(input_worldP, output_worldP,
+								  criterion_worldP, trigger_worldP, *paramsP,
+								  BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
 		} else if (paramsP->mode == BPS_MODE_PATH) {
-			SortMappedPixels<PF_Pixel8>(input_worldP, output_worldP, *paramsP,
-										in_data->width, in_data->height);
+			SortMappedPixels<PF_Pixel8>(input_worldP, output_worldP,
+										criterion_worldP, trigger_worldP, *paramsP,
+										BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
 		} else {
-			SortGenericPaths<PF_Pixel8>(input_worldP, output_worldP, *paramsP,
-										in_data->width, in_data->height);
+			SortGenericPaths<PF_Pixel8>(input_worldP, output_worldP,
+										criterion_worldP, trigger_worldP, *paramsP,
+										BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
 		}
 		break;
 	default:

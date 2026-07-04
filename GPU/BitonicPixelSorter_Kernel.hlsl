@@ -45,6 +45,18 @@ cbuffer BitonicParams : register(b0)
 	int height;
 	int inputOriginX;
 	int inputOriginY;
+	int inputWidth;
+	int inputHeight;
+	int criterionPitch;
+	int criterionOriginX;
+	int criterionOriginY;
+	int criterionWidth;
+	int criterionHeight;
+	int triggerPitch;
+	int triggerOriginX;
+	int triggerOriginY;
+	int triggerWidth;
+	int triggerHeight;
 	int outputOriginX;
 	int outputOriginY;
 	int outputWidth;
@@ -71,6 +83,8 @@ cbuffer BitonicParams : register(b0)
 	float swirlK;
 	int swirlLineMin;
 	int pathDirection;
+	int pathClosed;
+	float pathLength;
 	int pathSMin;
 	int pathNMin;
 	int pathSampleCount;
@@ -88,10 +102,13 @@ struct BpsPathSampleGpu
 RWByteAddressBuffer sortTex : register(u0);
 RWByteAddressBuffer keysTex : register(u1);
 RWByteAddressBuffer mappedKeysTex : register(u2);
+RWByteAddressBuffer pathRecordsTex : register(u3);
 ByteAddressBuffer srcTex : register(t0);
-ByteAddressBuffer pathTex : register(t1);
-ByteAddressBuffer domainTex : register(t2);
-ByteAddressBuffer mappedWorkOffsetsTex : register(t3);
+ByteAddressBuffer criterionTex : register(t1);
+ByteAddressBuffer triggerTex : register(t2);
+ByteAddressBuffer pathTex : register(t3);
+ByteAddressBuffer domainTex : register(t4);
+ByteAddressBuffer mappedWorkOffsetsTex : register(t5);
 
 BpsPathSampleGpu LoadPathSample(uint index)
 {
@@ -202,6 +219,65 @@ bool BpsIsAffected(float triggerKey)
 	const bool inside = triggerKey >= thresholdMin && triggerKey <= thresholdMax;
 	return affect == BPS_AFFECT_OUTSIDE_THRESHOLDS ? !inside : inside;
 }
+
+bool CriterionInWorld(int x, int y)
+{
+	return x >= criterionOriginX && y >= criterionOriginY &&
+		x < criterionOriginX + criterionWidth && y < criterionOriginY + criterionHeight;
+}
+
+bool TriggerInWorld(int x, int y)
+{
+	return x >= triggerOriginX && y >= triggerOriginY &&
+		x < triggerOriginX + triggerWidth && y < triggerOriginY + triggerHeight;
+}
+
+uint CriterionIndexXY(int x, int y)
+{
+	return (uint)((x - criterionOriginX) + (y - criterionOriginY) * criterionPitch);
+}
+
+uint TriggerIndexXY(int x, int y)
+{
+	return (uint)((x - triggerOriginX) + (y - triggerOriginY) * triggerPitch);
+}
+
+float SampleCriterionKey(int x, int y)
+{
+	if (!CriterionInWorld(x, y)) {
+		return -1.0f;
+	}
+	return BpsSortKey(LoadPixel(criterionTex, CriterionIndexXY(x, y)), criterion);
+}
+
+float SampleTriggerKey(int x, int y)
+{
+	if (!TriggerInWorld(x, y)) {
+		return -1.0f;
+	}
+	return BpsSortKey(LoadPixel(triggerTex, TriggerIndexXY(x, y)), trigger);
+}
+
+float SampleCriterionKeyFromSrcIndex(uint srcIndex)
+{
+	if (srcIndex == 0xffffffffu) {
+		return -1.0f;
+	}
+	const int x = (int)(srcIndex % (uint)srcPitch) + inputOriginX;
+	const int y = (int)(srcIndex / (uint)srcPitch) + inputOriginY;
+	return SampleCriterionKey(x, y);
+}
+
+float SampleTriggerKeyFromSrcIndex(uint srcIndex)
+{
+	if (srcIndex == 0xffffffffu) {
+		return -1.0f;
+	}
+	const int x = (int)(srcIndex % (uint)srcPitch) + inputOriginX;
+	const int y = (int)(srcIndex / (uint)srcPitch) + inputOriginY;
+	return SampleTriggerKey(x, y);
+}
+
 
 uint BpsCycleShift(uint count)
 {
@@ -344,6 +420,41 @@ bool BpsPathClosest(float px, float py, out float sOut, out float nOut)
 	return true;
 }
 
+float BpsWrapArcLength(float s, float length)
+{
+	if (length <= 1.0e-6f) {
+		return s;
+	}
+	float w = fmod(s, length);
+	if (w < 0.0f) {
+		w += length;
+	}
+	return w;
+}
+
+bool BpsPathLaneOrder(float s, float n, out int laneOut, out float order)
+{
+	const bool closed = pathClosed != 0 && pathLength > 1.0e-6f;
+	const float sLocal = closed ? BpsWrapArcLength(s, pathLength) : s;
+	if (pathDirection == BPS_PATH_DIR_TANGENT) {
+		laneOut = BpsRoundToInt(n) - pathNMin;
+		order = sLocal;
+	} else {
+		if (closed) {
+			const int bins = lineCount > 0 ? lineCount : 1;
+			int q = BpsRoundToInt(sLocal) % bins;
+			if (q < 0) {
+				q += bins;
+			}
+			laneOut = q;
+		} else {
+			laneOut = BpsRoundToInt(s) - pathSMin;
+		}
+		order = n;
+	}
+	return laneOut >= 0 && laneOut < lineCount;
+}
+
 uint BpsLineSize(uint gid)
 {
 	if (mode == BPS_MODE_FREE_ANGLE) {
@@ -425,7 +536,7 @@ bool BpsCoordForPos(uint gid, uint pos, out int x, out int y)
 bool SrcInWorld(int x, int y)
 {
 	return x >= inputOriginX && y >= inputOriginY &&
-		x < inputOriginX + width && y < inputOriginY + height;
+		x < inputOriginX + inputWidth && y < inputOriginY + inputHeight;
 }
 
 bool DstInWorld(int x, int y)
@@ -472,6 +583,34 @@ void StoreFloat(RWByteAddressBuffer buf, uint index, float value)
 float LoadFloat(RWByteAddressBuffer buf, uint index)
 {
 	return asfloat(buf.Load(index * 4u));
+}
+
+void StoreMappedRecord(RWByteAddressBuffer buf, uint index, float posKey, uint pixelIndex)
+{
+	const uint base = index * 8u;
+	buf.Store(base + 0u, asuint(posKey));
+	buf.Store(base + 4u, pixelIndex);
+}
+
+float LoadMappedRecordKey(RWByteAddressBuffer buf, uint index)
+{
+	return asfloat(buf.Load(index * 8u));
+}
+
+uint LoadMappedRecordPixel(RWByteAddressBuffer buf, uint index)
+{
+	return buf.Load(index * 8u + 4u);
+}
+
+bool BpsRecordBefore(float keyA, uint pixelA, float keyB, uint pixelB)
+{
+	if (keyA < keyB) {
+		return true;
+	}
+	if (keyA > keyB) {
+		return false;
+	}
+	return pixelA < pixelB;
 }
 
 bool BpsDomainPosForPixel(int x, int y, out int domainLine, out int domainPos)
@@ -569,7 +708,7 @@ bool BpsDomainPosForPixel(int x, int y, out int domainLine, out int domainPos)
 	return true;
 }
 
-[RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=1)),DescriptorTable(SRV(t0,numDescriptors=2))")]
+[RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=1)),DescriptorTable(SRV(t0,numDescriptors=4))")]
 [numthreads(256, 1, 1)]
 void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 {
@@ -580,11 +719,15 @@ void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 		return;
 	}
 
+	// Always write every destination pixel. Partial input worlds (common with
+	// alpha / adjustment layers) must not leave stale frame data behind.
 	for (uint pos = gtid; pos < size; pos += MAX_THREADS) {
 		int x = 0;
 		int y = 0;
-		if (BpsCoordForPos(gid, pos, x, y) && SrcInWorld(x, y) && DstInWorld(x, y)) {
-			StorePixel(sortTex, DstIndexXY(x, y), LoadPixel(srcTex, SrcIndexXY(x, y)));
+		if (BpsCoordForPos(gid, pos, x, y) && DstInWorld(x, y)) {
+			StorePixel(sortTex, DstIndexXY(x, y),
+				SrcInWorld(x, y) ? LoadPixel(srcTex, SrcIndexXY(x, y))
+								 : float4(0.0f, 0.0f, 0.0f, 0.0f));
 		}
 	}
 	GroupMemoryBarrierWithGroupSync();
@@ -597,7 +740,7 @@ void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 				int x = 0;
 				int y = 0;
 				if (BpsCoordForPos(gid, spanStart, x, y) && SrcInWorld(x, y)) {
-					float br = BpsSortKey(LoadPixel(srcTex, SrcIndexXY(x, y)), trigger);
+					float br = SampleTriggerKey(x, y);
 					if (BpsIsAffected(br)) {
 						break;
 					}
@@ -612,7 +755,7 @@ void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 				if (!BpsCoordForPos(gid, spanEnd, x, y) || !SrcInWorld(x, y)) {
 					break;
 				}
-				float br = BpsSortKey(LoadPixel(srcTex, SrcIndexXY(x, y)), trigger);
+				float br = SampleTriggerKey(x, y);
 				if (!BpsIsAffected(br)) {
 					break;
 				}
@@ -648,7 +791,7 @@ void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 				const bool valid = BpsCoordForPos(gid, pos, x, y) && SrcInWorld(x, y);
 				const uint srcIndex = valid ? SrcIndexXY(x, y) : 0xffffffffu;
 				scratchKey[loadIndex] = valid
-					? BpsSortKey(LoadPixel(srcTex, srcIndex), criterion)
+					? SampleCriterionKey(x, y)
 					: (ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX);
 				scratchIndex[loadIndex] = srcIndex;
 			} else {
@@ -709,7 +852,7 @@ groupshared uint s_spanSize;
 groupshared uint s_sortSize;
 groupshared uint s_pathLen;
 
-[RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=2)),DescriptorTable(SRV(t0,numDescriptors=2))")]
+[RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=2)),DescriptorTable(SRV(t0,numDescriptors=4))")]
 [numthreads(256, 1, 1)]
 void SortDomain(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 {
@@ -748,7 +891,7 @@ void SortDomain(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThread
 			while (runStart < pathLen) {
 				const uint pos = asuint(LoadFloat(keysTex, DomainIndex(gid, runStart)));
 				const uint srcIndex = LoadUintUAV(sortTex, DomainIndex(gid, pos));
-				const float br = BpsSortKey(LoadPixel(srcTex, srcIndex), trigger);
+				const float br = SampleTriggerKeyFromSrcIndex(srcIndex);
 				if (BpsIsAffected(br)) {
 					break;
 				}
@@ -758,7 +901,7 @@ void SortDomain(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThread
 			while (runEnd < pathLen) {
 				const uint pos = asuint(LoadFloat(keysTex, DomainIndex(gid, runEnd)));
 				const uint srcIndex = LoadUintUAV(sortTex, DomainIndex(gid, pos));
-				const float br = BpsSortKey(LoadPixel(srcTex, srcIndex), trigger);
+				const float br = SampleTriggerKeyFromSrcIndex(srcIndex);
 				if (!BpsIsAffected(br)) {
 					break;
 				}
@@ -787,7 +930,7 @@ void SortDomain(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThread
 				const uint pos = asuint(LoadFloat(keysTex, DomainIndex(gid, runStart + loadIndex)));
 				const uint srcIndex = LoadUintUAV(sortTex, DomainIndex(gid, pos));
 				StoreUint(sortTex, work, srcIndex);
-				StoreFloat(keysTex, work, BpsSortKey(LoadPixel(srcTex, srcIndex), criterion));
+				StoreFloat(keysTex, work, SampleCriterionKeyFromSrcIndex(srcIndex));
 			} else {
 				StoreUint(sortTex, work, 0xffffffffu);
 				StoreFloat(keysTex, work, ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX);
@@ -841,7 +984,7 @@ void SortDomain(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThread
 }
 
 // Non-axis pass 2: gather via inverse domain lookup.
-[RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=1)),DescriptorTable(SRV(t0,numDescriptors=3))")]
+[RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=1)),DescriptorTable(SRV(t0,numDescriptors=5))")]
 [numthreads(16, 16, 1)]
 void ApplyDomain(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
@@ -895,6 +1038,118 @@ void CopyInput(uint3 dispatchThreadID : SV_DispatchThreadID)
 }
 
 [RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=3)),DescriptorTable(SRV(t0,numDescriptors=4))")]
+[numthreads(16, 16, 1)]
+void BuildPathClassifyCount(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+	const int x = (int)dispatchThreadID.x;
+	const int y = (int)dispatchThreadID.y;
+	if (x >= width || y >= height) {
+		return;
+	}
+
+	const uint pidx = (uint)(y * width + x);
+	sortTex.Store(pidx * 4u, 0xffffffffu);
+
+	float s = 0.0f;
+	float n = 0.0f;
+	if (!BpsPathClosest((float)x, (float)y, s, n)) {
+		return;
+	}
+
+	int lane = 0;
+	float order = 0.0f;
+	if (!BpsPathLaneOrder(s, n, lane, order)) {
+		return;
+	}
+
+	sortTex.Store(pidx * 4u, asuint(lane));
+	keysTex.Store(pidx * 4u, asuint(order));
+	uint ignored = 0u;
+	mappedKeysTex.InterlockedAdd((uint)lane * 4u, 1u, ignored);
+}
+
+[RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=4))")]
+[numthreads(16, 16, 1)]
+void BuildPathScatterRecords(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+	const int x = (int)dispatchThreadID.x;
+	const int y = (int)dispatchThreadID.y;
+	if (x >= width || y >= height) {
+		return;
+	}
+
+	const uint pidx = (uint)(y * width + x);
+	const int lane = asint(sortTex.Load(pidx * 4u));
+	if (lane < 0) {
+		return;
+	}
+
+	uint dst = 0u;
+	mappedKeysTex.InterlockedAdd((uint)lane * 4u, 1u, dst);
+	StoreMappedRecord(pathRecordsTex, dst, asfloat(keysTex.Load(pidx * 4u)), pidx);
+}
+
+[RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=2)),DescriptorTable(SRV(t0,numDescriptors=4))")]
+[numthreads(256, 1, 1)]
+void BuildPathSortRecords(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
+{
+	const uint mapLine = groupID.x;
+	const uint gtid = groupThreadID.x;
+	if ((int)mapLine >= lineCount) {
+		return;
+	}
+
+	const uint begin = LoadUint(srcTex, mapLine);
+	const uint end = LoadUint(srcTex, mapLine + 1u);
+	const uint lineSize = end - begin;
+	if (lineSize <= 1u) {
+		return;
+	}
+
+	const uint sortSize = BpsNextPow2(lineSize);
+	const uint sortBase = LoadUint(pathTex, mapLine) + lineSize;
+	for (uint loadIndex = gtid; loadIndex < sortSize; loadIndex += MAX_THREADS) {
+		if (loadIndex < lineSize) {
+			StoreMappedRecord(keysTex, sortBase + loadIndex,
+				LoadMappedRecordKey(sortTex, begin + loadIndex),
+				LoadMappedRecordPixel(sortTex, begin + loadIndex));
+		} else {
+			StoreMappedRecord(keysTex, sortBase + loadIndex, BPS_FLOAT_MAX, 0xffffffffu);
+		}
+	}
+	AllMemoryBarrierWithGroupSync();
+
+	for (uint k = 2u; k <= sortSize; k <<= 1) {
+		for (uint j = k >> 1; j > 0u; j >>= 1) {
+			for (uint sortIndex = gtid; sortIndex < sortSize; sortIndex += MAX_THREADS) {
+				const uint partner = sortIndex ^ j;
+				if (partner > sortIndex) {
+					const uint slotA = sortBase + sortIndex;
+					const uint slotB = sortBase + partner;
+					const float keyA = LoadMappedRecordKey(keysTex, slotA);
+					const float keyB = LoadMappedRecordKey(keysTex, slotB);
+					const uint pixelA = LoadMappedRecordPixel(keysTex, slotA);
+					const uint pixelB = LoadMappedRecordPixel(keysTex, slotB);
+					const bool stageAscending = (sortIndex & k) == 0u;
+					const bool before = BpsRecordBefore(keyA, pixelA, keyB, pixelB);
+					if (before != stageAscending) {
+						StoreMappedRecord(keysTex, slotA, keyB, pixelB);
+						StoreMappedRecord(keysTex, slotB, keyA, pixelA);
+					}
+				}
+			}
+			AllMemoryBarrierWithGroupSync();
+		}
+	}
+
+	for (uint writeIndex = gtid; writeIndex < lineSize; writeIndex += MAX_THREADS) {
+		StoreMappedRecord(sortTex, begin + writeIndex,
+			LoadMappedRecordKey(keysTex, sortBase + writeIndex),
+			LoadMappedRecordPixel(keysTex, sortBase + writeIndex));
+	}
+}
+
+[RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=3)),DescriptorTable(SRV(t0,numDescriptors=6))")]
 [numthreads(256, 1, 1)]
 void SortMapped(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 {
@@ -930,7 +1185,7 @@ void SortMapped(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThread
 			while (runStart < lineSize) {
 				const uint srcIndex = LoadUintUAV(keysTex, workBase + runStart);
 				if (srcIndex != 0xffffffffu) {
-					const float br = BpsSortKey(LoadPixel(srcTex, srcIndex), trigger);
+					const float br = SampleTriggerKeyFromSrcIndex(srcIndex);
 					if (BpsIsAffected(br)) {
 						break;
 					}
@@ -944,7 +1199,7 @@ void SortMapped(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThread
 				if (srcIndex == 0xffffffffu) {
 					break;
 				}
-				const float br = BpsSortKey(LoadPixel(srcTex, srcIndex), trigger);
+				const float br = SampleTriggerKeyFromSrcIndex(srcIndex);
 				if (!BpsIsAffected(br)) {
 					break;
 				}
@@ -972,7 +1227,7 @@ void SortMapped(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThread
 				const uint srcIndex = LoadUintUAV(keysTex, workBase + runStart + loadIndex);
 				StoreUint(keysTex, sortBase + loadIndex, srcIndex);
 				StoreFloat(mappedKeysTex, sortBase + loadIndex,
-					BpsSortKey(LoadPixel(srcTex, srcIndex), criterion));
+					SampleCriterionKeyFromSrcIndex(srcIndex));
 			} else {
 				StoreUint(keysTex, sortBase + loadIndex, 0xffffffffu);
 				StoreFloat(mappedKeysTex, sortBase + loadIndex,

@@ -40,23 +40,27 @@ validated on Apple Silicon Macs in After Effects 2023 through 2026.
 
 ### Parameters
 
+UI order matches the Effect Controls panel:
+
 | Parameter | Meaning |
 | --- | --- |
+| GPU Acceleration | Read-only status of the Mercury GPU path. |
 | Mode | Axis, Free Angle, Rotation, Radial, Swirl, or Path sorting. |
+| Order | Ascending or descending key order. |
+| Threshold Min | Lower trigger-key bound (percent). |
+| Threshold Max | Upper trigger-key bound (percent). |
+| Sort Trigger | Threshold key: Luminance, RGB Average/Product/Minimum/Maximum, Red, Green, Blue, Alpha, Hue, or Saturation. |
+| Trigger Source Layer | Layer used to evaluate the trigger key (`None` = effect source). |
+| Sort Criterion | Sort key, with the same choices as Sort Trigger. |
+| Criterion Source Layer | Layer used to evaluate the sort key (`None` = effect source). |
+| Affect | Sort pixels inside or outside the threshold range. |
+| Cycle | Cyclic shift applied to each sorted run. |
 | Direction | Horizontal row sort or vertical column sort in Axis mode. |
 | Angle | Free Angle direction. |
 | Centre | Rotation/Radial/Swirl centre point. |
-| Swirl Amount | Twist rate for Swirl mode (radians per pixel of radius). |
-| Swirl Direction | Clockwise or counter-clockwise swirl. |
+| Swirl Amount | Twist amount for Swirl mode (360° = one turn to the farthest frame corner; sign selects direction). |
 | Path | Layer mask path used in Path mode. |
 | Path Direction | Sort along the path normal or tangent. |
-| Sort Criterion | Sort key: Luminance, RGB Average/Product/Minimum/Maximum, Red, Green, Blue, Alpha, Hue, or Saturation. |
-| Sort Trigger | Threshold key, with the same choices as Sort Criterion. |
-| Affect | Sort pixels inside or outside the threshold range. |
-| Cycle | Cyclic shift applied to each sorted run. |
-| Order | Ascending or descending key order. |
-| Threshold Min | Lower trigger-key bound. |
-| Threshold Max | Upper trigger-key bound. |
 
 The default luminance key follows the upstream weights:
 
@@ -64,10 +68,16 @@ The default luminance key follows the upstream weights:
 0.298912 * R + 0.586611 * G + 0.114478 * B
 ```
 
-Swirl is classified as `phase = wrap(theta - signedAmount * radius)`, with
-`Swirl Amount` measured in radians per pixel of radius. `0` therefore uses the
-same line classification as Radial mode, and larger values form Archimedean
-spiral paths while sorting outward by radius.
+Swirl is classified as `phase = wrap(theta - signedAmount * radius)`.
+`Swirl Amount` is an angle control where 360° maps to one full turn at the
+farthest frame corner; the sign selects direction. `0` therefore uses the same
+line classification as Radial mode, and larger values form Archimedean spiral
+paths while sorting outward by radius.
+
+`Criterion Source Layer` and `Trigger Source Layer` default to `None`, which uses
+the effect source. When set to another layer, sort keys and threshold runs are
+evaluated from that layer at the same layer coordinates while pixels are still
+moved from the effect source.
 
 Path mode assigns every output pixel to the nearest segment of the sampled
 polyline. Open path endpoints inside the frame are extended along their tangent
@@ -240,23 +250,27 @@ Apple Silicon Mac 上の After Effects 2023〜2026 で検証済みです。
 
 ### パラメータ
 
+Effect Controls パネルと同じ名前・順番です。
+
 | パラメータ | 説明 |
 | --- | --- |
+| GPUアクセラレーション | Mercury GPU パスの状態（読み取り専用）。 |
 | モード | 軸方向、自由角度、回転、放射、螺旋、パスのソート方式。 |
+| 並び順 | 昇順または降順。 |
+| しきい値（下限） | トリガーキーの下限（パーセント）。 |
+| しきい値（上限） | トリガーキーの上限（パーセント）。 |
+| ソートトリガー | しきい値判定キー。輝度、RGB平均、RGB積、RGB最小、RGB最大、赤チャンネル、緑チャンネル、青チャンネル、アルファチャンネル、色相、彩度。 |
+| トリガーソースレイヤー | トリガーキーを評価するレイヤー（`なし` = エフェクトソース）。 |
+| ソート基準 | 並べ替えキー。選択肢はソートトリガーと同じ。 |
+| 基準ソースレイヤー | ソートキーを評価するレイヤー（`なし` = エフェクトソース）。 |
+| 影響 | しきい値内、またはしきい値外のどちらをソート対象にするか。 |
+| 循環 | ソート後の各 run に適用する循環シフト量。 |
 | 方向 | 軸方向モードでの水平ソート、または垂直ソート。 |
 | 角度 | 自由角度モードのソート方向。 |
 | 中心 | 回転/放射/螺旋モードの中心点。 |
-| 螺旋量 | 螺旋モードの捩れ量（半径 1px あたりのラジアン）。 |
-| 回転方向 | 螺旋の時計回り / 反時計回り。 |
+| 螺旋量 | 螺旋モードの捩れ量（360° = フレーム最遠角までの 1 回転。符号で方向を選択）。 |
 | パス | パスモードで使うレイヤーマスクパス。 |
 | パス方向 | 法線方向またはタンジェント方向にソート。 |
-| ソート基準 | 並べ替えキー。輝度、RGB平均/積/最小/最大、赤、緑、青、アルファ、色相、彩度。 |
-| ソートトリガー | しきい値判定キー。選択肢はソート基準と同じ。 |
-| 影響 | しきい値内、またはしきい値外のどちらをソート対象にするか。 |
-| 循環 | ソート後の各 run に適用する循環シフト量。 |
-| 並び順 | 選択キーの昇順または降順。 |
-| しきい値 Min | トリガーキーの下限。 |
-| しきい値 Max | トリガーキーの上限。 |
 
 既定の輝度キーは上流と同じ重み付けを用います。
 
@@ -264,10 +278,14 @@ Apple Silicon Mac 上の After Effects 2023〜2026 で検証済みです。
 0.298912 * R + 0.586611 * G + 0.114478 * B
 ```
 
-螺旋は `phase = wrap(theta - signedAmount * radius)` として分類され、
-螺旋量は半径 1px あたりのラジアン量です。`0` では放射モードと同じ line
-分類になり、値を大きくすると半径方向に外へ進むアルキメデス螺旋として
-ソートされます。
+螺旋は `phase = wrap(theta - signedAmount * radius)` として分類されます。
+螺旋量は角度コントロールで、360° がフレーム最遠角での 1 回転に対応し、符号で
+方向を選びます。`0` では放射モードと同じ line 分類になり、値を大きくすると
+半径方向に外へ進むアルキメデス螺旋としてソートされます。
+
+基準ソースレイヤーとトリガーソースレイヤーの既定は `なし` で、その場合は
+エフェクトソースを使います。別レイヤーを指定すると、同じレイヤー座標でその
+レイヤーからキーを評価し、動かすピクセルはエフェクトソースのままです。
 
 パスモードでは、全出力画素をサンプリング済み polyline の最近傍セグメントに
 所属させます。端点がフレーム内にあるオープンパスは端点 tangent 方向へ
@@ -431,26 +449,40 @@ Metal 已实现：可编译并链接为通用 `.plugin`，计算内核以运行�
 
 ### 参数
 
+名称与顺序与 Effect Controls 面板一致。
+
 | 参数 | 含义 |
 | --- | --- |
+| GPU 加速 | Mercury GPU 路径状态（只读）。 |
 | 模式 | 轴向、自由角度、旋转、放射、螺旋或路径排序。 |
+| 排序 | 升序或降序。 |
+| 阈值下限 | 触发键下限（百分比）。 |
+| 阈值上限 | 触发键上限（百分比）。 |
+| 排序触发 | 阈值判定键：亮度、RGB平均值、RGB乘积、RGB最小值、RGB最大值、红色通道、绿色通道、蓝色通道、Alpha通道、色相、饱和度。 |
+| 触发源图层 | 用于计算触发键的图层（`无` = 效果源）。 |
+| 排序标准 | 排序键，选项与排序触发相同。 |
+| 标准源图层 | 用于计算排序键的图层（`无` = 效果源）。 |
+| 影响 | 对阈值内或阈值外的像素排序。 |
+| 循环 | 对每个已排序区间应用的循环位移。 |
 | 方向 | 轴向模式下的水平或垂直排序。 |
 | 角度 | 自由角度模式的排序方向。 |
 | 中心 | 旋转/放射/螺旋模式的中心点。 |
-| 螺旋量 | 螺旋模式的扭转量（每像素半径的弧度）。 |
-| 旋转方向 | 顺时针或逆时针螺旋。 |
+| 螺旋量 | 螺旋扭转量（360° = 到画面最远角的一整圈；符号选择方向）。 |
 | 路径 | 路径模式使用的图层蒙版路径。 |
 | 路径方向 | 沿法线或切线方向排序。 |
-| 排序标准 | 亮度、RGB平均值、RGB乘积、RGB最小值或RGB最大值。 |
-| 顺序 | 按所选键升序或降序排列。 |
-| 阈值最小值 | 可排序像素的键下限。 |
-| 阈值最大值 | 可排序像素的键上限。 |
 
 默认亮度键沿用上游权重：
 
 ```text
 0.298912 * R + 0.586611 * G + 0.114478 * B
 ```
+
+螺旋按 `phase = wrap(theta - signedAmount * radius)` 分类。螺旋量是角度控件，
+360° 对应画面最远角处一整圈，符号选择方向。`0` 与放射模式使用相同的 line
+分类；更大的值会形成向外的阿基米德螺旋路径。
+
+标准源图层与触发源图层默认为 `无`，此时使用效果源。指定其他图层时，在相同
+图层坐标上从该图层读取键，移动的像素仍来自效果源。
 
 ### 仓库结构
 
@@ -607,26 +639,42 @@ Metal은 구현되었습니다. 유니버설 `.plugin`으로 컴파일 및 링�
 
 ### 매개변수
 
+이름과 순서는 Effect Controls 패널과 같습니다.
+
 | 매개변수 | 의미 |
 | --- | --- |
+| GPU 가속 | Mercury GPU 경로 상태(읽기 전용). |
 | 모드 | 축 방향, 자유 각도, 회전, 방사, 나선, 패스 정렬. |
+| 정렬 | 오름차순 또는 내림차순. |
+| 임계값 하한 | 트리거 키 하한(퍼센트). |
+| 임계값 상한 | 트리거 키 상한(퍼센트). |
+| 정렬 트리거 | 임계값 판정 키: 휘도, RGB 평균, RGB 곱, RGB 최솟값, RGB 최댓값, 빨강 채널, 초록 채널, 파랑 채널, 알파 채널, 색상, 채도. |
+| 트리거 소스 레이어 | 트리거 키를 평가할 레이어(`없음` = 효과 소스). |
+| 정렬 기준 | 정렬 키. 선택지는 정렬 트리거와 동일. |
+| 기준 소스 레이어 | 정렬 키를 평가할 레이어(`없음` = 효과 소스). |
+| 영향 | 임계값 내부 또는 외부 픽셀을 정렬. |
+| 순환 | 정렬된 각 run에 적용하는 순환 이동량. |
 | 방향 | 축 방향 모드의 수평 또는 수직 정렬. |
 | 각도 | 자유 각도 모드의 정렬 방향. |
 | 중심 | 회전/방사/나선 모드의 중심점. |
-| 나선량 | 나선 모드의 비틀림 양(반지름 1px당 라디안). |
-| 회전 방향 | 시계 방향 또는 반시계 방향 나선. |
+| 나선량 | 나선 비틀림 양(360° = 프레임 최원각까지 한 바퀴, 부호로 방향 선택). |
 | 패스 | 패스 모드에서 사용하는 레이어 마스크 패스. |
 | 패스 방향 | 법선 또는 접선 방향으로 정렬. |
-| 정렬 기준 | 휘도, RGB 평균, RGB 곱, RGB 최솟값, RGB 최댓값. |
-| 정렬 순서 | 선택 키의 오름차순 또는 내림차순. |
-| 임계값 최소 | 정렬 대상 픽셀의 키 하한. |
-| 임계값 최대 | 정렬 대상 픽셀의 키 상한. |
 
 기본 휘도 키는 상류와 동일한 가중치를 사용합니다.
 
 ```text
 0.298912 * R + 0.586611 * G + 0.114478 * B
 ```
+
+나선은 `phase = wrap(theta - signedAmount * radius)` 로 분류됩니다. 나선량은
+각도 컨트롤이며, 360°가 프레임 최원각에서의 한 바퀴에 해당하고 부호로 방향을
+고릅니다. `0`이면 방사 모드와 같은 line 분류를 쓰고, 값이 커지면 바깥으로
+향하는 아르키메데스 나선으로 정렬됩니다.
+
+기준 소스 레이어와 트리거 소스 레이어의 기본값은 `없음`이며, 이때는 효과
+소스를 사용합니다. 다른 레이어를 지정하면 같은 레이어 좌표에서 해당 레이어의
+키를 읽고, 이동하는 픽셀은 효과 소스 그대로입니다.
 
 ### 저장소 구조
 

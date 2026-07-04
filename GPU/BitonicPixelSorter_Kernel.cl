@@ -98,6 +98,47 @@ inline bool bps_is_affected(float triggerKey, float thresholdMin, float threshol
 	return affect == BPS_AFFECT_OUTSIDE_THRESHOLDS ? !inside : inside;
 }
 
+typedef struct BpsKeySource {
+	__global const float4 *tex;
+	int pitch;
+	int originX;
+	int originY;
+	int width;
+	int height;
+} BpsKeySource;
+
+inline bool bps_key_in_world(BpsKeySource src, int x, int y)
+{
+	return x >= src.originX && y >= src.originY &&
+		   x < src.originX + src.width && y < src.originY + src.height;
+}
+
+inline float bps_sample_key(BpsKeySource src, int x, int y, int keyCriterion)
+{
+	if (!bps_key_in_world(src, x, y)) {
+		return -1.0f;
+	}
+	const uint idx = (uint)((x - src.originX) + (y - src.originY) * src.pitch);
+	return bps_sort_key(src.tex[idx], keyCriterion);
+}
+
+inline float bps_sample_key_from_src_index(
+	BpsKeySource src,
+	int srcPitch,
+	int inputOriginX,
+	int inputOriginY,
+	uint srcIndex,
+	int keyCriterion)
+{
+	if (srcIndex == 0xffffffffu) {
+		return -1.0f;
+	}
+	const int x = (int)(srcIndex % (uint)srcPitch) + inputOriginX;
+	const int y = (int)(srcIndex / (uint)srcPitch) + inputOriginY;
+	return bps_sample_key(src, x, y, keyCriterion);
+}
+
+
 inline uint bps_cycle_shift(uint count, float cycleDegrees)
 {
 	if (count <= 1u) return 0u;
@@ -228,6 +269,44 @@ inline bool bps_path_closest(__global const BpsPathSampleGpu *samples, int sampl
 	}
 	*sOut = bestS;
 	*nOut = bestN;
+	return true;
+}
+
+inline float bps_wrap_arc_length(float s, float length)
+{
+	if (length <= 1.0e-6f) return s;
+	float w = fmod(s, length);
+	if (w < 0.0f) w += length;
+	return w;
+}
+
+inline bool bps_path_lane_order(int pathDirection, int pathClosed, float pathLength,
+	int pathSMin, int pathNMin, int lineCount,
+	float s, float n, int *line, float *order)
+{
+	const bool closed = (pathClosed != 0) && pathLength > 1.0e-6f;
+	const float sLocal = closed ? bps_wrap_arc_length(s, pathLength) : s;
+	int lane = 0;
+	float posKey = 0.0f;
+	if (pathDirection == BPS_PATH_DIR_TANGENT) {
+		lane = bps_round_to_int(n) - pathNMin;
+		posKey = sLocal;
+	} else {
+		if (closed) {
+			const int bins = lineCount > 0 ? lineCount : 1;
+			int q = bps_round_to_int(sLocal) % bins;
+			if (q < 0) q += bins;
+			lane = q;
+		} else {
+			lane = bps_round_to_int(s) - pathSMin;
+		}
+		posKey = n;
+	}
+	if (lane < 0 || lane >= lineCount) {
+		return false;
+	}
+	*line = lane;
+	*order = posKey;
 	return true;
 }
 
@@ -402,12 +481,26 @@ inline bool bps_domain_pos_for_pixel(int mode, int x, int y,
 __kernel void BitonicSortKernel(
 	__global const float4 *srcTex,
 	__global float4       *sortTex,
+	__global const float4 *criterionTex,
+	__global const float4 *triggerTex,
+	int                    criterionPitch,
+	int                    criterionOriginX,
+	int                    criterionOriginY,
+	int                    criterionWidth,
+	int                    criterionHeight,
+	int                    triggerPitch,
+	int                    triggerOriginX,
+	int                    triggerOriginY,
+	int                    triggerWidth,
+	int                    triggerHeight,
 	int                    srcPitch,
 	int                    dstPitch,
 	int                    width,
 	int                    height,
 	int                    inputOriginX,
 	int                    inputOriginY,
+	int                    inputWidth,
+	int                    inputHeight,
 	int                    outputOriginX,
 	int                    outputOriginY,
 	int                    outputWidth,
@@ -438,6 +531,21 @@ __kernel void BitonicSortKernel(
 	int                    pathSampleCount,
 	__global const BpsPathSampleGpu *pathSamples)
 {
+
+	BpsKeySource criterionSrc;
+	criterionSrc.tex = criterionTex;
+	criterionSrc.pitch = criterionPitch;
+	criterionSrc.originX = criterionOriginX;
+	criterionSrc.originY = criterionOriginY;
+	criterionSrc.width = criterionWidth;
+	criterionSrc.height = criterionHeight;
+	BpsKeySource triggerSrc;
+	triggerSrc.tex = triggerTex;
+	triggerSrc.pitch = triggerPitch;
+	triggerSrc.originX = triggerOriginX;
+	triggerSrc.originY = triggerOriginY;
+	triggerSrc.width = triggerWidth;
+	triggerSrc.height = triggerHeight;
 	// scratchKey + scratchIndex already use the full 32 KB local-memory budget
 	// guaranteed by the OpenCL spec, so the span metadata reuses scratchIndex[0..3]
 	// rather than dedicated locals. Local-id 0 publishes it; every work-item copies
@@ -456,22 +564,26 @@ __kernel void BitonicSortKernel(
 	}
 
 	#define BPS_SRC_IN_WORLD(x, y) ((x) >= inputOriginX && (y) >= inputOriginY && \
-									(x) < inputOriginX + width && (y) < inputOriginY + height)
+									(x) < inputOriginX + inputWidth && (y) < inputOriginY + inputHeight)
 	#define BPS_DST_IN_WORLD(x, y) ((x) >= outputOriginX && (y) >= outputOriginY && \
 									(x) < outputOriginX + outputWidth && (y) < outputOriginY + outputHeight)
 	#define BPS_SRC_INDEX_XY(x, y) ((uint)(((x) - inputOriginX) + ((y) - inputOriginY) * srcPitch))
 	#define BPS_DST_INDEX_XY(x, y) ((uint)(((x) - outputOriginX) + ((y) - outputOriginY) * dstPitch))
 
+	// Always write every destination pixel. Partial input worlds (common with
+	// alpha / adjustment layers) must not leave stale frame data behind.
 	for (uint pos = gtid; pos < size; pos += MAX_THREADS) {
 		int x = 0, y = 0;
 		if (bps_coord_for_pos(mode, direction, gid, pos, width, height,
 							  outputOriginX, outputOriginY, lineCount,
 							  freePMin, freeQMin, freeLineLength,
 							  angleCos, angleSin, centerX, centerY,
-							 swirlK, swirlLineMin, pathDirection, pathSMin, pathNMin,
-							 pathSampleCount, pathSamples, &x, &y) &&
-			BPS_SRC_IN_WORLD(x, y) && BPS_DST_IN_WORLD(x, y)) {
-			sortTex[BPS_DST_INDEX_XY(x, y)] = srcTex[BPS_SRC_INDEX_XY(x, y)];
+							  swirlK, swirlLineMin, pathDirection, pathSMin, pathNMin,
+							  pathSampleCount, pathSamples, &x, &y) &&
+			BPS_DST_IN_WORLD(x, y)) {
+			sortTex[BPS_DST_INDEX_XY(x, y)] = BPS_SRC_IN_WORLD(x, y)
+				? srcTex[BPS_SRC_INDEX_XY(x, y)]
+				: (float4)(0.0f, 0.0f, 0.0f, 0.0f);
 		}
 	}
 	barrier(CLK_LOCAL_MEM_FENCE);
@@ -489,7 +601,7 @@ __kernel void BitonicSortKernel(
 							 swirlK, swirlLineMin, pathDirection, pathSMin, pathNMin,
 							 pathSampleCount, pathSamples, &x, &y) &&
 					BPS_SRC_IN_WORLD(x, y)) {
-					float br = bps_sort_key(srcTex[BPS_SRC_INDEX_XY(x, y)], trigger);
+					float br = bps_sample_key(triggerSrc, x, y, trigger);
 					if (bps_is_affected(br, thresholdMin, thresholdMax, affect)) break;
 				}
 				spanStart++;
@@ -505,7 +617,7 @@ __kernel void BitonicSortKernel(
 							 swirlK, swirlLineMin, pathDirection, pathSMin, pathNMin,
 							 pathSampleCount, pathSamples, &x, &y) ||
 					!BPS_SRC_IN_WORLD(x, y)) break;
-				float br = bps_sort_key(srcTex[BPS_SRC_INDEX_XY(x, y)], trigger);
+				float br = bps_sample_key(triggerSrc, x, y, trigger);
 				if (!bps_is_affected(br, thresholdMin, thresholdMax, affect)) break;
 				spanEnd++;
 			}
@@ -543,7 +655,7 @@ __kernel void BitonicSortKernel(
 							 pathSampleCount, pathSamples, &x, &y) &&
 								   BPS_SRC_IN_WORLD(x, y);
 				const uint srcIndex = valid ? BPS_SRC_INDEX_XY(x, y) : 0xffffffffu;
-				scratchKey[i] = valid ? bps_sort_key(srcTex[srcIndex], criterion) :
+				scratchKey[i] = valid ? bps_sample_key(criterionSrc, x, y, criterion) :
 					(ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX);
 				scratchIndex[i] = srcIndex;
 			} else {
@@ -606,6 +718,18 @@ __kernel void BitonicSortKernel(
 
 __kernel void BitonicSortDomainKernel(
 	__global const float4 *srcTex,
+	__global const float4 *criterionTex,
+	__global const float4 *triggerTex,
+	int                    criterionPitch,
+	int                    criterionOriginX,
+	int                    criterionOriginY,
+	int                    criterionWidth,
+	int                    criterionHeight,
+	int                    triggerPitch,
+	int                    triggerOriginX,
+	int                    triggerOriginY,
+	int                    triggerWidth,
+	int                    triggerHeight,
 	__global uint         *domain,
 	__global float        *keys,
 	int                    srcPitch,
@@ -613,6 +737,8 @@ __kernel void BitonicSortDomainKernel(
 	int                    height,
 	int                    inputOriginX,
 	int                    inputOriginY,
+	int                    inputWidth,
+	int                    inputHeight,
 	int                    mode,
 	int                    ordering,
 	int                    criterion,
@@ -639,6 +765,21 @@ __kernel void BitonicSortDomainKernel(
 	int                    pathSampleCount,
 	__global const BpsPathSampleGpu *pathSamples)
 {
+
+	BpsKeySource criterionSrc;
+	criterionSrc.tex = criterionTex;
+	criterionSrc.pitch = criterionPitch;
+	criterionSrc.originX = criterionOriginX;
+	criterionSrc.originY = criterionOriginY;
+	criterionSrc.width = criterionWidth;
+	criterionSrc.height = criterionHeight;
+	BpsKeySource triggerSrc;
+	triggerSrc.tex = triggerTex;
+	triggerSrc.pitch = triggerPitch;
+	triggerSrc.originX = triggerOriginX;
+	triggerSrc.originY = triggerOriginY;
+	triggerSrc.width = triggerWidth;
+	triggerSrc.height = triggerHeight;
 	__local uint s_spanStart;
 	__local uint s_spanEnd;
 	__local uint s_spanSize;
@@ -654,7 +795,7 @@ __kernel void BitonicSortDomainKernel(
 	}
 
 	#define BPS_SRC_IN_WORLD(x, y) ((x) >= inputOriginX && (y) >= inputOriginY && \
-									(x) < inputOriginX + width && (y) < inputOriginY + height)
+									(x) < inputOriginX + inputWidth && (y) < inputOriginY + inputHeight)
 	#define BPS_SRC_INDEX_XY(x, y) ((uint)(((x) - inputOriginX) + ((y) - inputOriginY) * srcPitch))
 	#define BPS_DOMAIN_INDEX(pos) ((uint)((int)gid * domainStride + (int)(pos)))
 
@@ -691,7 +832,7 @@ __kernel void BitonicSortDomainKernel(
 			while (runStart < pathLen) {
 				const uint pos = as_uint(keys[BPS_DOMAIN_INDEX(runStart)]);
 				const uint srcIndex = domain[BPS_DOMAIN_INDEX(pos)];
-				const float br = bps_sort_key(srcTex[srcIndex], trigger);
+				const float br = bps_sample_key_from_src_index(triggerSrc, srcPitch, inputOriginX, inputOriginY, srcIndex, trigger);
 				if (bps_is_affected(br, thresholdMin, thresholdMax, affect)) break;
 				runStart++;
 			}
@@ -699,7 +840,7 @@ __kernel void BitonicSortDomainKernel(
 			while (runEnd < pathLen) {
 				const uint pos = as_uint(keys[BPS_DOMAIN_INDEX(runEnd)]);
 				const uint srcIndex = domain[BPS_DOMAIN_INDEX(pos)];
-				const float br = bps_sort_key(srcTex[srcIndex], trigger);
+				const float br = bps_sample_key_from_src_index(triggerSrc, srcPitch, inputOriginX, inputOriginY, srcIndex, trigger);
 				if (!bps_is_affected(br, thresholdMin, thresholdMax, affect)) break;
 				runEnd++;
 			}
@@ -726,7 +867,7 @@ __kernel void BitonicSortDomainKernel(
 				const uint pos = as_uint(keys[BPS_DOMAIN_INDEX(runStart + i)]);
 				const uint srcIndex = domain[BPS_DOMAIN_INDEX(pos)];
 				domain[work] = srcIndex;
-				keys[work] = bps_sort_key(srcTex[srcIndex], criterion);
+				keys[work] = bps_sample_key_from_src_index(criterionSrc, srcPitch, inputOriginX, inputOriginY, srcIndex, criterion);
 			} else {
 				domain[work] = 0xffffffffu;
 				keys[work] = ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX;
@@ -791,6 +932,8 @@ __kernel void BitonicApplyDomainKernel(
 	int                    height,
 	int                    inputOriginX,
 	int                    inputOriginY,
+	int                    inputWidth,
+	int                    inputHeight,
 	int                    outputOriginX,
 	int                    outputOriginY,
 	int                    outputWidth,
@@ -826,7 +969,7 @@ __kernel void BitonicApplyDomainKernel(
 
 	float4 pixel = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
 	if (x >= inputOriginX && y >= inputOriginY &&
-		x < inputOriginX + width && y < inputOriginY + height) {
+		x < inputOriginX + inputWidth && y < inputOriginY + inputHeight) {
 		const uint srcIndex =
 			(uint)((x - inputOriginX) + (y - inputOriginY) * srcPitch);
 		pixel = srcTex[srcIndex];
@@ -860,6 +1003,8 @@ __kernel void BitonicCopyInputKernel(
 	int                    height,
 	int                    inputOriginX,
 	int                    inputOriginY,
+	int                    inputWidth,
+	int                    inputHeight,
 	int                    outputOriginX,
 	int                    outputOriginY,
 	int                    outputWidth,
@@ -876,15 +1021,157 @@ __kernel void BitonicCopyInputKernel(
 	const uint dstIndex = (uint)(ox + oy * dstPitch);
 	float4 pixel = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
 	if (x >= inputOriginX && y >= inputOriginY &&
-		x < inputOriginX + width && y < inputOriginY + height) {
+		x < inputOriginX + inputWidth && y < inputOriginY + inputHeight) {
 		pixel = srcTex[(uint)((x - inputOriginX) + (y - inputOriginY) * srcPitch)];
 	}
 	dstTex[dstIndex] = pixel;
 }
 
+__kernel void BitonicBuildPathClassifyCountKernel(
+	__global const BpsPathSampleGpu *pathSamples,
+	int                    pathSampleCount,
+	int                    width,
+	int                    height,
+	int                    lineCount,
+	int                    pathDirection,
+	int                    pathClosed,
+	float                  pathLength,
+	int                    pathSMin,
+	int                    pathNMin,
+	__global int          *laneOf,
+	__global float        *keyOf,
+	volatile __global uint *laneCounts)
+{
+	const int x = (int)get_global_id(0);
+	const int y = (int)get_global_id(1);
+	if (x >= width || y >= height) {
+		return;
+	}
+	const uint pidx = (uint)(y * width + x);
+	laneOf[pidx] = -1;
+
+	float s = 0.0f;
+	float n = 0.0f;
+	if (!bps_path_closest(pathSamples, pathSampleCount, (float)x, (float)y, &s, &n)) {
+		return;
+	}
+
+	int lane = 0;
+	float order = 0.0f;
+	if (!bps_path_lane_order(pathDirection, pathClosed, pathLength,
+							 pathSMin, pathNMin, lineCount,
+							 s, n, &lane, &order)) {
+		return;
+	}
+	laneOf[pidx] = lane;
+	keyOf[pidx] = order;
+	atomic_add(&laneCounts[lane], 1u);
+}
+
+__kernel void BitonicBuildPathScatterRecordsKernel(
+	__global const int    *laneOf,
+	__global const float  *keyOf,
+	volatile __global uint *laneCursors,
+	__global BpsMappedPixelRecordGpu *records,
+	int                    width,
+	int                    height)
+{
+	const int x = (int)get_global_id(0);
+	const int y = (int)get_global_id(1);
+	if (x >= width || y >= height) {
+		return;
+	}
+	const uint pidx = (uint)(y * width + x);
+	const int lane = laneOf[pidx];
+	if (lane < 0) {
+		return;
+	}
+	const uint dst = atomic_add(&laneCursors[lane], 1u);
+	records[dst].posKey = keyOf[pidx];
+	records[dst].pixelIndex = pidx;
+}
+
+inline bool bps_record_before(BpsMappedPixelRecordGpu a, BpsMappedPixelRecordGpu b)
+{
+	if (a.posKey < b.posKey) return true;
+	if (a.posKey > b.posKey) return false;
+	return a.pixelIndex < b.pixelIndex;
+}
+
+__kernel void BitonicBuildPathSortRecordsKernel(
+	__global BpsMappedPixelRecordGpu *records,
+	__global BpsMappedPixelRecordGpu *workRecords,
+	__global const uint   *lineOffsets,
+	__global const uint   *workOffsets,
+	int                    lineCount)
+{
+	const uint line = get_group_id(0);
+	const uint gtid = get_local_id(0);
+	if ((int)line >= lineCount) {
+		return;
+	}
+	const uint begin = lineOffsets[line];
+	const uint end = lineOffsets[line + 1u];
+	const uint lineSize = end - begin;
+	if (lineSize <= 1u) {
+		return;
+	}
+
+	const uint sortSize = bps_next_pow2(lineSize);
+	const uint sortBase = workOffsets[line] + lineSize;
+	for (uint i = gtid; i < sortSize; i += MAX_THREADS) {
+		BpsMappedPixelRecordGpu record;
+		if (i < lineSize) {
+			record = records[begin + i];
+		} else {
+			record.posKey = BPS_FLOAT_MAX;
+			record.pixelIndex = 0xffffffffu;
+		}
+		workRecords[sortBase + i] = record;
+	}
+	barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+	for (uint k = 2u; k <= sortSize; k <<= 1) {
+		for (uint j = k >> 1; j > 0u; j >>= 1) {
+			for (uint i = gtid; i < sortSize; i += MAX_THREADS) {
+				const uint partner = i ^ j;
+				if (partner > i) {
+					const uint slotA = sortBase + i;
+					const uint slotB = sortBase + partner;
+					const BpsMappedPixelRecordGpu a = workRecords[slotA];
+					const BpsMappedPixelRecordGpu b = workRecords[slotB];
+					const bool stageAscending = (i & k) == 0u;
+					const bool before = bps_record_before(a, b);
+					if (before != stageAscending) {
+						workRecords[slotA] = b;
+						workRecords[slotB] = a;
+					}
+				}
+			}
+			barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+		}
+	}
+
+	for (uint i = gtid; i < lineSize; i += MAX_THREADS) {
+		records[begin + i] = workRecords[sortBase + i];
+	}
+}
+
 __kernel void BitonicSortMappedKernel(
 	__global const float4 *srcTex,
 	__global float4       *dstTex,
+	__global const float4 *criterionTex,
+	__global const float4 *triggerTex,
+	int                    criterionPitch,
+	int                    criterionOriginX,
+	int                    criterionOriginY,
+	int                    criterionWidth,
+	int                    criterionHeight,
+	int                    triggerPitch,
+	int                    triggerOriginX,
+	int                    triggerOriginY,
+	int                    triggerWidth,
+	int                    triggerHeight,
 	__global uint         *domain,
 	__global float        *keys,
 	__global const BpsMappedPixelRecordGpu *records,
@@ -896,6 +1183,8 @@ __kernel void BitonicSortMappedKernel(
 	int                    height,
 	int                    inputOriginX,
 	int                    inputOriginY,
+	int                    inputWidth,
+	int                    inputHeight,
 	int                    outputOriginX,
 	int                    outputOriginY,
 	int                    outputWidth,
@@ -909,6 +1198,21 @@ __kernel void BitonicSortMappedKernel(
 	float                  thresholdMax,
 	int                    lineCount)
 {
+
+	BpsKeySource criterionSrc;
+	criterionSrc.tex = criterionTex;
+	criterionSrc.pitch = criterionPitch;
+	criterionSrc.originX = criterionOriginX;
+	criterionSrc.originY = criterionOriginY;
+	criterionSrc.width = criterionWidth;
+	criterionSrc.height = criterionHeight;
+	BpsKeySource triggerSrc;
+	triggerSrc.tex = triggerTex;
+	triggerSrc.pitch = triggerPitch;
+	triggerSrc.originX = triggerOriginX;
+	triggerSrc.originY = triggerOriginY;
+	triggerSrc.width = triggerWidth;
+	triggerSrc.height = triggerHeight;
 	__local uint s_spanStart;
 	__local uint s_spanEnd;
 	__local uint s_spanSize;
@@ -930,7 +1234,7 @@ __kernel void BitonicSortMappedKernel(
 	const bool ascending = ordering != 0;
 
 	#define BPS_SRC_IN_WORLD(x, y) ((x) >= inputOriginX && (y) >= inputOriginY && \
-									(x) < inputOriginX + width && (y) < inputOriginY + height)
+									(x) < inputOriginX + inputWidth && (y) < inputOriginY + inputHeight)
 	#define BPS_DST_IN_WORLD(x, y) ((x) >= outputOriginX && (y) >= outputOriginY && \
 									(x) < outputOriginX + outputWidth && (y) < outputOriginY + outputHeight)
 	#define BPS_SRC_INDEX_XY(x, y) ((uint)(((x) - inputOriginX) + ((y) - inputOriginY) * srcPitch))
@@ -953,7 +1257,7 @@ __kernel void BitonicSortMappedKernel(
 			while (runStart < lineSize) {
 				const uint srcIndex = domain[workBase + runStart];
 				if (srcIndex != 0xffffffffu) {
-					const float br = bps_sort_key(srcTex[srcIndex], trigger);
+					const float br = bps_sample_key_from_src_index(triggerSrc, srcPitch, inputOriginX, inputOriginY, srcIndex, trigger);
 					if (bps_is_affected(br, thresholdMin, thresholdMax, affect)) break;
 				}
 				runStart++;
@@ -962,7 +1266,7 @@ __kernel void BitonicSortMappedKernel(
 			while (runEnd < lineSize) {
 				const uint srcIndex = domain[workBase + runEnd];
 				if (srcIndex == 0xffffffffu) break;
-				const float br = bps_sort_key(srcTex[srcIndex], trigger);
+				const float br = bps_sample_key_from_src_index(triggerSrc, srcPitch, inputOriginX, inputOriginY, srcIndex, trigger);
 				if (!bps_is_affected(br, thresholdMin, thresholdMax, affect)) break;
 				runEnd++;
 			}
@@ -986,7 +1290,7 @@ __kernel void BitonicSortMappedKernel(
 			if (i < spanSize) {
 				const uint srcIndex = domain[workBase + runStart + i];
 				domain[sortBase + i] = srcIndex;
-				keys[sortBase + i] = bps_sort_key(srcTex[srcIndex], criterion);
+				keys[sortBase + i] = bps_sample_key_from_src_index(criterionSrc, srcPitch, inputOriginX, inputOriginY, srcIndex, criterion);
 			} else {
 				domain[sortBase + i] = 0xffffffffu;
 				keys[sortBase + i] = ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX;

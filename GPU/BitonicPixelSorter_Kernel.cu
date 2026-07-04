@@ -21,6 +21,11 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+#include <algorithm>
+#include <cmath>
+#include <mutex>
+#include <vector>
+
 // Single configuration covering lines up to 4096 px (the host falls back to CPU
 // beyond that). 256 threads, 32 KiB of shared sort keys and source indices.
 #define MAX_THREADS 256
@@ -51,6 +56,24 @@ struct BpsMappedPixelRecordGpu {
 	float posKey;
 	unsigned int pixelIndex;
 };
+
+struct BpsCudaPathMap {
+	unsigned long long key = 0ull;
+	int device = -1;
+	int width = 0;
+	int height = 0;
+	int lineCount = 0;
+	int mappedRecordCount = 0;
+	int mappedWorkItemCount = 0;
+	BpsMappedPixelRecordGpu *records = nullptr;
+	unsigned int *lineOffsets = nullptr;
+	unsigned int *workOffsets = nullptr;
+};
+
+namespace {
+std::mutex g_cudaPathMapMutex;
+BpsCudaPathMap g_cudaPathMap;
+}
 
 #define BPS_CRITERION_LUMINANCE 1
 #define BPS_CRITERION_RGB_AVERAGE 2
@@ -131,6 +154,49 @@ __device__ __forceinline__ bool bps_is_affected(
 	return affect == BPS_AFFECT_OUTSIDE_THRESHOLDS ? !inside : inside;
 }
 
+struct BpsKeySource {
+	const float4 *tex;
+	int pitch;
+	int originX;
+	int originY;
+	int width;
+	int height;
+};
+
+__device__ __forceinline__ bool bps_key_in_world(const BpsKeySource &src, int x, int y)
+{
+	return x >= src.originX && y >= src.originY &&
+		   x < src.originX + src.width && y < src.originY + src.height;
+}
+
+__device__ __forceinline__ float bps_sample_key(const BpsKeySource &src, int x, int y, int keyCriterion)
+{
+	if (!bps_key_in_world(src, x, y)) {
+		return -1.0f;
+	}
+	const unsigned int idx =
+		(unsigned int)((x - src.originX) + (y - src.originY) * src.pitch);
+	return bps_sort_key(src.tex[idx], keyCriterion);
+}
+
+// Recover layer coordinates from a source-world linear index.
+__device__ __forceinline__ float bps_sample_key_from_src_index(
+	const BpsKeySource &src,
+	int srcPitch,
+	int inputOriginX,
+	int inputOriginY,
+	unsigned int srcIndex,
+	int keyCriterion)
+{
+	if (srcIndex == 0xffffffffu) {
+		return -1.0f;
+	}
+	const int x = (int)(srcIndex % (unsigned int)srcPitch) + inputOriginX;
+	const int y = (int)(srcIndex / (unsigned int)srcPitch) + inputOriginY;
+	return bps_sample_key(src, x, y, keyCriterion);
+}
+
+
 __device__ __forceinline__ unsigned int bps_cycle_shift(unsigned int count, float cycleDegrees)
 {
 	if (count <= 1u) return 0u;
@@ -153,6 +219,93 @@ __device__ __forceinline__ unsigned int bps_next_pow2(unsigned int value)
 	return value + 1u;
 }
 
+static unsigned int bps_next_pow2_host(unsigned int value)
+{
+	if (value <= 1u) return 1u;
+	value--;
+	value |= value >> 1;
+	value |= value >> 2;
+	value |= value >> 4;
+	value |= value >> 8;
+	value |= value >> 16;
+	return value + 1u;
+}
+
+static void bps_release_cuda_path_map(BpsCudaPathMap *map)
+{
+	if (!map) return;
+	cudaFree(map->workOffsets);
+	cudaFree(map->lineOffsets);
+	cudaFree(map->records);
+	map->workOffsets = nullptr;
+	map->lineOffsets = nullptr;
+	map->records = nullptr;
+	map->key = 0ull;
+	map->device = -1;
+	map->width = 0;
+	map->height = 0;
+	map->lineCount = 0;
+	map->mappedRecordCount = 0;
+	map->mappedWorkItemCount = 0;
+}
+
+extern "C" void BitonicClearCudaPathMapCache()
+{
+	std::lock_guard<std::mutex> lock(g_cudaPathMapMutex);
+	bps_release_cuda_path_map(&g_cudaPathMap);
+}
+
+static int bps_cuda_jfa_grid_factor(int width, int height)
+{
+	const int maxDim = (std::max)(width, height);
+	int factor = (maxDim + 450) / 900;
+	if (factor < 1) factor = 1;
+	if (factor > 3) factor = 3;
+	return factor;
+}
+
+static void bps_normalise_tangent_host(float *tx, float *ty)
+{
+	const float len = std::sqrt((*tx) * (*tx) + (*ty) * (*ty));
+	if (len > 1.0e-6f) {
+		*tx /= len;
+		*ty /= len;
+	} else {
+		*tx = 1.0f;
+		*ty = 0.0f;
+	}
+}
+
+static std::vector<BpsPathSampleGpu> bps_build_cuda_path_seeds(
+	const BpsPathSampleGpu *samples,
+	int sampleCount)
+{
+	std::vector<BpsPathSampleGpu> seeds;
+	if (!samples || sampleCount < 2) {
+		return seeds;
+	}
+	for (int i = 0; i < sampleCount - 1; ++i) {
+		const BpsPathSampleGpu p0 = samples[i];
+		const BpsPathSampleGpu p1 = samples[i + 1];
+		const float dx = p1.x - p0.x;
+		const float dy = p1.y - p0.y;
+		const float len = std::sqrt(dx * dx + dy * dy);
+		const int steps = (std::max)(1, (int)std::ceil(len));
+		for (int k = (i > 0) ? 1 : 0; k <= steps; ++k) {
+			const float t = (float)k / (float)steps;
+			BpsPathSampleGpu seed;
+			seed.x = p0.x + dx * t;
+			seed.y = p0.y + dy * t;
+			seed.s = p0.s + (p1.s - p0.s) * t;
+			seed.tx = p0.tx + (p1.tx - p0.tx) * t;
+			seed.ty = p0.ty + (p1.ty - p0.ty) * t;
+			bps_normalise_tangent_host(&seed.tx, &seed.ty);
+			seeds.push_back(seed);
+		}
+	}
+	return seeds;
+}
+
 __device__ __forceinline__ bool bps_before(
 	float keyA,
 	unsigned int indexA,
@@ -167,6 +320,52 @@ __device__ __forceinline__ bool bps_before(
 __device__ __forceinline__ int bps_round_to_int(float value)
 {
 	return (int)floorf(value + 0.5f);
+}
+
+__device__ __forceinline__ float bps_wrap_arc_length(float s, float length)
+{
+	if (length <= 1.0e-6f) return s;
+	float w = fmodf(s, length);
+	if (w < 0.0f) w += length;
+	return w;
+}
+
+__device__ __forceinline__ bool bps_path_lane_order(
+	int pathDirection,
+	int pathClosed,
+	float pathLength,
+	int pathSMin,
+	int pathNMin,
+	int lineCount,
+	float s,
+	float n,
+	int *line,
+	float *order)
+{
+	const bool closed = (pathClosed != 0) && pathLength > 1.0e-6f;
+	const float sLocal = closed ? bps_wrap_arc_length(s, pathLength) : s;
+	int lane = 0;
+	float posKey = 0.0f;
+	if (pathDirection == BPS_PATH_DIR_TANGENT) {
+		lane = bps_round_to_int(n) - pathNMin;
+		posKey = sLocal;
+	} else {
+		if (closed) {
+			const int bins = lineCount > 0 ? lineCount : 1;
+			int q = bps_round_to_int(sLocal) % bins;
+			if (q < 0) q += bins;
+			lane = q;
+		} else {
+			lane = bps_round_to_int(s) - pathSMin;
+		}
+		posKey = n;
+	}
+	if (lane < 0 || lane >= lineCount) {
+		return false;
+	}
+	*line = lane;
+	*order = posKey;
+	return true;
 }
 
 __device__ __forceinline__ unsigned int bps_rotation_line_length(unsigned int radius)
@@ -479,12 +678,26 @@ __device__ __forceinline__ bool bps_domain_pos_for_pixel(
 __global__ void BitonicSortKernel(
 	const float4 *srcTex,
 	float4       *sortTex,
+	const float4 *criterionTex,
+	const float4 *triggerTex,
+	int           criterionPitch,
+	int           criterionOriginX,
+	int           criterionOriginY,
+	int           criterionWidth,
+	int           criterionHeight,
+	int           triggerPitch,
+	int           triggerOriginX,
+	int           triggerOriginY,
+	int           triggerWidth,
+	int           triggerHeight,
 	int           srcPitch,
 	int           dstPitch,
 	int           width,
 	int           height,
 	int           inputOriginX,
 	int           inputOriginY,
+	int           inputWidth,
+	int           inputHeight,
 	int           outputOriginX,
 	int           outputOriginY,
 	int           outputWidth,
@@ -526,6 +739,13 @@ __global__ void BitonicSortKernel(
 	__shared__ unsigned int s_spanSize;
 	__shared__ unsigned int s_sortSize;
 
+
+	const BpsKeySource criterionSrc = {
+		criterionTex, criterionPitch, criterionOriginX, criterionOriginY,
+		criterionWidth, criterionHeight};
+	const BpsKeySource triggerSrc = {
+		triggerTex, triggerPitch, triggerOriginX, triggerOriginY,
+		triggerWidth, triggerHeight};
 	const unsigned int gid  = blockIdx.x;
 	const unsigned int gtid = threadIdx.x;
 
@@ -537,12 +757,14 @@ __global__ void BitonicSortKernel(
 
 	// Map layer coordinates into AE's possibly partial GPU worlds.
 	#define BPS_SRC_IN_WORLD(x, y) ((x) >= inputOriginX && (y) >= inputOriginY && \
-									(x) < inputOriginX + width && (y) < inputOriginY + height)
+									(x) < inputOriginX + inputWidth && (y) < inputOriginY + inputHeight)
 	#define BPS_DST_IN_WORLD(x, y) ((x) >= outputOriginX && (y) >= outputOriginY && \
 									(x) < outputOriginX + outputWidth && (y) < outputOriginY + outputHeight)
 	#define BPS_SRC_INDEX_XY(x, y) ((unsigned int)(((x) - inputOriginX) + ((y) - inputOriginY) * srcPitch))
 	#define BPS_DST_INDEX_XY(x, y) ((unsigned int)(((x) - outputOriginX) + ((y) - outputOriginY) * dstPitch))
 
+	// Always write every destination pixel. Partial input worlds (common with
+	// alpha / adjustment layers) must not leave stale frame data behind.
 	for (unsigned int pos = gtid; pos < size; pos += MAX_THREADS) {
 		int x = 0, y = 0;
 		if (bps_coord_for_pos(mode, direction, gid, pos, width, height,
@@ -551,8 +773,10 @@ __global__ void BitonicSortKernel(
 							  angleCos, angleSin, centerX, centerY,
 							  swirlK, swirlLineMin, pathDirection, pathSMin, pathNMin,
 							  pathSampleCount, pathSamples, &x, &y) &&
-			BPS_SRC_IN_WORLD(x, y) && BPS_DST_IN_WORLD(x, y)) {
-			sortTex[BPS_DST_INDEX_XY(x, y)] = srcTex[BPS_SRC_INDEX_XY(x, y)];
+			BPS_DST_IN_WORLD(x, y)) {
+			sortTex[BPS_DST_INDEX_XY(x, y)] = BPS_SRC_IN_WORLD(x, y)
+				? srcTex[BPS_SRC_INDEX_XY(x, y)]
+				: make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 		}
 	}
 	__syncthreads();
@@ -570,7 +794,7 @@ __global__ void BitonicSortKernel(
 									  swirlK, swirlLineMin, pathDirection, pathSMin, pathNMin,
 									  pathSampleCount, pathSamples, &x, &y) &&
 					BPS_SRC_IN_WORLD(x, y)) {
-					float br = bps_sort_key(srcTex[BPS_SRC_INDEX_XY(x, y)], trigger);
+					float br = bps_sample_key(triggerSrc, x, y, trigger);
 					if (bps_is_affected(br, thresholdMin, thresholdMax, affect)) break;
 				}
 				spanStart++;
@@ -586,7 +810,7 @@ __global__ void BitonicSortKernel(
 									   swirlK, swirlLineMin, pathDirection, pathSMin, pathNMin,
 									   pathSampleCount, pathSamples, &x, &y) ||
 					!BPS_SRC_IN_WORLD(x, y)) break;
-				float br = bps_sort_key(srcTex[BPS_SRC_INDEX_XY(x, y)], trigger);
+				float br = bps_sample_key(triggerSrc, x, y, trigger);
 				if (!bps_is_affected(br, thresholdMin, thresholdMax, affect)) break;
 				spanEnd++;
 			}
@@ -621,7 +845,7 @@ __global__ void BitonicSortKernel(
 													 pathSampleCount, pathSamples, &x, &y) &&
 								   BPS_SRC_IN_WORLD(x, y);
 				const unsigned int srcIndex = valid ? BPS_SRC_INDEX_XY(x, y) : 0xffffffffu;
-				scratchKey[i] = valid ? bps_sort_key(srcTex[srcIndex], criterion) :
+				scratchKey[i] = valid ? bps_sample_key(criterionSrc, x, y, criterion) :
 					(ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX);
 				scratchIndex[i] = srcIndex;
 			} else {
@@ -686,6 +910,18 @@ __global__ void BitonicSortKernel(
 // Keys live in global memory so Rotation/Radial paths may exceed MAX_SIZE.
 __global__ void BitonicSortDomainKernel(
 	const float4     *srcTex,
+	const float4     *criterionTex,
+	const float4     *triggerTex,
+	int               criterionPitch,
+	int               criterionOriginX,
+	int               criterionOriginY,
+	int               criterionWidth,
+	int               criterionHeight,
+	int               triggerPitch,
+	int               triggerOriginX,
+	int               triggerOriginY,
+	int               triggerWidth,
+	int               triggerHeight,
 	unsigned int     *domain,
 	float            *keys,
 	int               srcPitch,
@@ -693,6 +929,8 @@ __global__ void BitonicSortDomainKernel(
 	int               height,
 	int               inputOriginX,
 	int               inputOriginY,
+	int               inputWidth,
+	int               inputHeight,
 	int               mode,
 	int               ordering,
 	int               criterion,
@@ -724,6 +962,13 @@ __global__ void BitonicSortDomainKernel(
 	__shared__ unsigned int s_spanSize;
 	__shared__ unsigned int s_sortSize;
 
+
+	const BpsKeySource criterionSrc = {
+		criterionTex, criterionPitch, criterionOriginX, criterionOriginY,
+		criterionWidth, criterionHeight};
+	const BpsKeySource triggerSrc = {
+		triggerTex, triggerPitch, triggerOriginX, triggerOriginY,
+		triggerWidth, triggerHeight};
 	const unsigned int gid  = blockIdx.x;
 	const unsigned int gtid = threadIdx.x;
 
@@ -734,7 +979,7 @@ __global__ void BitonicSortDomainKernel(
 	}
 
 	#define BPS_SRC_IN_WORLD(x, y) ((x) >= inputOriginX && (y) >= inputOriginY && \
-									(x) < inputOriginX + width && (y) < inputOriginY + height)
+									(x) < inputOriginX + inputWidth && (y) < inputOriginY + inputHeight)
 	#define BPS_SRC_INDEX_XY(x, y) ((unsigned int)(((x) - inputOriginX) + ((y) - inputOriginY) * srcPitch))
 	#define BPS_DOMAIN_INDEX(pos) ((unsigned int)((int)gid * domainStride + (int)(pos)))
 
@@ -777,7 +1022,7 @@ __global__ void BitonicSortDomainKernel(
 				const unsigned int pos =
 					__float_as_uint(keys[BPS_DOMAIN_INDEX(runStart)]);
 				const unsigned int srcIndex = domain[BPS_DOMAIN_INDEX(pos)];
-				const float br = bps_sort_key(srcTex[srcIndex], trigger);
+				const float br = bps_sample_key_from_src_index(triggerSrc, srcPitch, inputOriginX, inputOriginY, srcIndex, trigger);
 				if (bps_is_affected(br, thresholdMin, thresholdMax, affect)) break;
 				runStart++;
 			}
@@ -787,7 +1032,7 @@ __global__ void BitonicSortDomainKernel(
 				const unsigned int pos =
 					__float_as_uint(keys[BPS_DOMAIN_INDEX(runEnd)]);
 				const unsigned int srcIndex = domain[BPS_DOMAIN_INDEX(pos)];
-				const float br = bps_sort_key(srcTex[srcIndex], trigger);
+				const float br = bps_sample_key_from_src_index(triggerSrc, srcPitch, inputOriginX, inputOriginY, srcIndex, trigger);
 				if (!bps_is_affected(br, thresholdMin, thresholdMax, affect)) break;
 				runEnd++;
 			}
@@ -818,7 +1063,7 @@ __global__ void BitonicSortDomainKernel(
 					__float_as_uint(keys[BPS_DOMAIN_INDEX(runStart + i)]);
 				const unsigned int srcIndex = domain[BPS_DOMAIN_INDEX(pos)];
 				domain[work] = srcIndex;
-				keys[work] = bps_sort_key(srcTex[srcIndex], criterion);
+				keys[work] = bps_sample_key_from_src_index(criterionSrc, srcPitch, inputOriginX, inputOriginY, srcIndex, criterion);
 			} else {
 				domain[work] = 0xffffffffu;
 				keys[work] = ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX;
@@ -886,6 +1131,8 @@ __global__ void BitonicApplyDomainKernel(
 	int                   height,
 	int                   inputOriginX,
 	int                   inputOriginY,
+	int                   inputWidth,
+	int                   inputHeight,
 	int                   outputOriginX,
 	int                   outputOriginY,
 	int                   outputWidth,
@@ -921,7 +1168,7 @@ __global__ void BitonicApplyDomainKernel(
 
 	float4 pixel = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 	if (x >= inputOriginX && y >= inputOriginY &&
-		x < inputOriginX + width && y < inputOriginY + height) {
+		x < inputOriginX + inputWidth && y < inputOriginY + inputHeight) {
 		const unsigned int srcIndex =
 			(unsigned int)((x - inputOriginX) + (y - inputOriginY) * srcPitch);
 		pixel = srcTex[srcIndex];
@@ -955,6 +1202,8 @@ __global__ void BitonicCopyInputKernel(
 	int           height,
 	int           inputOriginX,
 	int           inputOriginY,
+	int           inputWidth,
+	int           inputHeight,
 	int           outputOriginX,
 	int           outputOriginY,
 	int           outputWidth,
@@ -971,15 +1220,237 @@ __global__ void BitonicCopyInputKernel(
 	const unsigned int dstIndex = (unsigned int)(ox + oy * dstPitch);
 	float4 pixel = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 	if (x >= inputOriginX && y >= inputOriginY &&
-		x < inputOriginX + width && y < inputOriginY + height) {
+		x < inputOriginX + inputWidth && y < inputOriginY + inputHeight) {
 		pixel = srcTex[(unsigned int)((x - inputOriginX) + (y - inputOriginY) * srcPitch)];
 	}
 	dstTex[dstIndex] = pixel;
 }
 
+__device__ __forceinline__ unsigned long long bps_pack_jfa_key(float d2, unsigned int seedIndex)
+{
+	return ((unsigned long long)__float_as_uint(d2) << 32) |
+		(unsigned long long)seedIndex;
+}
+
+__device__ __forceinline__ unsigned int bps_jfa_seed_index(unsigned long long key)
+{
+	return (unsigned int)(key & 0xffffffffull);
+}
+
+__device__ __forceinline__ bool bps_jfa_key_valid(unsigned long long key)
+{
+	return bps_jfa_seed_index(key) != 0xffffffffu;
+}
+
+__global__ void CudaPathSeedKernel(
+	const BpsPathSampleGpu *seeds,
+	int seedCount,
+	unsigned long long *field,
+	int gridW,
+	int gridH,
+	float scale)
+{
+	const unsigned int seedIndex = blockIdx.x * blockDim.x + threadIdx.x;
+	if ((int)seedIndex >= seedCount) return;
+	const BpsPathSampleGpu seed = seeds[seedIndex];
+	int cx = bps_round_to_int(seed.x / scale);
+	int cy = bps_round_to_int(seed.y / scale);
+	// Open-end extensions meet the frame edge; keep boundary seeds.
+	if (cx < 0) cx = 0;
+	else if (cx >= gridW) cx = gridW - 1;
+	if (cy < 0) cy = 0;
+	else if (cy >= gridH) cy = gridH - 1;
+	const float ax = (float)cx * scale;
+	const float ay = (float)cy * scale;
+	const float dx = ax - seed.x;
+	const float dy = ay - seed.y;
+	const float d2 = dx * dx + dy * dy;
+	const unsigned long long key = bps_pack_jfa_key(d2, seedIndex);
+	atomicMin(&field[(unsigned int)(cy * gridW + cx)], key);
+}
+
+__global__ void CudaPathJfaPassKernel(
+	const BpsPathSampleGpu *seeds,
+	const unsigned long long *src,
+	unsigned long long *dst,
+	int gridW,
+	int gridH,
+	int step,
+	float scale)
+{
+	static const int kDX[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
+	static const int kDY[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
+	const int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+	const int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+	if (x >= gridW || y >= gridH) return;
+
+	const unsigned int idx = (unsigned int)(y * gridW + x);
+	const float ax = (float)x * scale;
+	const float ay = (float)y * scale;
+	unsigned long long best = src[idx];
+
+	for (int k = 0; k < 8; ++k) {
+		const int nx = x + kDX[k] * step;
+		const int ny = y + kDY[k] * step;
+		if (nx < 0 || ny < 0 || nx >= gridW || ny >= gridH) continue;
+		const unsigned long long nkey = src[(unsigned int)(ny * gridW + nx)];
+		if (!bps_jfa_key_valid(nkey)) continue;
+		const unsigned int seedIndex = bps_jfa_seed_index(nkey);
+		const BpsPathSampleGpu seed = seeds[seedIndex];
+		const float dx = ax - seed.x;
+		const float dy = ay - seed.y;
+		const unsigned long long cand =
+			bps_pack_jfa_key(dx * dx + dy * dy, seedIndex);
+		if (cand < best) {
+			best = cand;
+		}
+	}
+	dst[idx] = best;
+}
+
+__global__ void CudaPathClassifyCountKernel(
+	const BpsPathSampleGpu *seeds,
+	const unsigned long long *field,
+	int gridW,
+	int gridH,
+	int factor,
+	int width,
+	int height,
+	int lineCount,
+	int pathDirection,
+	int pathClosed,
+	float pathLength,
+	int pathSMin,
+	int pathNMin,
+	int *laneOf,
+	float *keyOf,
+	unsigned int *laneCounts)
+{
+	const int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+	const int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+	if (x >= width || y >= height) return;
+	const unsigned int pidx = (unsigned int)(y * width + x);
+	laneOf[pidx] = -1;
+
+	const int cx = min(x / factor, gridW - 1);
+	const int cy = min(y / factor, gridH - 1);
+	const unsigned long long key = field[(unsigned int)(cy * gridW + cx)];
+	if (!bps_jfa_key_valid(key)) return;
+
+	const BpsPathSampleGpu seed = seeds[bps_jfa_seed_index(key)];
+	const float dx = (float)x - seed.x;
+	const float dy = (float)y - seed.y;
+	const float n = -seed.ty * dx + seed.tx * dy;
+	int lane = 0;
+	float order = 0.0f;
+	if (!bps_path_lane_order(pathDirection, pathClosed, pathLength,
+							 pathSMin, pathNMin, lineCount,
+							 seed.s, n, &lane, &order)) {
+		return;
+	}
+	laneOf[pidx] = lane;
+	keyOf[pidx] = order;
+	atomicAdd(&laneCounts[lane], 1u);
+}
+
+__global__ void CudaPathScatterRecordsKernel(
+	const int *laneOf,
+	const float *keyOf,
+	unsigned int *laneCursors,
+	BpsMappedPixelRecordGpu *records,
+	int width,
+	int height)
+{
+	const int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+	const int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+	if (x >= width || y >= height) return;
+	const unsigned int pidx = (unsigned int)(y * width + x);
+	const int lane = laneOf[pidx];
+	if (lane < 0) return;
+	const unsigned int dst = atomicAdd(&laneCursors[lane], 1u);
+	records[dst].posKey = keyOf[pidx];
+	records[dst].pixelIndex = pidx;
+}
+
+__device__ __forceinline__ bool bps_record_before(
+	const BpsMappedPixelRecordGpu &a,
+	const BpsMappedPixelRecordGpu &b)
+{
+	if (a.posKey < b.posKey) return true;
+	if (a.posKey > b.posKey) return false;
+	return a.pixelIndex < b.pixelIndex;
+}
+
+__global__ void CudaPathSortRecordsKernel(
+	BpsMappedPixelRecordGpu *records,
+	BpsMappedPixelRecordGpu *workRecords,
+	const unsigned int *lineOffsets,
+	const unsigned int *workOffsets,
+	int lineCount)
+{
+	const unsigned int line = blockIdx.x;
+	const unsigned int gtid = threadIdx.x;
+	if ((int)line >= lineCount) return;
+	const unsigned int begin = lineOffsets[line];
+	const unsigned int end = lineOffsets[line + 1u];
+	const unsigned int lineSize = end - begin;
+	if (lineSize <= 1u) return;
+
+	const unsigned int sortSize = bps_next_pow2(lineSize);
+	const unsigned int sortBase = workOffsets[line] + lineSize;
+	for (unsigned int i = gtid; i < sortSize; i += MAX_THREADS) {
+		BpsMappedPixelRecordGpu record;
+		if (i < lineSize) {
+			record = records[begin + i];
+		} else {
+			record.posKey = BPS_FLOAT_MAX;
+			record.pixelIndex = 0xffffffffu;
+		}
+		workRecords[sortBase + i] = record;
+	}
+	__syncthreads();
+
+	for (unsigned int k = 2u; k <= sortSize; k <<= 1) {
+		for (unsigned int j = k >> 1; j > 0u; j >>= 1) {
+			for (unsigned int i = gtid; i < sortSize; i += MAX_THREADS) {
+				const unsigned int partner = i ^ j;
+				if (partner > i) {
+					const unsigned int slotA = sortBase + i;
+					const unsigned int slotB = sortBase + partner;
+					const BpsMappedPixelRecordGpu a = workRecords[slotA];
+					const BpsMappedPixelRecordGpu b = workRecords[slotB];
+					const bool stageAscending = (i & k) == 0u;
+					const bool before = bps_record_before(a, b);
+					if (before != stageAscending) {
+						workRecords[slotA] = b;
+						workRecords[slotB] = a;
+					}
+				}
+			}
+			__syncthreads();
+		}
+	}
+
+	for (unsigned int i = gtid; i < lineSize; i += MAX_THREADS) {
+		records[begin + i] = workRecords[sortBase + i];
+	}
+}
+
 __global__ void BitonicSortMappedKernel(
 	const float4 *srcTex,
 	float4       *dstTex,
+	const float4 *criterionTex,
+	const float4 *triggerTex,
+	int           criterionPitch,
+	int           criterionOriginX,
+	int           criterionOriginY,
+	int           criterionWidth,
+	int           criterionHeight,
+	int           triggerPitch,
+	int           triggerOriginX,
+	int           triggerOriginY,
+	int           triggerWidth,
+	int           triggerHeight,
 	unsigned int *domain,
 	float        *keys,
 	const BpsMappedPixelRecordGpu *records,
@@ -991,6 +1462,8 @@ __global__ void BitonicSortMappedKernel(
 	int           height,
 	int           inputOriginX,
 	int           inputOriginY,
+	int           inputWidth,
+	int           inputHeight,
 	int           outputOriginX,
 	int           outputOriginY,
 	int           outputWidth,
@@ -1009,6 +1482,13 @@ __global__ void BitonicSortMappedKernel(
 	__shared__ unsigned int s_spanSize;
 	__shared__ unsigned int s_sortSize;
 
+
+	const BpsKeySource criterionSrc = {
+		criterionTex, criterionPitch, criterionOriginX, criterionOriginY,
+		criterionWidth, criterionHeight};
+	const BpsKeySource triggerSrc = {
+		triggerTex, triggerPitch, triggerOriginX, triggerOriginY,
+		triggerWidth, triggerHeight};
 	const unsigned int line = blockIdx.x;
 	const unsigned int gtid = threadIdx.x;
 	if ((int)line >= lineCount) {
@@ -1025,7 +1505,7 @@ __global__ void BitonicSortMappedKernel(
 	const bool ascending = ordering != 0;
 
 	#define BPS_SRC_IN_WORLD(x, y) ((x) >= inputOriginX && (y) >= inputOriginY && \
-									(x) < inputOriginX + width && (y) < inputOriginY + height)
+									(x) < inputOriginX + inputWidth && (y) < inputOriginY + inputHeight)
 	#define BPS_DST_IN_WORLD(x, y) ((x) >= outputOriginX && (y) >= outputOriginY && \
 									(x) < outputOriginX + outputWidth && (y) < outputOriginY + outputHeight)
 	#define BPS_SRC_INDEX_XY(x, y) ((unsigned int)(((x) - inputOriginX) + ((y) - inputOriginY) * srcPitch))
@@ -1048,7 +1528,7 @@ __global__ void BitonicSortMappedKernel(
 			while (runStart < lineSize) {
 				const unsigned int srcIndex = domain[workBase + runStart];
 				if (srcIndex != 0xffffffffu) {
-					const float br = bps_sort_key(srcTex[srcIndex], trigger);
+					const float br = bps_sample_key_from_src_index(triggerSrc, srcPitch, inputOriginX, inputOriginY, srcIndex, trigger);
 					if (bps_is_affected(br, thresholdMin, thresholdMax, affect)) break;
 				}
 				runStart++;
@@ -1057,7 +1537,7 @@ __global__ void BitonicSortMappedKernel(
 			while (runEnd < lineSize) {
 				const unsigned int srcIndex = domain[workBase + runEnd];
 				if (srcIndex == 0xffffffffu) break;
-				const float br = bps_sort_key(srcTex[srcIndex], trigger);
+				const float br = bps_sample_key_from_src_index(triggerSrc, srcPitch, inputOriginX, inputOriginY, srcIndex, trigger);
 				if (!bps_is_affected(br, thresholdMin, thresholdMax, affect)) break;
 				runEnd++;
 			}
@@ -1081,7 +1561,7 @@ __global__ void BitonicSortMappedKernel(
 			if (i < spanSize) {
 				const unsigned int srcIndex = domain[workBase + runStart + i];
 				domain[sortBase + i] = srcIndex;
-				keys[sortBase + i] = bps_sort_key(srcTex[srcIndex], criterion);
+				keys[sortBase + i] = bps_sample_key_from_src_index(criterionSrc, srcPitch, inputOriginX, inputOriginY, srcIndex, criterion);
 			} else {
 				domain[sortBase + i] = 0xffffffffu;
 				keys[sortBase + i] = ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX;
@@ -1135,6 +1615,319 @@ __global__ void BitonicSortMappedKernel(
 	#undef BPS_DST_INDEX_XY
 }
 
+static cudaError_t bps_build_cuda_path_map(
+	int width,
+	int height,
+	int lineCount,
+	int pathDirection,
+	int pathClosed,
+	float pathLength,
+	int pathSMin,
+	int pathNMin,
+	int pathSampleCount,
+	const void *pathSamplesHost,
+	unsigned long long pathMapKey,
+	BpsCudaPathMap *cache)
+{
+	if (!cache || width <= 0 || height <= 0 || lineCount <= 0 ||
+		pathSampleCount < 2 || !pathSamplesHost || pathMapKey == 0ull) {
+		return cudaErrorInvalidValue;
+	}
+
+	int device = -1;
+	cudaError_t result = cudaGetDevice(&device);
+	if (result != cudaSuccess) return result;
+
+	if (cache->records &&
+		cache->key == pathMapKey &&
+		cache->device == device &&
+		cache->width == width &&
+		cache->height == height &&
+		cache->lineCount == lineCount) {
+		return cudaSuccess;
+	}
+
+	bps_release_cuda_path_map(cache);
+
+	const BpsPathSampleGpu *pathSamples =
+		static_cast<const BpsPathSampleGpu *>(pathSamplesHost);
+	std::vector<BpsPathSampleGpu> seeds =
+		bps_build_cuda_path_seeds(pathSamples, pathSampleCount);
+	if (seeds.empty() || seeds.size() > 0xfffffffeull) {
+		return cudaErrorInvalidValue;
+	}
+
+	const int factor = bps_cuda_jfa_grid_factor(width, height);
+	const int gridW = (width + factor - 1) / factor;
+	const int gridH = (height + factor - 1) / factor;
+	const size_t gridCount = (size_t)gridW * (size_t)gridH;
+	const size_t pixelCount = (size_t)width * (size_t)height;
+	const size_t offsetsCount = (size_t)lineCount + 1u;
+
+	BpsPathSampleGpu *seedsDev = nullptr;
+	unsigned long long *fieldA = nullptr;
+	unsigned long long *fieldB = nullptr;
+	int *laneOf = nullptr;
+	float *keyOf = nullptr;
+	unsigned int *laneCountsDev = nullptr;
+	unsigned int *lineOffsetsDev = nullptr;
+	unsigned int *workOffsetsDev = nullptr;
+	unsigned int *laneCursorsDev = nullptr;
+	BpsMappedPixelRecordGpu *recordsDev = nullptr;
+	BpsMappedPixelRecordGpu *workRecordsDev = nullptr;
+
+	const unsigned long long invalidKey = 0xffffffffffffffffull;
+	result = cudaMalloc((void **)&seedsDev, seeds.size() * sizeof(BpsPathSampleGpu));
+	if (result == cudaSuccess) {
+		result = cudaMemcpy(seedsDev, seeds.data(),
+							seeds.size() * sizeof(BpsPathSampleGpu),
+							cudaMemcpyHostToDevice);
+	}
+	if (result == cudaSuccess) result = cudaMalloc((void **)&fieldA, gridCount * sizeof(unsigned long long));
+	if (result == cudaSuccess) result = cudaMalloc((void **)&fieldB, gridCount * sizeof(unsigned long long));
+	if (result == cudaSuccess) result = cudaMalloc((void **)&laneOf, pixelCount * sizeof(int));
+	if (result == cudaSuccess) result = cudaMalloc((void **)&keyOf, pixelCount * sizeof(float));
+	if (result == cudaSuccess) result = cudaMalloc((void **)&laneCountsDev, (size_t)lineCount * sizeof(unsigned int));
+
+	if (result != cudaSuccess) {
+		cudaFree(laneCountsDev);
+		cudaFree(keyOf);
+		cudaFree(laneOf);
+		cudaFree(fieldB);
+		cudaFree(fieldA);
+		cudaFree(seedsDev);
+		return result;
+	}
+
+	result = cudaMemset(fieldA, 0xff, gridCount * sizeof(unsigned long long));
+	if (result == cudaSuccess) {
+		result = cudaMemset(laneCountsDev, 0, (size_t)lineCount * sizeof(unsigned int));
+	}
+	if (result != cudaSuccess) {
+		cudaFree(laneCountsDev);
+		cudaFree(keyOf);
+		cudaFree(laneOf);
+		cudaFree(fieldB);
+		cudaFree(fieldA);
+		cudaFree(seedsDev);
+		return result;
+	}
+	(void)invalidKey;
+
+	const unsigned int seedBlock = 256u;
+	const unsigned int seedGrid =
+		(unsigned int)((seeds.size() + seedBlock - 1u) / seedBlock);
+	CudaPathSeedKernel<<<seedGrid, seedBlock>>>(
+		seedsDev, (int)seeds.size(), fieldA, gridW, gridH, (float)factor);
+	result = cudaPeekAtLastError();
+	if (result == cudaSuccess) result = cudaDeviceSynchronize();
+	if (result != cudaSuccess) {
+		cudaFree(laneCountsDev);
+		cudaFree(keyOf);
+		cudaFree(laneOf);
+		cudaFree(fieldB);
+		cudaFree(fieldA);
+		cudaFree(seedsDev);
+		return result;
+	}
+
+	const dim3 jfaBlock(16, 16, 1);
+	const dim3 jfaGrid(
+		(unsigned int)((gridW + 15) / 16),
+		(unsigned int)((gridH + 15) / 16),
+		1u);
+	int step = 1;
+	const int gridMax = (std::max)(gridW, gridH);
+	while (step < (gridMax + 1) / 2) {
+		step <<= 1;
+	}
+	unsigned long long *srcField = fieldA;
+	unsigned long long *dstField = fieldB;
+	for (; step >= 1; step >>= 1) {
+		CudaPathJfaPassKernel<<<jfaGrid, jfaBlock>>>(
+			seedsDev, srcField, dstField, gridW, gridH, step, (float)factor);
+		result = cudaPeekAtLastError();
+		if (result == cudaSuccess) result = cudaDeviceSynchronize();
+		if (result != cudaSuccess) {
+			cudaFree(laneCountsDev);
+			cudaFree(keyOf);
+			cudaFree(laneOf);
+			cudaFree(fieldB);
+			cudaFree(fieldA);
+			cudaFree(seedsDev);
+			return result;
+		}
+		std::swap(srcField, dstField);
+	}
+	CudaPathJfaPassKernel<<<jfaGrid, jfaBlock>>>(
+		seedsDev, srcField, dstField, gridW, gridH, 1, (float)factor);
+	result = cudaPeekAtLastError();
+	if (result == cudaSuccess) result = cudaDeviceSynchronize();
+	if (result != cudaSuccess) {
+		cudaFree(laneCountsDev);
+		cudaFree(keyOf);
+		cudaFree(laneOf);
+		cudaFree(fieldB);
+		cudaFree(fieldA);
+		cudaFree(seedsDev);
+		return result;
+	}
+	srcField = dstField;
+
+	const dim3 classifyBlock(16, 16, 1);
+	const dim3 classifyGrid(
+		(unsigned int)((width + 15) / 16),
+		(unsigned int)((height + 15) / 16),
+		1u);
+	CudaPathClassifyCountKernel<<<classifyGrid, classifyBlock>>>(
+		seedsDev, srcField, gridW, gridH, factor, width, height, lineCount,
+		pathDirection, pathClosed, pathLength, pathSMin, pathNMin,
+		laneOf, keyOf, laneCountsDev);
+	result = cudaPeekAtLastError();
+	if (result == cudaSuccess) result = cudaDeviceSynchronize();
+	if (result != cudaSuccess) {
+		cudaFree(laneCountsDev);
+		cudaFree(keyOf);
+		cudaFree(laneOf);
+		cudaFree(fieldB);
+		cudaFree(fieldA);
+		cudaFree(seedsDev);
+		return result;
+	}
+
+	std::vector<unsigned int> laneCounts((size_t)lineCount);
+	result = cudaMemcpy(laneCounts.data(), laneCountsDev,
+						(size_t)lineCount * sizeof(unsigned int),
+						cudaMemcpyDeviceToHost);
+	if (result != cudaSuccess) {
+		cudaFree(laneCountsDev);
+		cudaFree(keyOf);
+		cudaFree(laneOf);
+		cudaFree(fieldB);
+		cudaFree(fieldA);
+		cudaFree(seedsDev);
+		return result;
+	}
+
+	std::vector<unsigned int> lineOffsets(offsetsCount, 0u);
+	std::vector<unsigned int> workOffsets(offsetsCount, 0u);
+	unsigned int recordCount = 0u;
+	unsigned int workCount = 0u;
+	for (int line = 0; line < lineCount; ++line) {
+		lineOffsets[(size_t)line] = recordCount;
+		workOffsets[(size_t)line] = workCount;
+		const unsigned int len = laneCounts[(size_t)line];
+		recordCount += len;
+		workCount += len + bps_next_pow2_host(len);
+	}
+	lineOffsets[(size_t)lineCount] = recordCount;
+	workOffsets[(size_t)lineCount] = workCount;
+
+	if (recordCount == 0u || workCount == 0u) {
+		cudaFree(laneCountsDev);
+		cudaFree(keyOf);
+		cudaFree(laneOf);
+		cudaFree(fieldB);
+		cudaFree(fieldA);
+		cudaFree(seedsDev);
+		return cudaSuccess;
+	}
+
+	result = cudaMalloc((void **)&lineOffsetsDev, offsetsCount * sizeof(unsigned int));
+	if (result == cudaSuccess) result = cudaMalloc((void **)&workOffsetsDev, offsetsCount * sizeof(unsigned int));
+	if (result == cudaSuccess) result = cudaMalloc((void **)&laneCursorsDev, offsetsCount * sizeof(unsigned int));
+	if (result == cudaSuccess) result = cudaMalloc((void **)&recordsDev, (size_t)recordCount * sizeof(BpsMappedPixelRecordGpu));
+	if (result == cudaSuccess) result = cudaMalloc((void **)&workRecordsDev, (size_t)workCount * sizeof(BpsMappedPixelRecordGpu));
+	if (result == cudaSuccess) {
+		result = cudaMemcpy(lineOffsetsDev, lineOffsets.data(),
+							offsetsCount * sizeof(unsigned int),
+							cudaMemcpyHostToDevice);
+	}
+	if (result == cudaSuccess) {
+		result = cudaMemcpy(workOffsetsDev, workOffsets.data(),
+							offsetsCount * sizeof(unsigned int),
+							cudaMemcpyHostToDevice);
+	}
+	if (result == cudaSuccess) {
+		result = cudaMemcpy(laneCursorsDev, lineOffsets.data(),
+							offsetsCount * sizeof(unsigned int),
+							cudaMemcpyHostToDevice);
+	}
+	if (result != cudaSuccess) {
+		cudaFree(workRecordsDev);
+		cudaFree(recordsDev);
+		cudaFree(laneCursorsDev);
+		cudaFree(workOffsetsDev);
+		cudaFree(lineOffsetsDev);
+		cudaFree(laneCountsDev);
+		cudaFree(keyOf);
+		cudaFree(laneOf);
+		cudaFree(fieldB);
+		cudaFree(fieldA);
+		cudaFree(seedsDev);
+		return result;
+	}
+
+	CudaPathScatterRecordsKernel<<<classifyGrid, classifyBlock>>>(
+		laneOf, keyOf, laneCursorsDev, recordsDev, width, height);
+	result = cudaPeekAtLastError();
+	if (result == cudaSuccess) result = cudaDeviceSynchronize();
+	if (result != cudaSuccess) {
+		cudaFree(workRecordsDev);
+		cudaFree(recordsDev);
+		cudaFree(laneCursorsDev);
+		cudaFree(workOffsetsDev);
+		cudaFree(lineOffsetsDev);
+		cudaFree(laneCountsDev);
+		cudaFree(keyOf);
+		cudaFree(laneOf);
+		cudaFree(fieldB);
+		cudaFree(fieldA);
+		cudaFree(seedsDev);
+		return result;
+	}
+
+	CudaPathSortRecordsKernel<<<lineCount, MAX_THREADS>>>(
+		recordsDev, workRecordsDev, lineOffsetsDev, workOffsetsDev, lineCount);
+	result = cudaPeekAtLastError();
+	if (result == cudaSuccess) result = cudaDeviceSynchronize();
+	if (result != cudaSuccess) {
+		cudaFree(workRecordsDev);
+		cudaFree(recordsDev);
+		cudaFree(laneCursorsDev);
+		cudaFree(workOffsetsDev);
+		cudaFree(lineOffsetsDev);
+		cudaFree(laneCountsDev);
+		cudaFree(keyOf);
+		cudaFree(laneOf);
+		cudaFree(fieldB);
+		cudaFree(fieldA);
+		cudaFree(seedsDev);
+		return result;
+	}
+
+	cache->key = pathMapKey;
+	cache->device = device;
+	cache->width = width;
+	cache->height = height;
+	cache->lineCount = lineCount;
+	cache->mappedRecordCount = (int)recordCount;
+	cache->mappedWorkItemCount = (int)workCount;
+	cache->records = recordsDev;
+	cache->lineOffsets = lineOffsetsDev;
+	cache->workOffsets = workOffsetsDev;
+
+	cudaFree(workRecordsDev);
+	cudaFree(laneCursorsDev);
+	cudaFree(laneCountsDev);
+	cudaFree(keyOf);
+	cudaFree(laneOf);
+	cudaFree(fieldB);
+	cudaFree(fieldA);
+	cudaFree(seedsDev);
+	return cudaSuccess;
+}
+
 // Host launch wrapper, called from SmartRenderGPU (BitonicPixelSorter_GPU.cpp).
 // extern "C" to keep a stable, unmangled symbol across the nvcc/MSVC boundary.
 //
@@ -1143,6 +1936,8 @@ __global__ void BitonicSortMappedKernel(
 // passed through the CUDA runtime launch API in the Adobe sample.
 extern "C" cudaError_t BitonicSort_CUDA(
 	const void *src,
+	const void *criterionMem,
+	const void *triggerMem,
 	void       *dst,
 	int         srcPitch,
 	int         dstPitch,
@@ -1150,6 +1945,18 @@ extern "C" cudaError_t BitonicSort_CUDA(
 	int         height,
 	int         inputOriginX,
 	int         inputOriginY,
+	int         inputWidth,
+	int         inputHeight,
+	int         criterionPitch,
+	int         criterionOriginX,
+	int         criterionOriginY,
+	int         criterionWidth,
+	int         criterionHeight,
+	int         triggerPitch,
+	int         triggerOriginX,
+	int         triggerOriginY,
+	int         triggerWidth,
+	int         triggerHeight,
 	int         outputOriginX,
 	int         outputOriginY,
 	int         outputWidth,
@@ -1176,10 +1983,14 @@ extern "C" cudaError_t BitonicSort_CUDA(
 	float       swirlK,
 	int         swirlLineMin,
 	int         pathDirection,
+	int         pathClosed,
+	float       pathLength,
 	int         pathSMin,
 	int         pathNMin,
 	int         pathSampleCount,
 	const void *pathSamplesHost,
+	unsigned long long pathMapKey,
+	int         useGpuPathMapBuild,
 	int         mappedRecordCount,
 	int         mappedWorkItemCount,
 	const void *mappedRecordsHost,
@@ -1191,7 +2002,7 @@ extern "C" cudaError_t BitonicSort_CUDA(
 	}
 
 	BpsPathSampleGpu *pathSamplesDev = nullptr;
-	if (pathSampleCount > 0 && pathSamplesHost) {
+	if (mode != BPS_MODE_PATH && pathSampleCount > 0 && pathSamplesHost) {
 		const size_t pathBytes =
 			(size_t)pathSampleCount * sizeof(BpsPathSampleGpu);
 		cudaError_t path_result =
@@ -1210,8 +2021,11 @@ extern "C" cudaError_t BitonicSort_CUDA(
 	if (mode == BPS_MODE_AXIS) {
 		BitonicSortKernel<<<lineCount, MAX_THREADS, 0>>>(
 			(const float4 *)src, (float4 *)dst,
+			(const float4 *)criterionMem, (const float4 *)triggerMem,
+			criterionPitch, criterionOriginX, criterionOriginY, criterionWidth, criterionHeight,
+			triggerPitch, triggerOriginX, triggerOriginY, triggerWidth, triggerHeight,
 			srcPitch, dstPitch, width, height,
-			inputOriginX, inputOriginY, outputOriginX, outputOriginY, outputWidth, outputHeight,
+			inputOriginX, inputOriginY, inputWidth, inputHeight, outputOriginX, outputOriginY, outputWidth, outputHeight,
 			mode, direction, ordering, criterion, trigger, affect, cycleDegrees, lineCount,
 			freePMin, freeQMin, freeLineLength, radialLength,
 			thresholdMin, thresholdMax, angleCos, angleSin, centerX, centerY,
@@ -1237,7 +2051,7 @@ extern "C" cudaError_t BitonicSort_CUDA(
 		BitonicCopyInputKernel<<<copyGrid, copyBlock, 0>>>(
 			(const float4 *)src, (float4 *)dst,
 			srcPitch, dstPitch, width, height,
-			inputOriginX, inputOriginY, outputOriginX, outputOriginY,
+			inputOriginX, inputOriginY, inputWidth, inputHeight, outputOriginX, outputOriginY,
 			outputWidth, outputHeight);
 		cudaError_t result = cudaPeekAtLastError();
 		if (result != cudaSuccess) {
@@ -1250,58 +2064,93 @@ extern "C" cudaError_t BitonicSort_CUDA(
 			return result;
 		}
 
-		if (mappedRecordCount <= 0 || mappedWorkItemCount <= 0 ||
-			!mappedRecordsHost || !mappedLineOffsetsHost || !mappedWorkOffsetsHost) {
-			cudaFree(pathSamplesDev);
-			return cudaSuccess;
-		}
-
 		BpsMappedPixelRecordGpu *recordsDev = nullptr;
 		unsigned int *lineOffsetsDev = nullptr;
 		unsigned int *workOffsetsDev = nullptr;
 		unsigned int *domain = nullptr;
 		float *keys = nullptr;
-		const size_t recordsBytes =
-			(size_t)mappedRecordCount * sizeof(BpsMappedPixelRecordGpu);
-		const size_t offsetsBytes =
-			(size_t)(lineCount + 1) * sizeof(unsigned int);
+		bool ownsMapBuffers = true;
+		std::unique_lock<std::mutex> cacheLock;
+		if (useGpuPathMapBuild) {
+			cacheLock = std::unique_lock<std::mutex>(g_cudaPathMapMutex);
+			result = bps_build_cuda_path_map(
+				width, height, lineCount, pathDirection, pathClosed, pathLength,
+				pathSMin, pathNMin, pathSampleCount, pathSamplesHost, pathMapKey,
+				&g_cudaPathMap);
+			if (result != cudaSuccess) {
+				cudaFree(pathSamplesDev);
+				return result;
+			}
+			mappedRecordCount = g_cudaPathMap.mappedRecordCount;
+			mappedWorkItemCount = g_cudaPathMap.mappedWorkItemCount;
+			recordsDev = g_cudaPathMap.records;
+			lineOffsetsDev = g_cudaPathMap.lineOffsets;
+			workOffsetsDev = g_cudaPathMap.workOffsets;
+			ownsMapBuffers = false;
+		} else {
+			if (mappedRecordCount <= 0 || mappedWorkItemCount <= 0 ||
+				!mappedRecordsHost || !mappedLineOffsetsHost || !mappedWorkOffsetsHost) {
+				cudaFree(pathSamplesDev);
+				return cudaSuccess;
+			}
+			const size_t recordsBytes =
+				(size_t)mappedRecordCount * sizeof(BpsMappedPixelRecordGpu);
+			const size_t offsetsBytes =
+				(size_t)(lineCount + 1) * sizeof(unsigned int);
+			result = cudaMalloc((void **)&recordsDev, recordsBytes);
+			if (result == cudaSuccess) result = cudaMalloc((void **)&lineOffsetsDev, offsetsBytes);
+			if (result == cudaSuccess) result = cudaMalloc((void **)&workOffsetsDev, offsetsBytes);
+			if (result == cudaSuccess) {
+				result = cudaMemcpy(recordsDev, mappedRecordsHost, recordsBytes,
+									cudaMemcpyHostToDevice);
+			}
+			if (result == cudaSuccess) {
+				result = cudaMemcpy(lineOffsetsDev, mappedLineOffsetsHost, offsetsBytes,
+									cudaMemcpyHostToDevice);
+			}
+			if (result == cudaSuccess) {
+				result = cudaMemcpy(workOffsetsDev, mappedWorkOffsetsHost, offsetsBytes,
+									cudaMemcpyHostToDevice);
+			}
+		}
+		if (mappedRecordCount <= 0 || mappedWorkItemCount <= 0 ||
+			!recordsDev || !lineOffsetsDev || !workOffsetsDev) {
+			if (ownsMapBuffers) {
+				cudaFree(workOffsetsDev);
+				cudaFree(lineOffsetsDev);
+				cudaFree(recordsDev);
+			}
+			cudaFree(pathSamplesDev);
+			return cudaSuccess;
+		}
 		const size_t workUintBytes =
 			(size_t)mappedWorkItemCount * sizeof(unsigned int);
 		const size_t workFloatBytes =
 			(size_t)mappedWorkItemCount * sizeof(float);
 
-		result = cudaMalloc((void **)&recordsDev, recordsBytes);
-		if (result == cudaSuccess) result = cudaMalloc((void **)&lineOffsetsDev, offsetsBytes);
-		if (result == cudaSuccess) result = cudaMalloc((void **)&workOffsetsDev, offsetsBytes);
 		if (result == cudaSuccess) result = cudaMalloc((void **)&domain, workUintBytes);
 		if (result == cudaSuccess) result = cudaMalloc((void **)&keys, workFloatBytes);
-		if (result == cudaSuccess) {
-			result = cudaMemcpy(recordsDev, mappedRecordsHost, recordsBytes,
-								cudaMemcpyHostToDevice);
-		}
-		if (result == cudaSuccess) {
-			result = cudaMemcpy(lineOffsetsDev, mappedLineOffsetsHost, offsetsBytes,
-								cudaMemcpyHostToDevice);
-		}
-		if (result == cudaSuccess) {
-			result = cudaMemcpy(workOffsetsDev, mappedWorkOffsetsHost, offsetsBytes,
-								cudaMemcpyHostToDevice);
-		}
 		if (result != cudaSuccess) {
 			cudaFree(keys);
 			cudaFree(domain);
-			cudaFree(workOffsetsDev);
-			cudaFree(lineOffsetsDev);
-			cudaFree(recordsDev);
+			if (ownsMapBuffers) {
+				cudaFree(workOffsetsDev);
+				cudaFree(lineOffsetsDev);
+				cudaFree(recordsDev);
+			}
 			cudaFree(pathSamplesDev);
 			return result;
 		}
 
 		BitonicSortMappedKernel<<<lineCount, MAX_THREADS, 0>>>(
-			(const float4 *)src, (float4 *)dst, domain, keys,
+			(const float4 *)src, (float4 *)dst,
+			(const float4 *)criterionMem, (const float4 *)triggerMem,
+			criterionPitch, criterionOriginX, criterionOriginY, criterionWidth, criterionHeight,
+			triggerPitch, triggerOriginX, triggerOriginY, triggerWidth, triggerHeight,
+			domain, keys,
 			recordsDev, lineOffsetsDev, workOffsetsDev,
 			srcPitch, dstPitch, width, height,
-			inputOriginX, inputOriginY, outputOriginX, outputOriginY,
+			inputOriginX, inputOriginY, inputWidth, inputHeight, outputOriginX, outputOriginY,
 			outputWidth, outputHeight,
 			ordering, criterion, trigger, affect, cycleDegrees,
 			thresholdMin, thresholdMax, lineCount);
@@ -1312,9 +2161,11 @@ extern "C" cudaError_t BitonicSort_CUDA(
 		}
 		cudaFree(keys);
 		cudaFree(domain);
-		cudaFree(workOffsetsDev);
-		cudaFree(lineOffsetsDev);
-		cudaFree(recordsDev);
+		if (ownsMapBuffers) {
+			cudaFree(workOffsetsDev);
+			cudaFree(lineOffsetsDev);
+			cudaFree(recordsDev);
+		}
 		cudaFree(pathSamplesDev);
 		return result;
 	}
@@ -1359,9 +2210,13 @@ extern "C" cudaError_t BitonicSort_CUDA(
 	}
 
 	BitonicSortDomainKernel<<<lineCount, MAX_THREADS, 0>>>(
-		(const float4 *)src, domain, keys,
+		(const float4 *)src,
+		(const float4 *)criterionMem, (const float4 *)triggerMem,
+		criterionPitch, criterionOriginX, criterionOriginY, criterionWidth, criterionHeight,
+		triggerPitch, triggerOriginX, triggerOriginY, triggerWidth, triggerHeight,
+		domain, keys,
 		srcPitch, width, height,
-		inputOriginX, inputOriginY,
+		inputOriginX, inputOriginY, inputWidth, inputHeight,
 		mode, ordering, criterion, trigger, affect, cycleDegrees, lineCount,
 		freePMin, freeQMin, freeLineLength, radialLength, paddedStride,
 		thresholdMin, thresholdMax, angleCos, angleSin, centerX, centerY,
@@ -1392,7 +2247,7 @@ extern "C" cudaError_t BitonicSort_CUDA(
 	BitonicApplyDomainKernel<<<applyGrid, applyBlock, 0>>>(
 		(const float4 *)src, (float4 *)dst, domain,
 		srcPitch, dstPitch, width, height,
-		inputOriginX, inputOriginY, outputOriginX, outputOriginY, outputWidth, outputHeight,
+		inputOriginX, inputOriginY, inputWidth, inputHeight, outputOriginX, outputOriginY, outputWidth, outputHeight,
 		mode, lineCount,
 		freePMin, freeQMin, freeLineLength, radialLength, paddedStride,
 		angleCos, angleSin, centerX, centerY,

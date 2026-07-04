@@ -56,8 +56,8 @@ BPS_RationalScale(const PF_RationalScale &scale)
 static void
 BPS_ResolvePathGeometry(PF_InData *in_data, BitonicSorterParams *paramsP)
 {
-	const A_long frameW = in_data ? in_data->width : 0;
-	const A_long frameH = in_data ? in_data->height : 0;
+	const A_long frameW = BPS_RenderWidth(in_data);
+	const A_long frameH = BPS_RenderHeight(in_data);
 
 	// Path mode domain bounds are filled exclusively by BPS_BuildPathGeometry.
 	// Do not clear domainLineCount / path fields here or the map build sees an
@@ -406,6 +406,14 @@ ParamsSetup(
 					 items.c_str(), BPS_SORT_TRIGGER);
 	}
 
+	// Trigger source layer (None = use the effect source).
+	AEFX_CLR_STRUCT(def);
+	{
+		std::string name = AELocalise::GetStringForAE(LocKey::STR_TRIGGER_SOURCE_NAME, in_data);
+		def.flags = PF_ParamFlag_USE_VALUE_FOR_OLD_PROJECTS;
+		PF_ADD_LAYER(name.c_str(), PF_LayerDefault_NONE, BPS_TRIGGER_SOURCE);
+	}
+
 	// Sort criterion.
 	AEFX_CLR_STRUCT(def);
 	{
@@ -414,6 +422,14 @@ ParamsSetup(
 		def.flags = PF_ParamFlag_USE_VALUE_FOR_OLD_PROJECTS;
 		PF_ADD_POPUP(name.c_str(), 11, BPS_SORT_CRITERION_DFLT,
 					 items.c_str(), BPS_SORT_CRITERION);
+	}
+
+	// Criterion source layer (None = use the effect source).
+	AEFX_CLR_STRUCT(def);
+	{
+		std::string name = AELocalise::GetStringForAE(LocKey::STR_CRITERION_SOURCE_NAME, in_data);
+		def.flags = PF_ParamFlag_USE_VALUE_FOR_OLD_PROJECTS;
+		PF_ADD_LAYER(name.c_str(), PF_LayerDefault_NONE, BPS_CRITERION_SOURCE);
 	}
 
 	// Affect (Inside / Outside thresholds).
@@ -681,10 +697,12 @@ PreRender(
 	// Angle degrees: 360° = one turn to the farthest frame corner; sign = direction.
 	const float swirl_degrees = static_cast<float>(FIX_2_FLOAT(cur_param.u.ad.value));
 	{
-		const float xs[4] = {0.0f, static_cast<float>(in_data->width - 1),
-							 0.0f, static_cast<float>(in_data->width - 1)};
-		const float ys[4] = {0.0f, 0.0f, static_cast<float>(in_data->height - 1),
-							 static_cast<float>(in_data->height - 1)};
+		const A_long render_w = BPS_RenderWidth(in_data);
+		const A_long render_h = BPS_RenderHeight(in_data);
+		const float xs[4] = {0.0f, static_cast<float>(render_w - 1),
+							 0.0f, static_cast<float>(render_w - 1)};
+		const float ys[4] = {0.0f, 0.0f, static_cast<float>(render_h - 1),
+							 static_cast<float>(render_h - 1)};
 		float max_radius = 1.0f;
 		for (int i = 0; i < 4; ++i) {
 			const float dx = xs[i] - infoP->centerX;
@@ -720,17 +738,18 @@ PreRender(
 	}
 
 	BPS_ResolvePathGeometry(in_data, infoP);
+	const BpsGpuEligibility gpu_eligibility =
+		BPS_EvaluateGpuEligibility(in_data, infoP->mode, infoP->maxLineLength, output_rect);
 	// Path needs a pixel-owned map (closest-point lanes). The map is geometry-
 	// only, so it is cached and reused across frames and param tweaks; it is
 	// built (low-res Jump Flooding) only when the mask/frame actually changes.
-	// Swirl uses the analytic domain path (Radial/Rotation) — no host prepass.
-	if (!err && infoP->mode == BPS_MODE_PATH) {
+	// GPU-capable renders now build the map on the device on cache miss; CPU
+	// renders still acquire this host map as their oracle/fallback.
+	if (!err && infoP->mode == BPS_MODE_PATH && !gpu_eligibility.render_possible) {
 		dataP->pathMap =
-			BPS_AcquirePathMap(in_data->width, in_data->height, *infoP);
+			BPS_AcquirePathMap(BPS_RenderWidth(in_data), BPS_RenderHeight(in_data), *infoP);
 	}
 
-	const BpsGpuEligibility gpu_eligibility =
-		BPS_EvaluateGpuEligibility(in_data, infoP->mode, infoP->maxLineLength, output_rect);
 	if (gpu_eligibility.render_possible) {
 		extraP->output->flags |= PF_RenderOutputFlag_GPU_RENDER_POSSIBLE;
 	}
@@ -759,18 +778,22 @@ PreRender(
 		static_cast<long>(infoP->maxLineLength));
 #endif
 
-	// Pixel sorting needs the complete sort axis for each requested output
-	// pixel. Expand only the dependency axis, while keeping the produced result
-	// within AE's requested output rectangle.
+	// Pixel sorting moves values along the entire sort axis (or the whole frame
+	// in non-axis modes). Checkout and produce that full dependency region —
+	// never a partial dirty rect — or motion leaves stale "afterimage" pixels.
+	PF_LRect result_rect = output_rect;
 	req.rect = output_rect;
 	if (infoP->mode != BPS_MODE_AXIS) {
-		req.rect = BPS_FrameRect(in_data);
+		result_rect = BPS_FrameRect(in_data);
+		req.rect = result_rect;
 	} else if (infoP->direction == BPS_DIR_HORIZONTAL) {
-		req.rect.left = 0;
-		req.rect.right = in_data->width;
+		result_rect.left = 0;
+		result_rect.right = BPS_RenderWidth(in_data);
+		req.rect = result_rect;
 	} else {
-		req.rect.top = 0;
-		req.rect.bottom = in_data->height;
+		result_rect.top = 0;
+		result_rect.bottom = BPS_RenderHeight(in_data);
+		req.rect = result_rect;
 	}
 
 	ERR(extraP->cb->checkout_layer(in_data->effect_ref,
@@ -782,12 +805,61 @@ PreRender(
 								   in_data->time_scale,
 								   &in_result));
 
+	// Optional key-source layers. None falls back to the effect source at render.
+	// Request a complete frame: key sampling needs every pixel on the sort axis.
+	if (!err) {
+		PF_RenderRequest key_req = req;
+		key_req.rect = BPS_FrameRect(in_data);
+		key_req.field = PF_Field_FRAME;
+
+		PF_CheckoutResult trigger_result;
+		PF_CheckoutResult criterion_result;
+		AEFX_CLR_STRUCT(trigger_result);
+		AEFX_CLR_STRUCT(criterion_result);
+
+		const PF_Err trigger_err = extraP->cb->checkout_layer(
+			in_data->effect_ref,
+			BPS_UI_TRIGGER_SOURCE,
+			BPS_CHECKOUT_TRIGGER_SOURCE,
+			&key_req,
+			in_data->current_time,
+			in_data->time_step,
+			in_data->time_scale,
+			&trigger_result);
+		dataP->has_trigger_source =
+			(trigger_err == PF_Err_NONE &&
+			 trigger_result.ref_width > 0 &&
+			 trigger_result.ref_height > 0);
+
+		const PF_Err criterion_err = extraP->cb->checkout_layer(
+			in_data->effect_ref,
+			BPS_UI_CRITERION_SOURCE,
+			BPS_CHECKOUT_CRITERION_SOURCE,
+			&key_req,
+			in_data->current_time,
+			in_data->time_step,
+			in_data->time_scale,
+			&criterion_result);
+		dataP->has_criterion_source =
+			(criterion_err == PF_Err_NONE &&
+			 criterion_result.ref_width > 0 &&
+			 criterion_result.ref_height > 0);
+	}
+
 	if (!err) {
 		// Re-bind the host pointers after any vector reallocation / cache lookup.
 		BPS_BindMappedPointers(dataP);
 
-		extraP->output->result_rect = output_rect;
+		// Sorting can change pixels outside AE's dirty rect; always return the
+		// full dependency region and advertise the extra pixels.
+		extraP->output->result_rect = result_rect;
 		extraP->output->max_result_rect = BPS_FrameRect(in_data);
+		if (result_rect.left != output_rect.left ||
+			result_rect.top != output_rect.top ||
+			result_rect.right != output_rect.right ||
+			result_rect.bottom != output_rect.bottom) {
+			extraP->output->flags |= PF_RenderOutputFlag_RETURNS_EXTRA_PIXELS;
+		}
 
 		extraP->output->pre_render_data = dataP;
 		extraP->output->delete_pre_render_data_func = DisposePreRenderData;
@@ -811,6 +883,8 @@ SmartRender(
 
 	PF_EffectWorld	*input_worldP  = NULL;
 	PF_EffectWorld	*output_worldP = NULL;
+	PF_EffectWorld	*trigger_worldP = NULL;
+	PF_EffectWorld	*criterion_worldP = NULL;
 
 	BitonicPreRenderData *dataP =
 		reinterpret_cast<BitonicPreRenderData *>(extraP->input->pre_render_data);
@@ -820,11 +894,39 @@ SmartRender(
 	}
 	BitonicSorterParams *infoP = &dataP->params;
 	BPS_BindMappedPointers(dataP);
+	if (!isGPU && infoP->mode == BPS_MODE_PATH && !dataP->pathMap) {
+		dataP->pathMap =
+			BPS_AcquirePathMap(BPS_RenderWidth(in_data), BPS_RenderHeight(in_data), *infoP);
+		BPS_BindMappedPointers(dataP);
+	}
 
 	BPS_SetLastRenderUsedGpu(isGPU);
 
 	ERR((extraP->cb->checkout_layer_pixels(in_data->effect_ref, BPS_INPUT, &input_worldP)));
+	if (!err && dataP->has_trigger_source) {
+		if (extraP->cb->checkout_layer_pixels(in_data->effect_ref,
+											  BPS_CHECKOUT_TRIGGER_SOURCE,
+											  &trigger_worldP) != PF_Err_NONE) {
+			trigger_worldP = NULL;
+		}
+	}
+	if (!err && dataP->has_criterion_source) {
+		if (extraP->cb->checkout_layer_pixels(in_data->effect_ref,
+											  BPS_CHECKOUT_CRITERION_SOURCE,
+											  &criterion_worldP) != PF_Err_NONE) {
+			criterion_worldP = NULL;
+		}
+	}
 	ERR(extraP->cb->checkout_output(in_data->effect_ref, &output_worldP));
+
+	// None / failed checkout falls back to the effect source. Do not test
+	// world->data: GPU worlds often leave the CPU pointer null.
+	if (!trigger_worldP) {
+		trigger_worldP = input_worldP;
+	}
+	if (!criterion_worldP) {
+		criterion_worldP = input_worldP;
+	}
 
 	if (!err && input_worldP && output_worldP) {
 		AEFX_SuiteScoper<PF_WorldSuite2> world_suite =
@@ -839,10 +941,13 @@ SmartRender(
 #endif
 			if (isGPU) {
 				ERR(BPS_SmartRenderGPU(in_data, out_data, pixel_format,
-									   input_worldP, output_worldP, extraP, infoP));
+									   input_worldP, output_worldP,
+									   criterion_worldP, trigger_worldP,
+									   extraP, infoP));
 			} else {
 				ERR(BPS_SortImageCPU(in_data, out_data, pixel_format,
-									 input_worldP, output_worldP, infoP));
+									 input_worldP, output_worldP,
+									 criterion_worldP, trigger_worldP, infoP));
 			}
 #if defined(BPS_RENDER_DIAG)
 			const auto render_end = std::chrono::steady_clock::now();
@@ -867,6 +972,14 @@ SmartRender(
 		}
 	}
 
+	if (dataP->has_criterion_source) {
+		ERR2(extraP->cb->checkin_layer_pixels(in_data->effect_ref,
+											  BPS_CHECKOUT_CRITERION_SOURCE));
+	}
+	if (dataP->has_trigger_source) {
+		ERR2(extraP->cb->checkin_layer_pixels(in_data->effect_ref,
+											  BPS_CHECKOUT_TRIGGER_SOURCE));
+	}
 	ERR2(extraP->cb->checkin_layer_pixels(in_data->effect_ref, BPS_INPUT));
 	return err;
 }

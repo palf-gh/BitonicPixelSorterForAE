@@ -42,11 +42,13 @@
 #import <Foundation/Foundation.h>
 
 #include "BPS_MetalBackend.h"
+#include "BitonicPixelSorter_PathGeometry.h"
 #include "BitonicPixelSorter_Kernel.metal.h"	// kBitonicPixelSorter_Kernel_MetalString
 
 #include <cstdint>
 #include <cstring>
 #include <new>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Per-device GPU data stored in the PF_Handle allocated at setup.
@@ -59,6 +61,18 @@ struct MetalGPUData {
 	void *apply_domain_pipeline_bridge;
 	void *copy_pipeline_bridge;
 	void *mapped_sort_pipeline_bridge;
+	void *path_classify_count_pipeline_bridge;
+	void *path_scatter_records_pipeline_bridge;
+	void *path_sort_records_pipeline_bridge;
+	void *path_records_buffer_bridge;
+	void *path_line_offsets_buffer_bridge;
+	void *path_work_offsets_buffer_bridge;
+	std::uint64_t path_map_key;
+	int path_map_width;
+	int path_map_height;
+	int path_map_line_count;
+	int path_mapped_record_count;
+	int path_mapped_work_item_count;
 };
 
 // ---------------------------------------------------------------------------
@@ -73,6 +87,18 @@ struct BitonicSortParams {
 	int   height;
 	int   inputOriginX;
 	int   inputOriginY;
+	int   inputWidth;
+	int   inputHeight;
+	int   criterionPitch;
+	int   criterionOriginX;
+	int   criterionOriginY;
+	int   criterionWidth;
+	int   criterionHeight;
+	int   triggerPitch;
+	int   triggerOriginX;
+	int   triggerOriginY;
+	int   triggerWidth;
+	int   triggerHeight;
 	int   outputOriginX;
 	int   outputOriginY;
 	int   outputWidth;
@@ -99,10 +125,87 @@ struct BitonicSortParams {
 	float swirlK;
 	int   swirlLineMin;
 	int   pathDirection;
+	int   pathClosed;
+	float pathLength;
 	int   pathSMin;
 	int   pathNMin;
 	int   pathSampleCount;
 };
+
+static std::uint32_t BPS_MetalNextPow2(std::uint32_t value)
+{
+	if (value <= 1u) {
+		return 1u;
+	}
+	--value;
+	value |= value >> 1;
+	value |= value >> 2;
+	value |= value >> 4;
+	value |= value >> 8;
+	value |= value >> 16;
+	return value + 1u;
+}
+
+static bool BPS_MetalBuildOffsets(
+	const std::vector<std::uint32_t> &laneCounts,
+	std::vector<std::uint32_t> *lineOffsetsP,
+	std::vector<std::uint32_t> *workOffsetsP,
+	std::uint32_t *recordCountP,
+	std::uint32_t *workCountP)
+{
+	if (!lineOffsetsP || !workOffsetsP || !recordCountP || !workCountP) {
+		return false;
+	}
+	const size_t lineCount = laneCounts.size();
+	lineOffsetsP->assign(lineCount + 1u, 0u);
+	workOffsetsP->assign(lineCount + 1u, 0u);
+	std::uint64_t records = 0u;
+	std::uint64_t work = 0u;
+	for (size_t i = 0u; i < lineCount; ++i) {
+		if (records > 0xffffffffull || work > 0xffffffffull) {
+			return false;
+		}
+		(*lineOffsetsP)[i] = static_cast<std::uint32_t>(records);
+		(*workOffsetsP)[i] = static_cast<std::uint32_t>(work);
+		const std::uint32_t len = laneCounts[i];
+		records += len;
+		work += static_cast<std::uint64_t>(len) +
+			static_cast<std::uint64_t>(BPS_MetalNextPow2(len));
+	}
+	if (records > 0xffffffffull || work > 0xffffffffull) {
+		return false;
+	}
+	(*lineOffsetsP)[lineCount] = static_cast<std::uint32_t>(records);
+	(*workOffsetsP)[lineCount] = static_cast<std::uint32_t>(work);
+	*recordCountP = static_cast<std::uint32_t>(records);
+	*workCountP = static_cast<std::uint32_t>(work);
+	return true;
+}
+
+static void BPS_MetalReleaseBridge(void **bridgeP)
+{
+	if (bridgeP && *bridgeP) {
+		id object = (id)CFBridgingRelease(*bridgeP);
+		(void)object;
+		*bridgeP = nullptr;
+	}
+}
+
+static void BPS_MetalClearPathMap(MetalGPUData *metal_dataP)
+{
+	if (!metal_dataP) {
+		return;
+	}
+	BPS_MetalReleaseBridge(&metal_dataP->path_work_offsets_buffer_bridge);
+	BPS_MetalReleaseBridge(&metal_dataP->path_line_offsets_buffer_bridge);
+	BPS_MetalReleaseBridge(&metal_dataP->path_records_buffer_bridge);
+	metal_dataP->path_map_key = 0ull;
+	metal_dataP->path_map_width = 0;
+	metal_dataP->path_map_height = 0;
+	metal_dataP->path_map_line_count = 0;
+	metal_dataP->path_mapped_record_count = 0;
+	metal_dataP->path_mapped_work_item_count = 0;
+}
 
 // ---------------------------------------------------------------------------
 // BPS_MetalDeviceSetup
@@ -156,15 +259,19 @@ PF_Err BPS_MetalDeviceSetup(
 			return PF_Err_INTERNAL_STRUCT_DAMAGED;
 		}
 
-		NSString *kernel_names[5] = {
+		NSString *kernel_names[8] = {
 			@"BitonicSortKernel",
 			@"BitonicSortDomainKernel",
 			@"BitonicApplyDomainKernel",
 			@"BitonicCopyInputKernel",
-			@"BitonicSortMappedKernel"
+			@"BitonicSortMappedKernel",
+			@"BitonicBuildPathClassifyCountKernel",
+			@"BitonicBuildPathScatterRecordsKernel",
+			@"BitonicBuildPathSortRecordsKernel"
 		};
-		id<MTLComputePipelineState> pipelines[5] = {nil, nil, nil, nil, nil};
-		for (int i = 0; i < 5; ++i) {
+		id<MTLComputePipelineState> pipelines[8] = {
+			nil, nil, nil, nil, nil, nil, nil, nil};
+		for (int i = 0; i < 8; ++i) {
 			id<MTLFunction> function = [library newFunctionWithName:kernel_names[i]];
 			if (!function) {
 				return PF_Err_INTERNAL_STRUCT_DAMAGED;
@@ -187,6 +294,9 @@ PF_Err BPS_MetalDeviceSetup(
 		id<MTLComputePipelineState> apply_domain_pipeline = pipelines[2];
 		id<MTLComputePipelineState> copy_pipeline = pipelines[3];
 		id<MTLComputePipelineState> mapped_sort_pipeline = pipelines[4];
+		id<MTLComputePipelineState> path_classify_count_pipeline = pipelines[5];
+		id<MTLComputePipelineState> path_scatter_records_pipeline = pipelines[6];
+		id<MTLComputePipelineState> path_sort_records_pipeline = pipelines[7];
 
 		// Allocate the PF_Handle to hold MetalGPUData.
 		PF_Handle gpu_dataH = handle_suite->host_new_handle(sizeof(MetalGPUData));
@@ -213,6 +323,12 @@ PF_Err BPS_MetalDeviceSetup(
 			const_cast<void *>(CFBridgingRetain(copy_pipeline));
 		metal_dataP->mapped_sort_pipeline_bridge =
 			const_cast<void *>(CFBridgingRetain(mapped_sort_pipeline));
+		metal_dataP->path_classify_count_pipeline_bridge =
+			const_cast<void *>(CFBridgingRetain(path_classify_count_pipeline));
+		metal_dataP->path_scatter_records_pipeline_bridge =
+			const_cast<void *>(CFBridgingRetain(path_scatter_records_pipeline));
+		metal_dataP->path_sort_records_pipeline_bridge =
+			const_cast<void *>(CFBridgingRetain(path_sort_records_pipeline));
 
 		extraP->output->gpu_data = gpu_dataH;
 		out_dataP->out_flags2 = PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
@@ -252,6 +368,10 @@ PF_Err BPS_MetalDeviceSetdown(
 			// Release pipelines: balance the CFBridgingRetain from setup.
 			// CFBridgingRelease transfers the +1 into a local ARC variable that
 			// immediately goes out of scope, decrementing the retain count.
+			BPS_MetalClearPathMap(metal_dataP);
+			BPS_MetalReleaseBridge(&metal_dataP->path_sort_records_pipeline_bridge);
+			BPS_MetalReleaseBridge(&metal_dataP->path_scatter_records_pipeline_bridge);
+			BPS_MetalReleaseBridge(&metal_dataP->path_classify_count_pipeline_bridge);
 			if (metal_dataP->mapped_sort_pipeline_bridge) {
 				id<MTLComputePipelineState> pipeline =
 					(id<MTLComputePipelineState>)CFBridgingRelease(
@@ -311,6 +431,8 @@ PF_Err BPS_MetalSmartRender(
 	PF_SmartRenderExtra     *extraP,
 	const BitonicSorterParams *paramsP,
 	void                    *src_mem,
+	void                    *criterion_mem,
+	void                    *trigger_mem,
 	void                    *dst_mem,
 	int                      srcPitch,
 	int                      dstPitch,
@@ -318,6 +440,18 @@ PF_Err BPS_MetalSmartRender(
 	int                      height,
 	int                      inputOriginX,
 	int                      inputOriginY,
+	int                      inputWidth,
+	int                      inputHeight,
+	int                      criterionPitch,
+	int                      criterionOriginX,
+	int                      criterionOriginY,
+	int                      criterionWidth,
+	int                      criterionHeight,
+	int                      triggerPitch,
+	int                      triggerOriginX,
+	int                      triggerOriginY,
+	int                      triggerWidth,
+	int                      triggerHeight,
 	int                      outputOriginX,
 	int                      outputOriginY,
 	int                      outputWidth,
@@ -364,8 +498,16 @@ PF_Err BPS_MetalSmartRender(
 			(__bridge id<MTLComputePipelineState>)metal_dataP->copy_pipeline_bridge;
 		id<MTLComputePipelineState> mapped_sort_pipeline =
 			(__bridge id<MTLComputePipelineState>)metal_dataP->mapped_sort_pipeline_bridge;
+		id<MTLComputePipelineState> path_classify_count_pipeline =
+			(__bridge id<MTLComputePipelineState>)metal_dataP->path_classify_count_pipeline_bridge;
+		id<MTLComputePipelineState> path_scatter_records_pipeline =
+			(__bridge id<MTLComputePipelineState>)metal_dataP->path_scatter_records_pipeline_bridge;
+		id<MTLComputePipelineState> path_sort_records_pipeline =
+			(__bridge id<MTLComputePipelineState>)metal_dataP->path_sort_records_pipeline_bridge;
 		if (!sort_pipeline || !domain_sort_pipeline || !apply_domain_pipeline ||
-			!copy_pipeline || !mapped_sort_pipeline) {
+			!copy_pipeline || !mapped_sort_pipeline ||
+			!path_classify_count_pipeline || !path_scatter_records_pipeline ||
+			!path_sort_records_pipeline) {
 			return PF_Err_INTERNAL_STRUCT_DAMAGED;
 		}
 
@@ -382,6 +524,18 @@ PF_Err BPS_MetalSmartRender(
 		metal_params.height        = height;
 		metal_params.inputOriginX  = inputOriginX;
 		metal_params.inputOriginY  = inputOriginY;
+		metal_params.inputWidth    = inputWidth;
+		metal_params.inputHeight   = inputHeight;
+		metal_params.criterionPitch = criterionPitch;
+		metal_params.criterionOriginX = criterionOriginX;
+		metal_params.criterionOriginY = criterionOriginY;
+		metal_params.criterionWidth = criterionWidth;
+		metal_params.criterionHeight = criterionHeight;
+		metal_params.triggerPitch = triggerPitch;
+		metal_params.triggerOriginX = triggerOriginX;
+		metal_params.triggerOriginY = triggerOriginY;
+		metal_params.triggerWidth = triggerWidth;
+		metal_params.triggerHeight = triggerHeight;
 		metal_params.outputOriginX = outputOriginX;
 		metal_params.outputOriginY = outputOriginY;
 		metal_params.outputWidth   = outputWidth;
@@ -419,6 +573,8 @@ PF_Err BPS_MetalSmartRender(
 		metal_params.swirlK        = paramsP->swirlK;
 		metal_params.swirlLineMin  = (int)paramsP->swirlLineMin;
 		metal_params.pathDirection = (int)paramsP->pathDirection;
+		metal_params.pathClosed    = (int)paramsP->pathClosed;
+		metal_params.pathLength    = paramsP->pathLength;
 		metal_params.pathSMin      = (int)paramsP->pathSMin;
 		metal_params.pathNMin      = (int)paramsP->pathNMin;
 		metal_params.pathSampleCount = (int)paramsP->pathSampleCount;
@@ -436,7 +592,15 @@ PF_Err BPS_MetalSmartRender(
 
 		// AE provides the GPU world data as id<MTLBuffer> cast to void*.
 		id<MTLBuffer> src_buffer = (__bridge id<MTLBuffer>)src_mem;
+		id<MTLBuffer> criterion_buffer = (__bridge id<MTLBuffer>)criterion_mem;
+		id<MTLBuffer> trigger_buffer = (__bridge id<MTLBuffer>)trigger_mem;
 		id<MTLBuffer> dst_buffer = (__bridge id<MTLBuffer>)dst_mem;
+		if (!criterion_buffer) {
+			criterion_buffer = src_buffer;
+		}
+		if (!trigger_buffer) {
+			trigger_buffer = src_buffer;
+		}
 
 		const NSUInteger pathCount =
 			paramsP->pathSampleCount > 0
@@ -464,8 +628,10 @@ PF_Err BPS_MetalSmartRender(
 			[computeEncoder setComputePipelineState:sort_pipeline];
 			[computeEncoder setBuffer:src_buffer  offset:0 atIndex:0];
 			[computeEncoder setBuffer:dst_buffer  offset:0 atIndex:1];
-			[computeEncoder setBuffer:paramBuffer offset:0 atIndex:2];
-			[computeEncoder setBuffer:pathBuffer  offset:0 atIndex:3];
+			[computeEncoder setBuffer:criterion_buffer offset:0 atIndex:2];
+			[computeEncoder setBuffer:trigger_buffer offset:0 atIndex:3];
+			[computeEncoder setBuffer:paramBuffer offset:0 atIndex:4];
+			[computeEncoder setBuffer:pathBuffer  offset:0 atIndex:5];
 
 			MTLSize threadgroupsPerGrid  = MTLSizeMake((NSUInteger)lineCount, 1, 1);
 			MTLSize threadsPerThreadgroup = MTLSizeMake(256, 1, 1);
@@ -487,44 +653,212 @@ PF_Err BPS_MetalSmartRender(
 			            threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
 			[copyEncoder endEncoding];
 
-			if (paramsP->mappedRecordCount > 0 &&
+			id<MTLBuffer> recordsBuffer = nil;
+			id<MTLBuffer> lineOffsetsBuffer = nil;
+			id<MTLBuffer> workOffsetsBuffer = nil;
+			int mappedRecordCount = (int)paramsP->mappedRecordCount;
+			int mappedWorkItemCount = (int)paramsP->mappedWorkItemCount;
+			const bool hasHostPathMap =
+				paramsP->mappedRecordCount > 0 &&
 				paramsP->mappedWorkItemCount > 0 &&
 				paramsP->mappedRecords &&
 				paramsP->mappedLineOffsets &&
-				paramsP->mappedWorkOffsets) {
+				paramsP->mappedWorkOffsets;
+			if (!hasHostPathMap &&
+				paramsP->pathSampleCount >= 2 &&
+				paramsP->pathSamples) {
+				const std::uint64_t pathMapKey =
+					BPS_PathMapKey(width, height, *paramsP);
+				if (metal_dataP->path_map_key == pathMapKey &&
+					metal_dataP->path_map_width == width &&
+					metal_dataP->path_map_height == height &&
+					metal_dataP->path_map_line_count == lineCount &&
+					metal_dataP->path_records_buffer_bridge &&
+					metal_dataP->path_line_offsets_buffer_bridge &&
+					metal_dataP->path_work_offsets_buffer_bridge) {
+					recordsBuffer =
+						(__bridge id<MTLBuffer>)metal_dataP->path_records_buffer_bridge;
+					lineOffsetsBuffer =
+						(__bridge id<MTLBuffer>)metal_dataP->path_line_offsets_buffer_bridge;
+					workOffsetsBuffer =
+						(__bridge id<MTLBuffer>)metal_dataP->path_work_offsets_buffer_bridge;
+					mappedRecordCount = metal_dataP->path_mapped_record_count;
+					mappedWorkItemCount = metal_dataP->path_mapped_work_item_count;
+				} else {
+					BPS_MetalClearPathMap(metal_dataP);
+
+					const NSUInteger pixelCount =
+						(NSUInteger)width * (NSUInteger)height;
+					id<MTLBuffer> laneBuffer =
+						[device newBufferWithLength:pixelCount * sizeof(int)
+						                    options:MTLResourceStorageModePrivate];
+					id<MTLBuffer> keyBuffer =
+						[device newBufferWithLength:pixelCount * sizeof(float)
+						                    options:MTLResourceStorageModePrivate];
+					id<MTLBuffer> countBuffer =
+						[device newBufferWithLength:(NSUInteger)lineCount * sizeof(std::uint32_t)
+						                    options:MTLResourceStorageModeShared];
+					if (!laneBuffer || !keyBuffer || !countBuffer) {
+						return PF_Err_OUT_OF_MEMORY;
+					}
+					std::memset([countBuffer contents], 0,
+								(NSUInteger)lineCount * sizeof(std::uint32_t));
+
+					id<MTLCommandBuffer> buildCommandBuffer = [queue commandBuffer];
+					id<MTLComputeCommandEncoder> classifyEncoder =
+						[buildCommandBuffer computeCommandEncoder];
+					[classifyEncoder setComputePipelineState:path_classify_count_pipeline];
+					[classifyEncoder setBuffer:pathBuffer  offset:0 atIndex:0];
+					[classifyEncoder setBuffer:laneBuffer  offset:0 atIndex:1];
+					[classifyEncoder setBuffer:keyBuffer   offset:0 atIndex:2];
+					[classifyEncoder setBuffer:countBuffer offset:0 atIndex:3];
+					[classifyEncoder setBuffer:paramBuffer offset:0 atIndex:4];
+					[classifyEncoder dispatchThreadgroups:
+						MTLSizeMake(((NSUInteger)width + 15u) / 16u,
+									((NSUInteger)height + 15u) / 16u,
+									1)
+						threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+					[classifyEncoder endEncoding];
+					[buildCommandBuffer commit];
+					[buildCommandBuffer waitUntilCompleted];
+					if (buildCommandBuffer.status == MTLCommandBufferStatusError) {
+						return PF_Err_INTERNAL_STRUCT_DAMAGED;
+					}
+
+					std::vector<std::uint32_t> laneCounts((size_t)lineCount, 0u);
+					std::memcpy(laneCounts.data(), [countBuffer contents],
+								(size_t)lineCount * sizeof(std::uint32_t));
+
+					std::vector<std::uint32_t> lineOffsets;
+					std::vector<std::uint32_t> workOffsets;
+					std::uint32_t recordCount = 0u;
+					std::uint32_t workCount = 0u;
+					if (!BPS_MetalBuildOffsets(laneCounts, &lineOffsets, &workOffsets,
+											   &recordCount, &workCount)) {
+						return PF_Err_INTERNAL_STRUCT_DAMAGED;
+					}
+
+					if (recordCount > 0u && workCount > 0u) {
+						const NSUInteger recordsBytes =
+							(NSUInteger)recordCount * (NSUInteger)sizeof(BpsMappedPixelRecord);
+						const NSUInteger offsetsBytes =
+							((NSUInteger)lineCount + 1u) * (NSUInteger)sizeof(std::uint32_t);
+						const NSUInteger workRecordsBytes =
+							(NSUInteger)workCount * (NSUInteger)sizeof(BpsMappedPixelRecord);
+						recordsBuffer =
+							[device newBufferWithLength:recordsBytes
+							                    options:MTLResourceStorageModePrivate];
+						lineOffsetsBuffer =
+							[device newBufferWithBytes:lineOffsets.data()
+							                    length:offsetsBytes
+							                   options:MTLResourceStorageModeShared];
+						workOffsetsBuffer =
+							[device newBufferWithBytes:workOffsets.data()
+							                    length:offsetsBytes
+							                   options:MTLResourceStorageModeShared];
+						id<MTLBuffer> cursorBuffer =
+							[device newBufferWithBytes:lineOffsets.data()
+							                    length:offsetsBytes
+							                   options:MTLResourceStorageModeShared];
+						id<MTLBuffer> workRecordsBuffer =
+							[device newBufferWithLength:workRecordsBytes
+							                    options:MTLResourceStorageModePrivate];
+						if (!recordsBuffer || !lineOffsetsBuffer || !workOffsetsBuffer ||
+							!cursorBuffer || !workRecordsBuffer) {
+							return PF_Err_OUT_OF_MEMORY;
+						}
+
+						id<MTLComputeCommandEncoder> scatterEncoder =
+							[commandBuffer computeCommandEncoder];
+						[scatterEncoder setComputePipelineState:path_scatter_records_pipeline];
+						[scatterEncoder setBuffer:laneBuffer     offset:0 atIndex:0];
+						[scatterEncoder setBuffer:keyBuffer      offset:0 atIndex:1];
+						[scatterEncoder setBuffer:cursorBuffer   offset:0 atIndex:2];
+						[scatterEncoder setBuffer:recordsBuffer  offset:0 atIndex:3];
+						[scatterEncoder setBuffer:paramBuffer    offset:0 atIndex:4];
+						[scatterEncoder dispatchThreadgroups:
+							MTLSizeMake(((NSUInteger)width + 15u) / 16u,
+										((NSUInteger)height + 15u) / 16u,
+										1)
+							threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+						[scatterEncoder endEncoding];
+
+						id<MTLComputeCommandEncoder> sortRecordsEncoder =
+							[commandBuffer computeCommandEncoder];
+						[sortRecordsEncoder setComputePipelineState:path_sort_records_pipeline];
+						[sortRecordsEncoder setBuffer:recordsBuffer     offset:0 atIndex:0];
+						[sortRecordsEncoder setBuffer:workRecordsBuffer offset:0 atIndex:1];
+						[sortRecordsEncoder setBuffer:lineOffsetsBuffer offset:0 atIndex:2];
+						[sortRecordsEncoder setBuffer:workOffsetsBuffer offset:0 atIndex:3];
+						[sortRecordsEncoder setBuffer:paramBuffer       offset:0 atIndex:4];
+						[sortRecordsEncoder dispatchThreadgroups:MTLSizeMake((NSUInteger)lineCount, 1, 1)
+						                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+						[sortRecordsEncoder endEncoding];
+
+						metal_dataP->path_records_buffer_bridge =
+							const_cast<void *>(CFBridgingRetain(recordsBuffer));
+						metal_dataP->path_line_offsets_buffer_bridge =
+							const_cast<void *>(CFBridgingRetain(lineOffsetsBuffer));
+						metal_dataP->path_work_offsets_buffer_bridge =
+							const_cast<void *>(CFBridgingRetain(workOffsetsBuffer));
+						metal_dataP->path_map_key = pathMapKey;
+						metal_dataP->path_map_width = width;
+						metal_dataP->path_map_height = height;
+						metal_dataP->path_map_line_count = lineCount;
+						metal_dataP->path_mapped_record_count = (int)recordCount;
+						metal_dataP->path_mapped_work_item_count = (int)workCount;
+						mappedRecordCount = (int)recordCount;
+						mappedWorkItemCount = (int)workCount;
+					}
+				}
+			} else if (hasHostPathMap) {
 				const NSUInteger recordsBytes =
 					(NSUInteger)paramsP->mappedRecordCount *
 					(NSUInteger)sizeof(BpsMappedPixelRecord);
 				const NSUInteger offsetsBytes =
 					((NSUInteger)lineCount + 1u) *
 					(NSUInteger)sizeof(std::uint32_t);
-				const NSUInteger domainBytes =
-					(NSUInteger)paramsP->mappedWorkItemCount *
-					(NSUInteger)sizeof(unsigned int);
-				const NSUInteger keysBytes =
-					(NSUInteger)paramsP->mappedWorkItemCount *
-					(NSUInteger)sizeof(float);
-
-				id<MTLBuffer> recordsBuffer =
+				recordsBuffer =
 					[device newBufferWithBytes:paramsP->mappedRecords
 					                    length:recordsBytes
 					                   options:MTLResourceStorageModeShared];
-				id<MTLBuffer> lineOffsetsBuffer =
+				lineOffsetsBuffer =
 					[device newBufferWithBytes:paramsP->mappedLineOffsets
 					                    length:offsetsBytes
 					                   options:MTLResourceStorageModeShared];
-				id<MTLBuffer> workOffsetsBuffer =
+				workOffsetsBuffer =
 					[device newBufferWithBytes:paramsP->mappedWorkOffsets
 					                    length:offsetsBytes
 					                   options:MTLResourceStorageModeShared];
+			}
+
+			if (mappedRecordCount > 0 &&
+				mappedWorkItemCount > 0 &&
+				recordsBuffer &&
+				lineOffsetsBuffer &&
+				workOffsetsBuffer) {
+				const NSUInteger recordsBytes =
+					(NSUInteger)mappedRecordCount *
+					(NSUInteger)sizeof(BpsMappedPixelRecord);
+				const NSUInteger offsetsBytes =
+					((NSUInteger)lineCount + 1u) *
+					(NSUInteger)sizeof(std::uint32_t);
+				const NSUInteger domainBytes =
+					(NSUInteger)mappedWorkItemCount *
+					(NSUInteger)sizeof(unsigned int);
+				const NSUInteger keysBytes =
+					(NSUInteger)mappedWorkItemCount *
+					(NSUInteger)sizeof(float);
+
 				id<MTLBuffer> domainBuffer =
 					[device newBufferWithLength:domainBytes
 					                    options:MTLResourceStorageModePrivate];
 				id<MTLBuffer> keysBuffer =
 					[device newBufferWithLength:keysBytes
 					                    options:MTLResourceStorageModePrivate];
-				if (!recordsBuffer || !lineOffsetsBuffer || !workOffsetsBuffer ||
-					!domainBuffer || !keysBuffer) {
+				(void)recordsBytes;
+				(void)offsetsBytes;
+				if (!domainBuffer || !keysBuffer) {
 					return PF_Err_OUT_OF_MEMORY;
 				}
 
@@ -533,12 +867,14 @@ PF_Err BPS_MetalSmartRender(
 				[mappedEncoder setComputePipelineState:mapped_sort_pipeline];
 				[mappedEncoder setBuffer:src_buffer         offset:0 atIndex:0];
 				[mappedEncoder setBuffer:dst_buffer         offset:0 atIndex:1];
-				[mappedEncoder setBuffer:domainBuffer      offset:0 atIndex:2];
-				[mappedEncoder setBuffer:keysBuffer        offset:0 atIndex:3];
-				[mappedEncoder setBuffer:paramBuffer       offset:0 atIndex:4];
-				[mappedEncoder setBuffer:recordsBuffer     offset:0 atIndex:5];
-				[mappedEncoder setBuffer:lineOffsetsBuffer offset:0 atIndex:6];
-				[mappedEncoder setBuffer:workOffsetsBuffer offset:0 atIndex:7];
+				[mappedEncoder setBuffer:criterion_buffer  offset:0 atIndex:2];
+				[mappedEncoder setBuffer:trigger_buffer    offset:0 atIndex:3];
+				[mappedEncoder setBuffer:domainBuffer      offset:0 atIndex:4];
+				[mappedEncoder setBuffer:keysBuffer        offset:0 atIndex:5];
+				[mappedEncoder setBuffer:paramBuffer       offset:0 atIndex:6];
+				[mappedEncoder setBuffer:recordsBuffer     offset:0 atIndex:7];
+				[mappedEncoder setBuffer:lineOffsetsBuffer offset:0 atIndex:8];
+				[mappedEncoder setBuffer:workOffsetsBuffer offset:0 atIndex:9];
 				[mappedEncoder dispatchThreadgroups:MTLSizeMake((NSUInteger)lineCount, 1, 1)
 				              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 				[mappedEncoder endEncoding];
@@ -584,10 +920,12 @@ PF_Err BPS_MetalSmartRender(
 				[commandBuffer computeCommandEncoder];
 			[sortEncoder setComputePipelineState:domain_sort_pipeline];
 			[sortEncoder setBuffer:src_buffer   offset:0 atIndex:0];
-			[sortEncoder setBuffer:domainBuffer offset:0 atIndex:1];
-			[sortEncoder setBuffer:keysBuffer   offset:0 atIndex:2];
-			[sortEncoder setBuffer:paramBuffer  offset:0 atIndex:3];
-			[sortEncoder setBuffer:pathBuffer   offset:0 atIndex:4];
+			[sortEncoder setBuffer:criterion_buffer offset:0 atIndex:1];
+			[sortEncoder setBuffer:trigger_buffer offset:0 atIndex:2];
+			[sortEncoder setBuffer:domainBuffer offset:0 atIndex:3];
+			[sortEncoder setBuffer:keysBuffer   offset:0 atIndex:4];
+			[sortEncoder setBuffer:paramBuffer  offset:0 atIndex:5];
+			[sortEncoder setBuffer:pathBuffer   offset:0 atIndex:6];
 			[sortEncoder dispatchThreadgroups:MTLSizeMake((NSUInteger)lineCount, 1, 1)
 			            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 			[sortEncoder endEncoding];

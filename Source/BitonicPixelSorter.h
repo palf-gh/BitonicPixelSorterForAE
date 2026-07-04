@@ -76,7 +76,16 @@ enum {
 	BPS_SWIRL_AMOUNT,		// angle: Swirl twist (360° = one turn to frame corner)
 	BPS_PATH,				// path: layer mask for Path mode
 	BPS_PATH_DIRECTION,		// popup: Normal / Tangent
+	BPS_CRITERION_SOURCE,	// layer: pixels for sort key (None = effect source)
+	BPS_TRIGGER_SOURCE,		// layer: pixels for trigger key (None = effect source)
 	BPS_NUM_PARAMS
+};
+
+// SmartFX checkout_id values for optional key-source layers. Distinct from
+// param indexes so PreRender/SmartRender stay paired even if UI order moves.
+enum {
+	BPS_CHECKOUT_TRIGGER_SOURCE = 100,
+	BPS_CHECKOUT_CRITERION_SOURCE = 101
 };
 
 // Retired before first release (was a CW/CCW popup; sign of BPS_SWIRL_AMOUNT
@@ -89,8 +98,8 @@ enum {
 //
 // UI layout order:
 //   GPU Status | Mode | Order | Threshold Min/Max
-//   | Trigger | Criterion | Affect | Cycle
-//   | Direction | Angle | Centre
+//   | Trigger | Trigger Source | Criterion | Criterion Source
+//   | Affect | Cycle | Direction | Angle | Centre
 //   | Swirl Amount | Path | Path Direction
 enum {
 	BPS_UI_INPUT = 0,
@@ -100,7 +109,9 @@ enum {
 	BPS_UI_THRESHOLD_MIN,
 	BPS_UI_THRESHOLD_MAX,
 	BPS_UI_SORT_TRIGGER,
+	BPS_UI_TRIGGER_SOURCE,
 	BPS_UI_SORT_CRITERION,
+	BPS_UI_CRITERION_SOURCE,
 	BPS_UI_AFFECT,
 	BPS_UI_CYCLE,
 	BPS_UI_DIRECTION,
@@ -253,6 +264,8 @@ PF_Err BPS_SortImageCPU(
 	PF_PixelFormat		pixel_format,
 	PF_EffectWorld		*input_worldP,
 	PF_EffectWorld		*output_worldP,
+	PF_EffectWorld		*criterion_worldP,
+	PF_EffectWorld		*trigger_worldP,
 	const BitonicSorterParams *paramsP);
 
 //-----------------------------------------------------------------------------
@@ -271,6 +284,8 @@ PF_Err BPS_SmartRenderGPU(
 	PF_PixelFormat		pixel_format,
 	PF_EffectWorld		*input_worldP,
 	PF_EffectWorld		*output_worldP,
+	PF_EffectWorld		*criterion_worldP,
+	PF_EffectWorld		*trigger_worldP,
 	PF_SmartRenderExtra	*extraP,
 	const BitonicSorterParams *paramsP);
 

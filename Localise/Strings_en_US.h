@@ -37,10 +37,14 @@ inline const char *GetString(LocKey::Key key) {
     return "Sort Criterion";
   case LocKey::STR_SORT_CRITERION_ITEMS:
     return "Luminance|RGB Average|RGB Product|RGB Minimum|RGB Maximum|Red Channel|Green Channel|Blue Channel|Alpha Channel|Hue|Saturation";
+  case LocKey::STR_CRITERION_SOURCE_NAME:
+    return "Criterion Source Layer";
   case LocKey::STR_SORT_TRIGGER_NAME:
     return "Sort Trigger";
   case LocKey::STR_SORT_TRIGGER_ITEMS:
     return "Luminance|RGB Average|RGB Product|RGB Minimum|RGB Maximum|Red Channel|Green Channel|Blue Channel|Alpha Channel|Hue|Saturation";
+  case LocKey::STR_TRIGGER_SOURCE_NAME:
+    return "Trigger Source Layer";
   case LocKey::STR_AFFECT_NAME:
     return "Affect";
   case LocKey::STR_AFFECT_ITEMS:

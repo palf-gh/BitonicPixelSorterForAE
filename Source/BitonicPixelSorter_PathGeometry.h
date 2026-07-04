@@ -44,6 +44,11 @@ struct BitonicPreRenderData {
 	std::vector<std::uint32_t> mappedWorkOffsets;
 	// Path mode uses a cached, shared map instead of the vectors above.
 	std::shared_ptr<const BpsPathMap> pathMap;
+	// True when PreRender successfully reserved a non-None key-source layer.
+	// GPU worlds often have a null CPU `data` pointer, so SmartRender must not
+	// use `world->data` to decide whether an external source is active.
+	bool has_trigger_source = false;
+	bool has_criterion_source = false;
 };
 
 // Sample the selected mask path into an extended polyline and fill Path-mode
@@ -107,6 +112,13 @@ bool BPS_ClassifyMappedPixel(
 // carry the resolved path domain (BPS_BuildPathGeometry). The returned map is
 // immutable and shared; keep the shared_ptr alive for the render's lifetime.
 std::shared_ptr<const BpsPathMap> BPS_AcquirePathMap(
+	A_long frame_w,
+	A_long frame_h,
+	const BitonicSorterParams &prm);
+
+// Geometry-only cache key shared by the CPU path-map cache and GPU device-side
+// path-map caches. The params must already carry resolved Path geometry.
+std::uint64_t BPS_PathMapKey(
 	A_long frame_w,
 	A_long frame_h,
 	const BitonicSorterParams &prm);

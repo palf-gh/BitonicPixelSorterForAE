@@ -12,6 +12,12 @@
 #include "BitonicCopyInput.rs.h"
 #include "BitonicSortMapped.cso.h"
 #include "BitonicSortMapped.rs.h"
+#include "BitonicBuildPathClassifyCount.cso.h"
+#include "BitonicBuildPathClassifyCount.rs.h"
+#include "BitonicBuildPathScatterRecords.cso.h"
+#include "BitonicBuildPathScatterRecords.rs.h"
+#include "BitonicBuildPathSortRecords.cso.h"
+#include "BitonicBuildPathSortRecords.rs.h"
 
 #include <cstring>
 
@@ -126,6 +132,45 @@ bool BPS_LoadEmbeddedDirectXMappedSortShader(
 		bps_directx_embedded::kBitonicSortMapped_rs_size,
 		bps_directx_embedded::kBitonicSortMapped_cso,
 		bps_directx_embedded::kBitonicSortMapped_cso_size);
+}
+
+bool BPS_LoadEmbeddedDirectXPathClassifyCountShader(
+	const DXContextPtr &context,
+	ShaderObjectPtr &out_shader)
+{
+	return BPS_LoadEmbeddedDirectXShader(
+		context,
+		out_shader,
+		bps_directx_embedded::kBitonicBuildPathClassifyCount_rs,
+		bps_directx_embedded::kBitonicBuildPathClassifyCount_rs_size,
+		bps_directx_embedded::kBitonicBuildPathClassifyCount_cso,
+		bps_directx_embedded::kBitonicBuildPathClassifyCount_cso_size);
+}
+
+bool BPS_LoadEmbeddedDirectXPathScatterRecordsShader(
+	const DXContextPtr &context,
+	ShaderObjectPtr &out_shader)
+{
+	return BPS_LoadEmbeddedDirectXShader(
+		context,
+		out_shader,
+		bps_directx_embedded::kBitonicBuildPathScatterRecords_rs,
+		bps_directx_embedded::kBitonicBuildPathScatterRecords_rs_size,
+		bps_directx_embedded::kBitonicBuildPathScatterRecords_cso,
+		bps_directx_embedded::kBitonicBuildPathScatterRecords_cso_size);
+}
+
+bool BPS_LoadEmbeddedDirectXPathSortRecordsShader(
+	const DXContextPtr &context,
+	ShaderObjectPtr &out_shader)
+{
+	return BPS_LoadEmbeddedDirectXShader(
+		context,
+		out_shader,
+		bps_directx_embedded::kBitonicBuildPathSortRecords_rs,
+		bps_directx_embedded::kBitonicBuildPathSortRecords_rs_size,
+		bps_directx_embedded::kBitonicBuildPathSortRecords_cso,
+		bps_directx_embedded::kBitonicBuildPathSortRecords_cso_size);
 }
 
 #endif

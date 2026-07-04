@@ -37,10 +37,14 @@ inline const char *GetString(LocKey::Key key) {
     return "排序标准";
   case LocKey::STR_SORT_CRITERION_ITEMS:
     return "亮度|RGB平均值|RGB乘积|RGB最小值|RGB最大值|红色通道|绿色通道|蓝色通道|Alpha通道|色相|饱和度";
+  case LocKey::STR_CRITERION_SOURCE_NAME:
+    return "标准源图层";
   case LocKey::STR_SORT_TRIGGER_NAME:
     return "排序触发";
   case LocKey::STR_SORT_TRIGGER_ITEMS:
     return "亮度|RGB平均值|RGB乘积|RGB最小值|RGB最大值|红色通道|绿色通道|蓝色通道|Alpha通道|色相|饱和度";
+  case LocKey::STR_TRIGGER_SOURCE_NAME:
+    return "触发源图层";
   case LocKey::STR_AFFECT_NAME:
     return "影响";
   case LocKey::STR_AFFECT_ITEMS:

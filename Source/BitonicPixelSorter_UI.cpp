@@ -35,7 +35,8 @@ BPS_ClampPopupForUI(A_long value, A_long min_value, A_long max_value, A_long def
 static A_long
 BPS_MaxLineLengthForUI(PF_InData *in_data, PF_ParamDef *params[])
 {
-	if (!in_data || !params || in_data->width <= 0 || in_data->height <= 0) {
+	if (!in_data || !params ||
+		BPS_RenderWidth(in_data) <= 0 || BPS_RenderHeight(in_data) <= 0) {
 		return 0;
 	}
 
@@ -50,11 +51,15 @@ BPS_MaxLineLengthForUI(PF_InData *in_data, PF_ParamDef *params[])
 								  BPS_DIR_HORIZONTAL, BPS_DIR_VERTICAL,
 								  BPS_DIRECTION_DFLT)
 			: BPS_DIRECTION_DFLT;
-		return (direction == BPS_DIR_HORIZONTAL) ? in_data->width : in_data->height;
+		const A_long render_w = BPS_RenderWidth(in_data);
+		const A_long render_h = BPS_RenderHeight(in_data);
+		return (direction == BPS_DIR_HORIZONTAL) ? render_w : render_h;
 	}
 
 	// Non-axis GPU eligibility is gated on frame size, not path length.
-	return in_data->width > in_data->height ? in_data->width : in_data->height;
+	const A_long render_w = BPS_RenderWidth(in_data);
+	const A_long render_h = BPS_RenderHeight(in_data);
+	return render_w > render_h ? render_w : render_h;
 }
 
 static void
@@ -328,9 +333,14 @@ BPS_DrawGpuStatus(
 // Initial hide (ParamsSetup) uses PF_PUI_INVISIBLE + COLLAPSE_TWIRLY for ANGLE /
 // POINT controls; never toggle PF_PUI_INVISIBLE here via PF_UpdateParamUI
 // (Premiere-only per SDK). See .agents/skills/ae-initially-hidden-params.
+//
+// When an ANGLE / POINT is shown, clear COLLAPSE_TWIRLY through PF_UpdateParamUI
+// so the dial appears expanded. Keep COLLAPSE_TWIRLY while hidden so a first
+// paint never leaves an orphan dial.
 static PF_Err
 BPS_SetParamVisible(
 	PF_InData *in_data,
+	PF_OutData *out_data,
 	PF_ParamDef *params[],
 	AEGP_SuiteHandler &suites,
 	AEGP_PluginID plugin_id,
@@ -338,27 +348,44 @@ BPS_SetParamVisible(
 	A_long index,
 	bool visible)
 {
-	(void)in_data;
-
 	if (index <= BPS_UI_INPUT || index >= BPS_UI_NUM_PARAMS || !params[index]) {
 		return PF_Err_NONE;
 	}
 
-	if (!plugin_id || !effectH || !suites.StreamSuite2() ||
-		!suites.DynamicStreamSuite2()) {
-		return PF_Err_NONE;
+	PF_Err err = PF_Err_NONE;
+
+	if (plugin_id && effectH && suites.StreamSuite2() &&
+		suites.DynamicStreamSuite2()) {
+		AEGP_StreamRefH streamH = NULL;
+		if (!suites.StreamSuite2()->AEGP_GetNewEffectStreamByIndex(
+				plugin_id, effectH, index, &streamH) &&
+			streamH) {
+			err = suites.DynamicStreamSuite2()->AEGP_SetDynamicStreamFlag(
+				streamH, AEGP_DynStreamFlag_HIDDEN, FALSE, !visible);
+			suites.StreamSuite2()->AEGP_DisposeStream(streamH);
+		}
 	}
 
-	AEGP_StreamRefH streamH = NULL;
-	if (suites.StreamSuite2()->AEGP_GetNewEffectStreamByIndex(
-			plugin_id, effectH, index, &streamH) ||
-		!streamH) {
-		return PF_Err_NONE;
+	// Expand / collapse the control region for dial-style params.
+	const PF_ParamType type = params[index]->param_type;
+	if (!err && in_data && out_data &&
+		(type == PF_Param_ANGLE || type == PF_Param_POINT ||
+		 type == PF_Param_POINT_3D)) {
+		PF_ParamDef def = *params[index];
+		if (visible) {
+			def.flags &= ~static_cast<A_long>(PF_ParamFlag_COLLAPSE_TWIRLY);
+		} else {
+			def.flags |= PF_ParamFlag_COLLAPSE_TWIRLY;
+		}
+		// Cosmetic only; do not touch ui_flags (no PF_PUI_INVISIBLE on AE).
+		AEFX_SuiteScoper<PF_ParamUtilsSuite3> param_utils(
+			in_data, kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3, out_data);
+		err = param_utils->PF_UpdateParamUI(in_data->effect_ref, index, &def);
+		if (!err) {
+			params[index]->flags = def.flags;
+		}
 	}
 
-	const PF_Err err = suites.DynamicStreamSuite2()->AEGP_SetDynamicStreamFlag(
-		streamH, AEGP_DynStreamFlag_HIDDEN, FALSE, !visible);
-	suites.StreamSuite2()->AEGP_DisposeStream(streamH);
 	return err;
 }
 
@@ -425,23 +452,23 @@ BPS_UpdateParamsUI(
 	}
 
 	PF_Err err = PF_Err_NONE;
-	ERR(BPS_SetParamVisible(in_data, params, suites, plugin_id, effectH,
+	ERR(BPS_SetParamVisible(in_data, out_data, params, suites, plugin_id, effectH,
 							BPS_UI_DIRECTION, mode == BPS_MODE_AXIS));
 	// Angle: Free Angle direction, or Rotation path start offset.
-	ERR(BPS_SetParamVisible(in_data, params, suites, plugin_id, effectH,
+	ERR(BPS_SetParamVisible(in_data, out_data, params, suites, plugin_id, effectH,
 							BPS_UI_ANGLE,
 							mode == BPS_MODE_FREE_ANGLE ||
 								mode == BPS_MODE_ROTATION));
-	ERR(BPS_SetParamVisible(in_data, params, suites, plugin_id, effectH,
+	ERR(BPS_SetParamVisible(in_data, out_data, params, suites, plugin_id, effectH,
 							BPS_UI_CENTER,
 							mode == BPS_MODE_ROTATION ||
 								mode == BPS_MODE_RADIAL ||
 								mode == BPS_MODE_SWIRL));
-	ERR(BPS_SetParamVisible(in_data, params, suites, plugin_id, effectH,
+	ERR(BPS_SetParamVisible(in_data, out_data, params, suites, plugin_id, effectH,
 							BPS_UI_SWIRL_AMOUNT, mode == BPS_MODE_SWIRL));
-	ERR(BPS_SetParamVisible(in_data, params, suites, plugin_id, effectH,
+	ERR(BPS_SetParamVisible(in_data, out_data, params, suites, plugin_id, effectH,
 							BPS_UI_PATH, mode == BPS_MODE_PATH));
-	ERR(BPS_SetParamVisible(in_data, params, suites, plugin_id, effectH,
+	ERR(BPS_SetParamVisible(in_data, out_data, params, suites, plugin_id, effectH,
 							BPS_UI_PATH_DIRECTION, mode == BPS_MODE_PATH));
 
 	if (effectH && suites.EffectSuite2()) {

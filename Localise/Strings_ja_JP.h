@@ -37,10 +37,14 @@ inline const char *GetString(LocKey::Key key) {
     return "ソート基準";
   case LocKey::STR_SORT_CRITERION_ITEMS:
     return "輝度|RGB平均|RGB積|RGB最小|RGB最大|赤チャンネル|緑チャンネル|青チャンネル|アルファチャンネル|色相|彩度";
+  case LocKey::STR_CRITERION_SOURCE_NAME:
+    return "基準ソースレイヤー";
   case LocKey::STR_SORT_TRIGGER_NAME:
     return "ソートトリガー";
   case LocKey::STR_SORT_TRIGGER_ITEMS:
     return "輝度|RGB平均|RGB積|RGB最小|RGB最大|赤チャンネル|緑チャンネル|青チャンネル|アルファチャンネル|色相|彩度";
+  case LocKey::STR_TRIGGER_SOURCE_NAME:
+    return "トリガーソースレイヤー";
   case LocKey::STR_AFFECT_NAME:
     return "影響";
   case LocKey::STR_AFFECT_ITEMS:

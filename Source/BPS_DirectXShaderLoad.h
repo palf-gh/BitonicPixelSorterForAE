@@ -26,4 +26,16 @@ bool BPS_LoadEmbeddedDirectXMappedSortShader(
 	const DXContextPtr &context,
 	ShaderObjectPtr &out_shader);
 
+bool BPS_LoadEmbeddedDirectXPathClassifyCountShader(
+	const DXContextPtr &context,
+	ShaderObjectPtr &out_shader);
+
+bool BPS_LoadEmbeddedDirectXPathScatterRecordsShader(
+	const DXContextPtr &context,
+	ShaderObjectPtr &out_shader);
+
+bool BPS_LoadEmbeddedDirectXPathSortRecordsShader(
+	const DXContextPtr &context,
+	ShaderObjectPtr &out_shader);
+
 #endif
