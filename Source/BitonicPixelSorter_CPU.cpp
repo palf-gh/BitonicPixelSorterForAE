@@ -758,6 +758,10 @@ static void SortGenericPaths(PF_EffectWorld *inP, PF_EffectWorld *outP,
 
 	std::vector<T> domain(domainSize);
 	std::vector<unsigned char> domainValid(domainSize, 0u);
+	// Only slots inside an in-threshold run (length >= 2) are composited over the
+	// original. Everything else keeps its exact source pixel, so the domain
+	// resample round-trip never degrades unsorted areas.
+	std::vector<unsigned char> domainAffected(domainSize, 0u);
 	PathScratch<T> scratch;
 	scratch.run.reserve(static_cast<size_t>(prm.maxLineLength > 0 ? prm.maxLineLength : 1));
 
@@ -766,8 +770,22 @@ static void SortGenericPaths(PF_EffectWorld *inP, PF_EffectWorld *outP,
 	// as one continuous arc — matching sample-plugin behaviour.
 	std::vector<A_long> path;
 	std::vector<A_long> run_positions;
+	std::vector<unsigned char> affectedLine;
 	path.reserve(static_cast<size_t>(prm.maxLineLength > 0 ? prm.maxLineLength : 1));
 	run_positions.reserve(path.capacity());
+	affectedLine.reserve(path.capacity());
+
+	// Mark a run as affected only when it can actually reorder pixels (>= 2), then
+	// sort it. Single in-threshold pixels are left as the exact original.
+	auto flushRun = [&]() {
+		if (run_positions.size() >= 2u) {
+			for (A_long runPos : run_positions) {
+				affectedLine[static_cast<size_t>(runPos)] = 1u;
+			}
+		}
+		SortRunAtPositions<T>(scratch, run_positions, prm);
+		run_positions.clear();
+	};
 
 	for (A_long line = 0; line < lineCount; ++line) {
 		const A_long lineLen = GenericLineLength(prm, line);
@@ -802,6 +820,7 @@ static void SortGenericPaths(PF_EffectWorld *inP, PF_EffectWorld *outP,
 		}
 
 		BuildPathOrder(scratch.validLine, lineLen, &path);
+		affectedLine.assign(lineSize, 0u);
 
 		run_positions.clear();
 		for (A_long pos : path) {
@@ -809,11 +828,10 @@ static void SortGenericPaths(PF_EffectWorld *inP, PF_EffectWorld *outP,
 			if (IsAffectedByThreshold(scratch.triggerKeys[index], prm)) {
 				run_positions.push_back(pos);
 			} else {
-				SortRunAtPositions<T>(scratch, run_positions, prm);
-				run_positions.clear();
+				flushRun();
 			}
 		}
-		SortRunAtPositions<T>(scratch, run_positions, prm);
+		flushRun();
 
 		const size_t base = offsets[static_cast<size_t>(line)];
 		for (A_long kWrite = 0; kWrite < lineLen; ++kWrite) {
@@ -821,6 +839,7 @@ static void SortGenericPaths(PF_EffectWorld *inP, PF_EffectWorld *outP,
 			const size_t dstIndex = base + index;
 			domain[dstIndex] = scratch.sortedLine[index];
 			domainValid[dstIndex] = scratch.validLine[index];
+			domainAffected[dstIndex] = affectedLine[index];
 		}
 	}
 
@@ -842,7 +861,9 @@ static void SortGenericPaths(PF_EffectWorld *inP, PF_EffectWorld *outP,
 
 			const size_t domainIndex =
 				offsets[static_cast<size_t>(line)] + static_cast<size_t>(pos);
-			if (domainIndex < domain.size() && domainValid[domainIndex] != 0u) {
+			// Composite over the original: only overwrite pixels a sort actually
+			// reordered; untouched areas keep the exact source (no resample loss).
+			if (domainIndex < domain.size() && domainAffected[domainIndex] != 0u) {
 				*PixelAtLayer<T>(outP, x, y) = domain[domainIndex];
 			}
 		}

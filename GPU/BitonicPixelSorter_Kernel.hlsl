@@ -825,11 +825,14 @@ void SortDomain(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThread
 		}
 
 		const uint shift = BpsCycleShift(spanSize);
+		// Flag reordered slots (run length >= 2) so ApplyDomain composites only
+		// those over the source and leaves unsorted areas pristine.
+		const uint affectedBit = (spanSize >= 2u) ? 0x80000000u : 0u;
 		for (uint writeIndex = gtid; writeIndex < spanSize; writeIndex += MAX_THREADS) {
 			const uint sortedIndex = (writeIndex + spanSize - shift) % spanSize;
 			const uint pos = asuint(LoadFloat(keysTex, DomainIndex(gid, runStart + writeIndex)));
-			StoreUint(sortTex, DomainIndex(gid, pos),
-				LoadUintUAV(sortTex, DomainIndex(gid, size + sortedIndex)));
+			const uint srcIndex = LoadUintUAV(sortTex, DomainIndex(gid, size + sortedIndex));
+			StoreUint(sortTex, DomainIndex(gid, pos), srcIndex | affectedBit);
 		}
 		AllMemoryBarrierWithGroupSync();
 
@@ -860,9 +863,11 @@ void ApplyDomain(uint3 dispatchThreadID : SV_DispatchThreadID)
 	int domainLine = 0;
 	int domainPos = 0;
 	if (BpsDomainPosForPixel(x, y, domainLine, domainPos)) {
-		const uint srcIndex = LoadUint(domainTex, (uint)(domainLine * domainStride + domainPos));
-		if (srcIndex != 0xffffffffu) {
-			pixel = LoadPixel(srcTex, srcIndex);
+		const uint raw = LoadUint(domainTex, (uint)(domainLine * domainStride + domainPos));
+		// High bit flags slots a sort reordered; composite only those over the
+		// source so unsorted areas keep the exact original (no resample loss).
+		if (raw != 0xffffffffu && (raw & 0x80000000u) != 0u) {
+			pixel = LoadPixel(srcTex, raw & 0x7fffffffu);
 		}
 	}
 

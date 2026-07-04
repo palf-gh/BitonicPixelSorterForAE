@@ -762,10 +762,14 @@ __kernel void BitonicSortDomainKernel(
 		}
 
 		const uint shift = bps_cycle_shift(spanSize, cycleDegrees);
+		// Flag reordered slots (run length >= 2) so ApplyDomain composites only
+		// those over the source and leaves unsorted areas pristine.
+		const uint affectedBit = (spanSize >= 2u) ? 0x80000000u : 0u;
 		for (uint i = gtid; i < spanSize; i += MAX_THREADS) {
 			const uint sortedIndex = (i + spanSize - shift) % spanSize;
 			const uint pos = as_uint(keys[BPS_DOMAIN_INDEX(runStart + i)]);
-			domain[BPS_DOMAIN_INDEX(pos)] = domain[BPS_DOMAIN_INDEX(size + sortedIndex)];
+			const uint srcIndex = domain[BPS_DOMAIN_INDEX(size + sortedIndex)];
+			domain[BPS_DOMAIN_INDEX(pos)] = srcIndex | affectedBit;
 		}
 		barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
 
@@ -836,9 +840,11 @@ __kernel void BitonicApplyDomainKernel(
 								 swirlK, swirlLineMin, pathDirection, pathSMin, pathNMin,
 								 pathSampleCount, pathSamples,
 								 &line, &pos)) {
-		const uint srcIndex = domain[(uint)(line * domainStride + pos)];
-		if (srcIndex != 0xffffffffu) {
-			pixel = srcTex[srcIndex];
+		const uint raw = domain[(uint)(line * domainStride + pos)];
+		// High bit flags slots a sort reordered; composite only those over the
+		// source so unsorted areas keep the exact original (no resample loss).
+		if (raw != 0xffffffffu && (raw & 0x80000000u) != 0u) {
+			pixel = srcTex[raw & 0x7fffffffu];
 		}
 	}
 
