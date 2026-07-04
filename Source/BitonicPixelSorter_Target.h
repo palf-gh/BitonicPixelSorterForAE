@@ -93,8 +93,9 @@
 // Precomputed literals only: Rez must not see addition expressions, or PiPL
 // and GlobalSetup can disagree and AE reports a version mismatch (84601).
 #if defined(BPS_HAS_HLSL)
-	// base | GPU (1<<25 = 33554432) | DirectX (1<<29 = 536870912)
-	#define OUT_FLAGS2		704643072
+	// base (134222848) | GPU (1<<25 = 33554432) | DirectX (1<<29 = 536870912)
+	// = 704648192.
+	#define OUT_FLAGS2		704648192
 #elif defined(BPS_HAS_CUDA) || defined(BPS_HAS_OPENCL) || defined(BPS_HAS_METAL)
 	// base | GPU (1<<25 = 33554432)
 	#define OUT_FLAGS2		167777280
