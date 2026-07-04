@@ -106,16 +106,6 @@ inline float SortKeyUnit(const PF_PixelFloat &p, A_long criterion) {
 	return SortKey(p.red, p.green, p.blue, p.alpha, criterion);
 }
 
-// Sample a sort/trigger key from an optional source world at layer coordinates.
-// Out-of-bounds samples return -1 so threshold runs treat them as unaffected.
-template <typename T>
-inline float SampleKeyAt(PF_EffectWorld *worldP, A_long x, A_long y, A_long keyCriterion) {
-	if (!worldP || !ContainsLayerPoint(worldP, x, y)) {
-		return -1.0f;
-	}
-	return SortKeyUnit(*PixelAtLayer<T>(worldP, x, y), keyCriterion);
-}
-
 template <typename T>
 inline T *PixelAt(PF_EffectWorld *worldP, A_long x, A_long y) {
 	return reinterpret_cast<T *>(reinterpret_cast<char *>(worldP->data) +
@@ -132,6 +122,16 @@ inline bool ContainsLayerPoint(const PF_EffectWorld *worldP, A_long layerX, A_lo
 		   layerY >= worldP->origin_y &&
 		   layerX < worldP->origin_x + worldP->width &&
 		   layerY < worldP->origin_y + worldP->height;
+}
+
+// Sample a sort/trigger key from an optional source world at layer coordinates.
+// Out-of-bounds samples return -1 so threshold runs treat them as unaffected.
+template <typename T>
+inline float SampleKeyAt(PF_EffectWorld *worldP, A_long x, A_long y, A_long keyCriterion) {
+	if (!worldP || !ContainsLayerPoint(worldP, x, y)) {
+		return -1.0f;
+	}
+	return SortKeyUnit(*PixelAtLayer<T>(worldP, x, y), keyCriterion);
 }
 
 inline A_long MaxLong(A_long a, A_long b) {

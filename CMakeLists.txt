@@ -491,6 +491,14 @@ elseif(APPLE)
 		COMMAND ${CMAKE_COMMAND} -E copy
 			"$<IF:$<CONFIG:Debug>,${PIPL_RSRC_DEBUG},${PIPL_RSRC_RELEASE}>"
 			"$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/Contents/Resources/BitonicPixelSorterPiPL.rsrc"
+		# Bump the bundle directory mtime. AE's PluginCache keys off the .plugin
+		# folder timestamp; updating only Contents/MacOS leaves the bundle mtime
+		# stale, so AE keeps the cached PiPL (version mismatch 84601/88601).
+		COMMAND ${CMAKE_COMMAND} -E touch
+			"$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>"
+			"$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/Contents"
+			"$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/Contents/MacOS"
+			"$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/Contents/Resources"
 		COMMAND xattr -cr "$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>"
 		# Ad-hoc code-sign the assembled bundle. The linker only applies a minimal
 		# "linker-signed" signature to the Mach-O; it does NOT produce a
