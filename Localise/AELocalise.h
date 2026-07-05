@@ -37,6 +37,8 @@
 #else
 #include <Carbon/Carbon.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <cstdio>
+#include <cstdlib>
 #endif
 
 namespace AELocalise {
@@ -379,6 +381,286 @@ inline std::string ConvertUTF8ToEncoding(const std::string &utf8,
   return ansiStr;
 }
 #else
+namespace Internal {
+inline std::string UTF16PathToUTF8(const A_UTF16Char *pathZ) {
+  if (!pathZ || !pathZ[0])
+    return "";
+
+  size_t length = 0;
+  while (pathZ[length])
+    ++length;
+
+  CFStringRef cfStr = CFStringCreateWithCharacters(
+      kCFAllocatorDefault, reinterpret_cast<const UniChar *>(pathZ),
+      static_cast<CFIndex>(length));
+  if (!cfStr)
+    return "";
+
+  CFIndex maxLen = CFStringGetMaximumSizeForEncoding(
+                       CFStringGetLength(cfStr), kCFStringEncodingUTF8) +
+                   1;
+  std::string result(static_cast<size_t>(maxLen), '\0');
+  if (!CFStringGetCString(cfStr, &result[0], maxLen, kCFStringEncodingUTF8)) {
+    CFRelease(cfStr);
+    return "";
+  }
+  CFRelease(cfStr);
+  result.resize(std::strlen(result.c_str()));
+  return result;
+}
+
+inline std::string GetPathStringFromCFURL(CFURLRef url) {
+  if (!url)
+    return "";
+
+  char path[4096] = {0};
+  if (CFURLGetFileSystemRepresentation(url, true,
+                                       reinterpret_cast<UInt8 *>(path),
+                                       sizeof(path)))
+    return path;
+  return "";
+}
+
+inline std::string GetHostExecutablePath(PF_InData *in_dataP) {
+  A_UTF16Char sdkPath[AEFX_MAX_PATH] = {0};
+
+  if (in_dataP && in_dataP->utils && in_dataP->utils->get_platform_data) {
+    PF_Err err = in_dataP->utils->get_platform_data(
+        in_dataP->effect_ref, PF_PlatData_EXE_FILE_PATH_W, sdkPath);
+    if (err == PF_Err_NONE && sdkPath[0]) {
+      const std::string path = UTF16PathToUTF8(sdkPath);
+      if (!path.empty() && path.find(".plugin") == std::string::npos)
+        return path;
+    }
+  }
+
+  // Loaded plug-ins run inside the host process; the main bundle is After
+  // Effects, not the .plugin bundle (contrast Windows GetModuleFileNameW(NULL)).
+  CFBundleRef mainBundle = CFBundleGetMainBundle();
+  if (mainBundle) {
+    CFURLRef exeURL = CFBundleCopyExecutableURL(mainBundle);
+    if (exeURL) {
+      const std::string path = GetPathStringFromCFURL(exeURL);
+      CFRelease(exeURL);
+      if (!path.empty())
+        return path;
+    }
+
+    CFURLRef bundleURL = CFBundleCopyBundleURL(mainBundle);
+    if (bundleURL) {
+      const std::string path = GetPathStringFromCFURL(bundleURL);
+      CFRelease(bundleURL);
+      if (!path.empty())
+        return path;
+    }
+  }
+
+  return "";
+}
+
+inline bool ParseLeadingMajorVersion(const std::string &versionText,
+                                     A_long *majorP) {
+  if (!majorP || versionText.empty())
+    return false;
+
+  A_long major = 0;
+  size_t i = 0;
+  while (i < versionText.size() && versionText[i] >= '0' &&
+         versionText[i] <= '9') {
+    major = major * 10 + (versionText[i] - '0');
+    ++i;
+  }
+  if (i == 0)
+    return false;
+
+  *majorP = major;
+  return true;
+}
+
+inline bool CopyHostAppVersionString(char *buffer, size_t bufferSize) {
+  if (!buffer || bufferSize == 0)
+    return false;
+
+  CFBundleRef mainBundle = CFBundleGetMainBundle();
+  if (!mainBundle)
+    return false;
+
+  static const CFStringRef versionKeys[] = {
+      CFSTR("CFBundleShortVersionString"),
+      CFSTR("Adobe Product Version"),
+  };
+
+  for (const CFStringRef key : versionKeys) {
+    CFTypeRef versionValue =
+        CFBundleGetValueForInfoDictionaryKey(mainBundle, key);
+    if (!versionValue ||
+        CFGetTypeID(versionValue) != CFStringGetTypeID())
+      continue;
+
+    buffer[0] = '\0';
+    if (CFStringGetCString(static_cast<CFStringRef>(versionValue), buffer,
+                           static_cast<CFIndex>(bufferSize),
+                           kCFStringEncodingUTF8) &&
+        buffer[0]) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+inline bool GetMacHostAppMajorVersion(A_long *majorP) {
+  if (!majorP)
+    return false;
+
+  char versionBuffer[64] = {0};
+  if (!CopyHostAppVersionString(versionBuffer, sizeof(versionBuffer)))
+    return false;
+
+  return ParseLeadingMajorVersion(versionBuffer, majorP);
+}
+
+inline bool ContainsAsciiCaseInsensitive(const std::string &value,
+                                         const char *needle) {
+  if (!needle || !*needle)
+    return true;
+
+  std::string loweredNeedle;
+  for (const char *p = needle; *p; ++p) {
+    char ch = *p;
+    if (ch >= 'A' && ch <= 'Z')
+      ch = static_cast<char>(ch - 'A' + 'a');
+    loweredNeedle.push_back(ch);
+  }
+
+  for (size_t i = 0; i + loweredNeedle.size() <= value.size(); ++i) {
+    bool matches = true;
+    for (size_t j = 0; j < loweredNeedle.size(); ++j) {
+      char ch = value[i + j];
+      if (ch >= 'A' && ch <= 'Z')
+        ch = static_cast<char>(ch - 'A' + 'a');
+      if (ch != loweredNeedle[j]) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches)
+      return true;
+  }
+  return false;
+}
+
+inline bool HostExecutablePathLooksLikeBeta(const std::string &path) {
+  return ContainsAsciiCaseInsensitive(path, "beta");
+}
+
+inline bool DebugLoggingEnabled() {
+  const char *value = std::getenv("PALF_AELOCALISE_DEBUG");
+  return value && value[0] && value[0] != '0';
+}
+
+inline void AppendDebugLogLine(const std::string &line) {
+  if (line.empty())
+    return;
+
+  FILE *file = std::fopen("/tmp/Palf_AELocalise.log", "ab");
+  if (!file)
+    return;
+
+  const std::string fileLine = line + "\n";
+  std::fwrite(fileLine.data(), 1, fileLine.size(), file);
+  std::fclose(file);
+}
+
+inline void LogHostTextEncodingDecisionOnce(const std::string &executablePath,
+                                            bool isAfterEffects,
+                                            bool looksBeta,
+                                            bool versionDetected,
+                                            A_long detectedMajor,
+                                            bool usesUTF8,
+                                            const char *reason) {
+  if (!DebugLoggingEnabled())
+    return;
+
+  static std::atomic<long> logged{0};
+  long expected = 0;
+  if (!logged.compare_exchange_strong(expected, 1, std::memory_order_acq_rel,
+                                      std::memory_order_relaxed))
+    return;
+
+  std::string line = "[Palf AELocalise] is_after_effects=";
+  line += isAfterEffects ? "1" : "0";
+  line += " beta_path=";
+  line += looksBeta ? "1" : "0";
+  line += " version_detected=";
+  line += versionDetected ? "1" : "0";
+  line += " major=";
+  line += versionDetected ? std::to_string(detectedMajor) : "unknown";
+  line += " uses_utf8=";
+  line += usesUTF8 ? "1" : "0";
+  line += " reason=";
+  line += reason ? reason : "unknown";
+  line += " path=\"";
+  line += executablePath;
+  line += "\"";
+
+  AppendDebugLogLine(line);
+}
+
+inline bool HostUsesUTF8ForAEText(PF_InData *in_dataP) {
+  const bool isAfterEffects =
+      in_dataP && in_dataP->appl_id == kAppID_AfterEffects;
+  if (!isAfterEffects) {
+    LogHostTextEncodingDecisionOnce("", false, false, false, 0, false,
+                                    "not-after-effects");
+    return false;
+  }
+
+  static std::atomic<long> cachedUsesUTF8{-1};
+  long usesUTF8 = cachedUsesUTF8.load(std::memory_order_acquire);
+  if (usesUTF8 < 0) {
+    const std::string executablePath = GetHostExecutablePath(in_dataP);
+    const bool looksBeta = HostExecutablePathLooksLikeBeta(executablePath);
+    bool versionDetected = false;
+    A_long detectedMajor = 0;
+    const char *reason = "legacy-version";
+
+    if (looksBeta) {
+      usesUTF8 = 1;
+      reason = "beta-path";
+    } else {
+      versionDetected = GetMacHostAppMajorVersion(&detectedMajor);
+      if (!versionDetected) {
+        LogHostTextEncodingDecisionOnce(executablePath, true, false, false, 0,
+                                        false, "version-detection-failed");
+        return false;
+      }
+      usesUTF8 = detectedMajor >= 26 ? 1 : 0;
+      if (usesUTF8)
+        reason = "major-version";
+    }
+
+    long expected = -1;
+    cachedUsesUTF8.compare_exchange_strong(
+        expected, usesUTF8, std::memory_order_release,
+        std::memory_order_relaxed);
+    usesUTF8 = cachedUsesUTF8.load(std::memory_order_acquire);
+    if (usesUTF8 < 0) {
+      LogHostTextEncodingDecisionOnce(executablePath, true, looksBeta,
+                                      versionDetected, detectedMajor, false,
+                                      "cache-not-set");
+      return false;
+    }
+
+    LogHostTextEncodingDecisionOnce(executablePath, true, looksBeta,
+                                    versionDetected, detectedMajor,
+                                    usesUTF8 != 0, reason);
+  }
+
+  return usesUTF8 != 0;
+}
+} // namespace Internal
+
 // 言語IDからエンコーディングを取得（macOS）
 inline CFStringEncoding GetEncodingForLanguage(const std::string &localeId) {
   if (localeId == "ja_JP")
@@ -506,7 +788,8 @@ template <typename LocKeyType> inline const char *GetString(LocKeyType key) {
 }
 
 // ローカライズ文字列を取得し、AEが受け付ける文字コードで返す。
-// Windows版AE BetaまたはAE 26以降ではUTF-8を返し、それ以前は言語ごとのコードページへ変換する。
+// AE BetaまたはAE 26以降ではUTF-8を返し、それ以前は言語ごとのレガシー
+// エンコーディング（Windows: コードページ、macOS: Shift-JIS 等）へ変換する。
 template <typename LocKeyType>
 inline const char *GetStringForAE(LocKeyType key, PF_InData *in_dataP) {
   std::string localeId = GetCurrentLanguage(in_dataP);
@@ -529,13 +812,10 @@ inline const char *GetStringForAE(LocKeyType key, PF_InData *in_dataP) {
   UINT codePage = GetCodePageForLanguage(localeId);
   Internal::s_tempBuffer = ConvertUTF8ToEncoding(utf8Str, codePage);
 #else
-  // macOS: After Effects expects param / UI strings in the platform legacy
-  // encoding (e.g. Shift-JIS for Japanese), NOT UTF-8. Passing raw UTF-8 makes
-  // AE fail with "cannot convert Unicode character" and refuse to initialise
-  // the effect. Korean is passed through as UTF-8 because EUC-KR conversion
-  // mojibakes. This matches the working PalfLib behaviour; the conversion
-  // helpers above were present but had been left unused here.
-  if (localeId == "ko_KR") {
+  if (Internal::HostUsesUTF8ForAEText(in_dataP)) {
+    Internal::s_tempBuffer = utf8Str;
+  } else if (localeId == "ko_KR") {
+    // Korean is passed through as UTF-8 because EUC-KR conversion mojibakes.
     Internal::s_tempBuffer = utf8Str;
   } else {
     CFStringEncoding encoding = GetEncodingForLanguage(localeId);
