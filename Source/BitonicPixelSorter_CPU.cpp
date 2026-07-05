@@ -134,6 +134,34 @@ inline float SampleKeyAt(PF_EffectWorld *worldP, A_long x, A_long y, A_long keyC
 	return SortKeyUnit(*PixelAtLayer<T>(worldP, x, y), keyCriterion);
 }
 
+inline bool UsesUnifiedKeys(PF_EffectWorld *criterionP,
+							PF_EffectWorld *triggerP,
+							A_long criterion,
+							A_long trigger)
+{
+	return criterionP == triggerP && criterion == trigger;
+}
+
+template <typename T>
+inline void FillSortKeys(PF_EffectWorld *criterionP,
+						 PF_EffectWorld *triggerP,
+						 A_long x,
+						 A_long y,
+						 A_long criterion,
+						 A_long trigger,
+						 float *criterionKeyOut,
+						 float *triggerKeyOut)
+{
+	if (UsesUnifiedKeys(criterionP, triggerP, criterion, trigger)) {
+		const float key = SampleKeyAt<T>(criterionP, x, y, criterion);
+		*criterionKeyOut = key;
+		*triggerKeyOut = key;
+		return;
+	}
+	*criterionKeyOut = SampleKeyAt<T>(criterionP, x, y, criterion);
+	*triggerKeyOut = SampleKeyAt<T>(triggerP, x, y, trigger);
+}
+
 inline A_long MaxLong(A_long a, A_long b) {
 	return a > b ? a : b;
 }
@@ -561,8 +589,8 @@ static void SortLines(PF_EffectWorld *inP, PF_EffectWorld *outP,
 					const T pixel = *PixelAtLayer<T>(inP, x, y);
 					scratch.sourceLine[index] = pixel;
 					scratch.sortedLine[index] = pixel;
-					scratch.keys[index] = SampleKeyAt<T>(criterionP, x, y, criterion);
-					scratch.triggerKeys[index] = SampleKeyAt<T>(triggerP, x, y, trigger);
+					FillSortKeys<T>(criterionP, triggerP, x, y, criterion, trigger,
+									&scratch.keys[index], &scratch.triggerKeys[index]);
 					scratch.validLine[index] = 1;
 				} else {
 					scratch.sourceLine[index] = T{};
@@ -667,78 +695,102 @@ static void SortMappedPixels(PF_EffectWorld *inP, PF_EffectWorld *outP,
 
 	const A_long criterion = prm.criterion;
 	const A_long trigger = prm.trigger;
-	LineScratch<T> scratch;
 
-	for (A_long line = 0; line < lineCount; ++line) {
-		const std::uint32_t begin = prm.mappedLineOffsets[line];
-		const std::uint32_t end = prm.mappedLineOffsets[line + 1];
-		if (end <= begin) {
-			continue;
-		}
+	auto processLines = [&](A_long chunkStart, A_long chunkEnd) {
+		LineScratch<T> scratch;
 
-		const size_t lineLen = static_cast<size_t>(end - begin);
-		scratch.sourceLine.resize(lineLen);
-		scratch.sortedLine.resize(lineLen);
-		scratch.keys.resize(lineLen);
-		scratch.triggerKeys.resize(lineLen);
-		scratch.validLine.resize(lineLen);
-		scratch.run.clear();
-		scratch.run.reserve(lineLen);
-
-		for (size_t i = 0; i < lineLen; ++i) {
-			const BpsMappedPixelRecord &record =
-				prm.mappedRecords[static_cast<size_t>(begin) + i];
-			const A_long x = static_cast<A_long>(record.pixelIndex % frameW);
-			const A_long y = static_cast<A_long>(record.pixelIndex / frameW);
-			if (ContainsLayerPoint(inP, x, y)) {
-				const T pixel = *PixelAtLayer<T>(inP, x, y);
-				scratch.sourceLine[i] = pixel;
-				scratch.sortedLine[i] = pixel;
-				scratch.keys[i] = SampleKeyAt<T>(criterionP, x, y, criterion);
-				scratch.triggerKeys[i] = SampleKeyAt<T>(triggerP, x, y, trigger);
-				scratch.validLine[i] = 1u;
-			} else {
-				scratch.sourceLine[i] = T{};
-				scratch.sortedLine[i] = T{};
-				scratch.keys[i] = -1.0f;
-				scratch.triggerKeys[i] = -1.0f;
-				scratch.validLine[i] = 0u;
+		for (A_long line = chunkStart; line < chunkEnd; ++line) {
+			const std::uint32_t begin = prm.mappedLineOffsets[line];
+			const std::uint32_t end = prm.mappedLineOffsets[line + 1];
+			if (end <= begin) {
+				continue;
 			}
-		}
 
-		A_long k = 0;
-		const A_long lineLenLong = static_cast<A_long>(lineLen);
-		while (k < lineLenLong) {
-			const size_t keyIndex = static_cast<size_t>(k);
-			if (scratch.validLine[keyIndex] != 0u &&
-				IsAffectedByThreshold(scratch.triggerKeys[keyIndex], prm)) {
-				const A_long start = k;
-				scratch.run.clear();
-				while (k < lineLenLong) {
-					const size_t runIndex = static_cast<size_t>(k);
-					if (scratch.validLine[runIndex] == 0u ||
-						!IsAffectedByThreshold(scratch.triggerKeys[runIndex], prm)) {
-						break;
+			const size_t lineLen = static_cast<size_t>(end - begin);
+			scratch.sourceLine.resize(lineLen);
+			scratch.sortedLine.resize(lineLen);
+			scratch.keys.resize(lineLen);
+			scratch.triggerKeys.resize(lineLen);
+			scratch.validLine.resize(lineLen);
+			scratch.run.clear();
+			scratch.run.reserve(lineLen);
+
+			for (size_t i = 0; i < lineLen; ++i) {
+				const BpsMappedPixelRecord &record =
+					prm.mappedRecords[static_cast<size_t>(begin) + i];
+				const A_long x = static_cast<A_long>(record.pixelIndex % frameW);
+				const A_long y = static_cast<A_long>(record.pixelIndex / frameW);
+				if (ContainsLayerPoint(inP, x, y)) {
+					const T pixel = *PixelAtLayer<T>(inP, x, y);
+					scratch.sourceLine[i] = pixel;
+					scratch.sortedLine[i] = pixel;
+					FillSortKeys<T>(criterionP, triggerP, x, y, criterion, trigger,
+									&scratch.keys[i], &scratch.triggerKeys[i]);
+					scratch.validLine[i] = 1u;
+				} else {
+					scratch.sourceLine[i] = T{};
+					scratch.sortedLine[i] = T{};
+					scratch.keys[i] = -1.0f;
+					scratch.triggerKeys[i] = -1.0f;
+					scratch.validLine[i] = 0u;
+				}
+			}
+
+			A_long k = 0;
+			const A_long lineLenLong = static_cast<A_long>(lineLen);
+			while (k < lineLenLong) {
+				const size_t keyIndex = static_cast<size_t>(k);
+				if (scratch.validLine[keyIndex] != 0u &&
+					IsAffectedByThreshold(scratch.triggerKeys[keyIndex], prm)) {
+					const A_long start = k;
+					scratch.run.clear();
+					while (k < lineLenLong) {
+						const size_t runIndex = static_cast<size_t>(k);
+						if (scratch.validLine[runIndex] == 0u ||
+							!IsAffectedByThreshold(scratch.triggerKeys[runIndex], prm)) {
+							break;
+						}
+						scratch.run.push_back(Entry<T>{
+							scratch.keys[runIndex], static_cast<uint32_t>(k)});
+						++k;
 					}
-					scratch.run.push_back(Entry<T>{
-						scratch.keys[runIndex], static_cast<uint32_t>(k)});
+					SortRunIntoLine<T>(scratch, start, prm);
+				} else {
 					++k;
 				}
-				SortRunIntoLine<T>(scratch, start, prm);
-			} else {
-				++k;
 			}
-		}
 
-		for (size_t i = 0; i < lineLen; ++i) {
-			const BpsMappedPixelRecord &record =
-				prm.mappedRecords[static_cast<size_t>(begin) + i];
-			const A_long x = static_cast<A_long>(record.pixelIndex % frameW);
-			const A_long y = static_cast<A_long>(record.pixelIndex / frameW);
-			if (scratch.validLine[i] != 0u && ContainsLayerPoint(outP, x, y)) {
-				*PixelAtLayer<T>(outP, x, y) = scratch.sortedLine[i];
+			for (size_t i = 0; i < lineLen; ++i) {
+				const BpsMappedPixelRecord &record =
+					prm.mappedRecords[static_cast<size_t>(begin) + i];
+				const A_long x = static_cast<A_long>(record.pixelIndex % frameW);
+				const A_long y = static_cast<A_long>(record.pixelIndex / frameW);
+				if (scratch.validLine[i] != 0u && ContainsLayerPoint(outP, x, y)) {
+					*PixelAtLayer<T>(outP, x, y) = scratch.sortedLine[i];
+				}
 			}
 		}
+	};
+
+	const unsigned int workerCount = WorkerCountFor(lineCount);
+	if (workerCount <= 1) {
+		processLines(0, lineCount);
+		return;
+	}
+
+	std::vector<std::thread> workers;
+	workers.reserve(workerCount);
+	for (unsigned int worker = 0; worker < workerCount; ++worker) {
+		const A_long chunkBegin =
+			static_cast<A_long>((static_cast<long long>(lineCount) * worker) / workerCount);
+		const A_long chunkEnd =
+			static_cast<A_long>((static_cast<long long>(lineCount) * (worker + 1)) / workerCount);
+		if (chunkBegin < chunkEnd) {
+			workers.emplace_back(processLines, chunkBegin, chunkEnd);
+		}
+	}
+	for (std::thread &worker : workers) {
+		worker.join();
 	}
 }
 
@@ -821,10 +873,8 @@ static void SortGenericPaths(PF_EffectWorld *inP, PF_EffectWorld *outP,
 				const T pixel = *PixelAtLayer<T>(inP, coord.x, coord.y);
 				scratch.sourceLine[index] = pixel;
 				scratch.sortedLine[index] = pixel;
-				scratch.keys[index] =
-					SampleKeyAt<T>(criterionP, coord.x, coord.y, criterion);
-				scratch.triggerKeys[index] =
-					SampleKeyAt<T>(triggerP, coord.x, coord.y, trigger);
+				FillSortKeys<T>(criterionP, triggerP, coord.x, coord.y, criterion, trigger,
+								&scratch.keys[index], &scratch.triggerKeys[index]);
 				scratch.validLine[index] = 1u;
 			} else {
 				scratch.sourceLine[index] = T{};
@@ -915,7 +965,7 @@ PF_Err BPS_SortImageCPU(
 			SortLines<PF_PixelFloat>(input_worldP, output_worldP,
 									  criterion_worldP, trigger_worldP, *paramsP,
 									  BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
-		} else if (paramsP->mode == BPS_MODE_PATH) {
+		} else if (paramsP->mappedRecords && paramsP->mappedRecordCount > 0) {
 			SortMappedPixels<PF_PixelFloat>(input_worldP, output_worldP,
 											criterion_worldP, trigger_worldP, *paramsP,
 											BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
@@ -930,7 +980,7 @@ PF_Err BPS_SortImageCPU(
 			SortLines<PF_Pixel16>(input_worldP, output_worldP,
 								   criterion_worldP, trigger_worldP, *paramsP,
 								   BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
-		} else if (paramsP->mode == BPS_MODE_PATH) {
+		} else if (paramsP->mappedRecords && paramsP->mappedRecordCount > 0) {
 			SortMappedPixels<PF_Pixel16>(input_worldP, output_worldP,
 										 criterion_worldP, trigger_worldP, *paramsP,
 										 BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
@@ -945,7 +995,7 @@ PF_Err BPS_SortImageCPU(
 			SortLines<PF_Pixel8>(input_worldP, output_worldP,
 								  criterion_worldP, trigger_worldP, *paramsP,
 								  BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
-		} else if (paramsP->mode == BPS_MODE_PATH) {
+		} else if (paramsP->mappedRecords && paramsP->mappedRecordCount > 0) {
 			SortMappedPixels<PF_Pixel8>(input_worldP, output_worldP,
 										criterion_worldP, trigger_worldP, *paramsP,
 										BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));

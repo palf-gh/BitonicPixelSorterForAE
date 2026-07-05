@@ -13,11 +13,10 @@
 #include "BitonicPixelSorter.h"
 #include "BitonicPixelSorter_GpuEligibility.h"
 #include "BitonicPixelSorter_PathGeometry.h"
+#include "BPS_PerfDiag.h"
 
 #if defined(BPS_RENDER_DIAG)
 	#include <chrono>
-	#include <cstdarg>
-	#include <cstdio>
 #endif
 #include <algorithm>
 #include <cstdlib>
@@ -185,28 +184,21 @@ PixelFormatName(PF_PixelFormat pixel_format)
 	}
 }
 
-static void
-BPS_DiagLog(const char *format, ...)
-{
-	char message[1024];
-	va_list args;
-	va_start(args, format);
-	std::vsnprintf(message, sizeof(message), format, args);
-	va_end(args);
+#endif
 
-#if defined(_WIN32)
-	OutputDebugStringA("[BitonicPixelSorter] ");
-	OutputDebugStringA(message);
-	OutputDebugStringA("\n");
-#else
-	FILE *file = std::fopen("/tmp/BitonicPixelSorter_render_diag.log", "a");
-	if (file) {
-		std::fprintf(file, "[BitonicPixelSorter] %s\n", message);
-		std::fclose(file);
+static bool
+BPS_LayerParamIsLinked(PF_InData *in_data, A_long ui_param_id)
+{
+	PF_ParamDef param;
+	AEFX_CLR_STRUCT(param);
+	if (PF_CHECKOUT_PARAM(in_data, ui_param_id, in_data->current_time,
+						  in_data->time_step, in_data->time_scale, &param) != PF_Err_NONE) {
+		return false;
 	}
-#endif
+	(void)PF_CHECKIN_PARAM(in_data, &param);
+	// "None" leaves the layer param at PF_LayerDefault_NONE with zero size.
+	return param.u.ld.dephault != PF_LayerDefault_NONE;
 }
-#endif
 
 static bool
 BPS_HostVersionAtLeast(const char *version, long required_major, long required_minor)
@@ -566,7 +558,7 @@ BPS_BindMappedPointers(BitonicPreRenderData *dataP)
 		? nullptr : dataP->pathSamples.data();
 	infoP->pathSampleCount = static_cast<A_long>(dataP->pathSamples.size());
 
-	if (infoP->mode == BPS_MODE_PATH && dataP->pathMap) {
+	if (dataP->pathMap) {
 		const BpsPathMap &m = *dataP->pathMap;
 		infoP->mappedRecords = m.records.empty() ? nullptr : m.records.data();
 		infoP->mappedLineOffsets =
@@ -598,6 +590,9 @@ PreRender(
 	PF_OutData			*out_data,
 	PF_PreRenderExtra	*extraP)
 {
+#if defined(BPS_RENDER_DIAG)
+	BPS_PERF_SCOPE("PreRender");
+#endif
 	PF_Err				err = PF_Err_NONE;
 	PF_CheckoutResult	in_result;
 	const PF_RenderRequest	raw_req = extraP->input->output_request;
@@ -619,12 +614,14 @@ PreRender(
 	infoP->mode = BPS_ClampPopup(cur_param.u.pd.value,
 								 BPS_MODE_AXIS, BPS_MODE_PATH, BPS_MODE_DFLT);
 
-	AEFX_CLR_STRUCT(cur_param);
-	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_DIRECTION, in_data->current_time,
-						  in_data->time_step, in_data->time_scale, &cur_param));
-	infoP->direction = BPS_ClampPopup(cur_param.u.pd.value,
-									  BPS_DIR_HORIZONTAL, BPS_DIR_VERTICAL,
-									  BPS_DIRECTION_DFLT);
+	if (infoP->mode == BPS_MODE_AXIS) {
+		AEFX_CLR_STRUCT(cur_param);
+		ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_DIRECTION, in_data->current_time,
+							  in_data->time_step, in_data->time_scale, &cur_param));
+		infoP->direction = BPS_ClampPopup(cur_param.u.pd.value,
+										  BPS_DIR_HORIZONTAL, BPS_DIR_VERTICAL,
+										  BPS_DIRECTION_DFLT);
+	}
 
 	AEFX_CLR_STRUCT(cur_param);
 	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_ORDER, in_data->current_time,
@@ -661,25 +658,37 @@ PreRender(
 	infoP->cycleDegrees = static_cast<float>(FIX_2_FLOAT(cur_param.u.ad.value));
 	infoP->cycleRadians = static_cast<float>(infoP->cycleDegrees * BPS_PI / 180.0);
 
-	AEFX_CLR_STRUCT(cur_param);
-	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_ANGLE, in_data->current_time,
-						  in_data->time_step, in_data->time_scale, &cur_param));
-	const double angle_degrees = FIX_2_FLOAT(cur_param.u.ad.value);
-	infoP->angleRadians = static_cast<float>(angle_degrees * BPS_PI / 180.0);
-	infoP->angleCos = static_cast<float>(std::cos(infoP->angleRadians));
-	infoP->angleSin = static_cast<float>(std::sin(infoP->angleRadians));
+	const bool needs_angle =
+		infoP->mode == BPS_MODE_FREE_ANGLE ||
+		infoP->mode == BPS_MODE_ROTATION ||
+		infoP->mode == BPS_MODE_SWIRL;
+	if (needs_angle) {
+		AEFX_CLR_STRUCT(cur_param);
+		ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_ANGLE, in_data->current_time,
+							  in_data->time_step, in_data->time_scale, &cur_param));
+		const double angle_degrees = FIX_2_FLOAT(cur_param.u.ad.value);
+		infoP->angleRadians = static_cast<float>(angle_degrees * BPS_PI / 180.0);
+		infoP->angleCos = static_cast<float>(std::cos(infoP->angleRadians));
+		infoP->angleSin = static_cast<float>(std::sin(infoP->angleRadians));
+	}
 
 	infoP->downsampleX = BPS_RationalScale(in_data->downsample_x);
 	infoP->downsampleY = BPS_RationalScale(in_data->downsample_y);
 
-	// Point params are already in the current (downsampled) layer coordinate
-	// system. Do not multiply by downsample again or the centre drifts toward
-	// the top-left at draft / half resolution.
-	AEFX_CLR_STRUCT(cur_param);
-	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_CENTER, in_data->current_time,
-						  in_data->time_step, in_data->time_scale, &cur_param));
-	infoP->centerX = static_cast<float>(FIX_2_FLOAT(cur_param.u.td.x_value));
-	infoP->centerY = static_cast<float>(FIX_2_FLOAT(cur_param.u.td.y_value));
+	const bool needs_center =
+		infoP->mode == BPS_MODE_ROTATION ||
+		infoP->mode == BPS_MODE_RADIAL ||
+		infoP->mode == BPS_MODE_SWIRL;
+	if (needs_center) {
+		// Point params are already in the current (downsampled) layer coordinate
+		// system. Do not multiply by downsample again or the centre drifts toward
+		// the top-left at draft / half resolution.
+		AEFX_CLR_STRUCT(cur_param);
+		ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_CENTER, in_data->current_time,
+							  in_data->time_step, in_data->time_scale, &cur_param));
+		infoP->centerX = static_cast<float>(FIX_2_FLOAT(cur_param.u.td.x_value));
+		infoP->centerY = static_cast<float>(FIX_2_FLOAT(cur_param.u.td.y_value));
+	}
 
 	AEFX_CLR_STRUCT(cur_param);
 	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_THRESHOLD_MIN, in_data->current_time,
@@ -691,12 +700,12 @@ PreRender(
 						  in_data->time_step, in_data->time_scale, &cur_param));
 	infoP->thresholdMax = (float)(cur_param.u.fs_d.value / 100.0);
 
-	AEFX_CLR_STRUCT(cur_param);
-	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_SWIRL_AMOUNT, in_data->current_time,
-						  in_data->time_step, in_data->time_scale, &cur_param));
-	// Angle degrees: 360° = one turn to the farthest frame corner; sign = direction.
-	const float swirl_degrees = static_cast<float>(FIX_2_FLOAT(cur_param.u.ad.value));
-	{
+	if (infoP->mode == BPS_MODE_SWIRL) {
+		AEFX_CLR_STRUCT(cur_param);
+		ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_SWIRL_AMOUNT, in_data->current_time,
+							  in_data->time_step, in_data->time_scale, &cur_param));
+		// Angle degrees: 360° = one turn to the farthest frame corner; sign = direction.
+		const float swirl_degrees = static_cast<float>(FIX_2_FLOAT(cur_param.u.ad.value));
 		const A_long render_w = BPS_RenderWidth(in_data);
 		const A_long render_h = BPS_RenderHeight(in_data);
 		const float xs[4] = {0.0f, static_cast<float>(render_w - 1),
@@ -718,18 +727,20 @@ PreRender(
 		infoP->swirlK = swirl_radians / max_radius;
 	}
 
-	AEFX_CLR_STRUCT(cur_param);
-	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_PATH_DIRECTION, in_data->current_time,
-						  in_data->time_step, in_data->time_scale, &cur_param));
-	infoP->pathDirection = BPS_ClampPopup(cur_param.u.pd.value,
-										  BPS_PATH_DIR_NORMAL, BPS_PATH_DIR_TANGENT,
-										  BPS_PATH_DIRECTION_DFLT);
-
 	PF_PathID path_id = 0;
-	AEFX_CLR_STRUCT(cur_param);
-	ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_PATH, in_data->current_time,
-						  in_data->time_step, in_data->time_scale, &cur_param));
-	path_id = cur_param.u.path_d.path_id;
+	if (infoP->mode == BPS_MODE_PATH) {
+		AEFX_CLR_STRUCT(cur_param);
+		ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_PATH_DIRECTION, in_data->current_time,
+							  in_data->time_step, in_data->time_scale, &cur_param));
+		infoP->pathDirection = BPS_ClampPopup(cur_param.u.pd.value,
+											  BPS_PATH_DIR_NORMAL, BPS_PATH_DIR_TANGENT,
+											  BPS_PATH_DIRECTION_DFLT);
+
+		AEFX_CLR_STRUCT(cur_param);
+		ERR(PF_CHECKOUT_PARAM(in_data, BPS_UI_PATH, in_data->current_time,
+							  in_data->time_step, in_data->time_scale, &cur_param));
+		path_id = cur_param.u.path_d.path_id;
+	}
 
 	if (!err && infoP->mode == BPS_MODE_PATH) {
 		ERR(BPS_BuildPathGeometry(in_data, out_data, path_id,
@@ -748,6 +759,10 @@ PreRender(
 	if (!err && infoP->mode == BPS_MODE_PATH && !gpu_eligibility.render_possible) {
 		dataP->pathMap =
 			BPS_AcquirePathMap(BPS_RenderWidth(in_data), BPS_RenderHeight(in_data), *infoP);
+	}
+	if (!err && BPS_ModeUsesTransformMap(infoP->mode)) {
+		dataP->pathMap =
+			BPS_AcquireTransformMap(BPS_RenderWidth(in_data), BPS_RenderHeight(in_data), *infoP);
 	}
 
 	if (gpu_eligibility.render_possible) {
@@ -817,29 +832,33 @@ PreRender(
 		AEFX_CLR_STRUCT(trigger_result);
 		AEFX_CLR_STRUCT(criterion_result);
 
-		const PF_Err trigger_err = extraP->cb->checkout_layer(
-			in_data->effect_ref,
-			BPS_UI_TRIGGER_SOURCE,
-			BPS_CHECKOUT_TRIGGER_SOURCE,
-			&key_req,
-			in_data->current_time,
-			in_data->time_step,
-			in_data->time_scale,
-			&trigger_result);
+		const PF_Err trigger_err = BPS_LayerParamIsLinked(in_data, BPS_UI_TRIGGER_SOURCE)
+			? extraP->cb->checkout_layer(
+				in_data->effect_ref,
+				BPS_UI_TRIGGER_SOURCE,
+				BPS_CHECKOUT_TRIGGER_SOURCE,
+				&key_req,
+				in_data->current_time,
+				in_data->time_step,
+				in_data->time_scale,
+				&trigger_result)
+			: PF_Err_NONE;
 		dataP->has_trigger_source =
 			(trigger_err == PF_Err_NONE &&
 			 trigger_result.ref_width > 0 &&
 			 trigger_result.ref_height > 0);
 
-		const PF_Err criterion_err = extraP->cb->checkout_layer(
-			in_data->effect_ref,
-			BPS_UI_CRITERION_SOURCE,
-			BPS_CHECKOUT_CRITERION_SOURCE,
-			&key_req,
-			in_data->current_time,
-			in_data->time_step,
-			in_data->time_scale,
-			&criterion_result);
+		const PF_Err criterion_err = BPS_LayerParamIsLinked(in_data, BPS_UI_CRITERION_SOURCE)
+			? extraP->cb->checkout_layer(
+				in_data->effect_ref,
+				BPS_UI_CRITERION_SOURCE,
+				BPS_CHECKOUT_CRITERION_SOURCE,
+				&key_req,
+				in_data->current_time,
+				in_data->time_step,
+				in_data->time_scale,
+				&criterion_result)
+			: PF_Err_NONE;
 		dataP->has_criterion_source =
 			(criterion_err == PF_Err_NONE &&
 			 criterion_result.ref_width > 0 &&
@@ -894,9 +913,14 @@ SmartRender(
 	}
 	BitonicSorterParams *infoP = &dataP->params;
 	BPS_BindMappedPointers(dataP);
-	if (!isGPU && infoP->mode == BPS_MODE_PATH && !dataP->pathMap) {
-		dataP->pathMap =
-			BPS_AcquirePathMap(BPS_RenderWidth(in_data), BPS_RenderHeight(in_data), *infoP);
+	if (!dataP->pathMap && BPS_ModeUsesMappedSort(infoP->mode)) {
+		if (infoP->mode == BPS_MODE_PATH) {
+			dataP->pathMap =
+				BPS_AcquirePathMap(BPS_RenderWidth(in_data), BPS_RenderHeight(in_data), *infoP);
+		} else if (BPS_ModeUsesTransformMap(infoP->mode)) {
+			dataP->pathMap =
+				BPS_AcquireTransformMap(BPS_RenderWidth(in_data), BPS_RenderHeight(in_data), *infoP);
+		}
 		BPS_BindMappedPointers(dataP);
 	}
 

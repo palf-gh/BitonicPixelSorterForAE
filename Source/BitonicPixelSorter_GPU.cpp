@@ -33,6 +33,7 @@
 #include "BitonicPixelSorter.h"
 #include "BitonicPixelSorter_GpuEligibility.h"
 #include "BitonicPixelSorter_PathGeometry.h"
+#include "BPS_PerfDiag.h"
 
 #include <atomic>
 #include <algorithm>
@@ -100,6 +101,8 @@ struct OpenCLGPUData {
 	cl_kernel path_classify_count_kernel;
 	cl_kernel path_scatter_records_kernel;
 	cl_kernel path_sort_records_kernel;
+	cl_mem path_samples_mem;
+	int path_samples_capacity;
 	cl_mem path_records_mem;
 	cl_mem path_line_offsets_mem;
 	cl_mem path_work_offsets_mem;
@@ -109,6 +112,10 @@ struct OpenCLGPUData {
 	int path_map_line_count;
 	int path_mapped_record_count;
 	int path_mapped_work_item_count;
+	cl_mem domain_pool_mem;
+	cl_mem keys_pool_mem;
+	size_t domain_pool_bytes;
+	size_t keys_pool_bytes;
 };
 
 inline PF_Err CL2Err(cl_int cl_result)
@@ -134,6 +141,21 @@ static void ReleaseOpenCLPathMap(OpenCLGPUData *cl_dataP)
 	if (cl_dataP->path_records_mem) {
 		(void)clReleaseMemObject(cl_dataP->path_records_mem);
 		cl_dataP->path_records_mem = 0;
+	}
+	if (cl_dataP->path_samples_mem) {
+		(void)clReleaseMemObject(cl_dataP->path_samples_mem);
+		cl_dataP->path_samples_mem = 0;
+		cl_dataP->path_samples_capacity = 0;
+	}
+	if (cl_dataP->domain_pool_mem) {
+		(void)clReleaseMemObject(cl_dataP->domain_pool_mem);
+		cl_dataP->domain_pool_mem = 0;
+		cl_dataP->domain_pool_bytes = 0;
+	}
+	if (cl_dataP->keys_pool_mem) {
+		(void)clReleaseMemObject(cl_dataP->keys_pool_mem);
+		cl_dataP->keys_pool_mem = 0;
+		cl_dataP->keys_pool_bytes = 0;
 	}
 	cl_dataP->path_map_key = 0ull;
 	cl_dataP->path_map_width = 0;
@@ -685,27 +707,7 @@ std::string BPS_QueryDirectXDeviceName(ID3D12Device *device)
 #endif
 
 #if defined(BPS_RENDER_DIAG)
-static void
-BPS_GpuDiagLog(const char *format, ...)
-{
-	char message[1024];
-	va_list args;
-	va_start(args, format);
-	std::vsnprintf(message, sizeof(message), format, args);
-	va_end(args);
-
-#if defined(_WIN32)
-	OutputDebugStringA("[BitonicPixelSorter] ");
-	OutputDebugStringA(message);
-	OutputDebugStringA("\n");
-#else
-	FILE *file = std::fopen("/tmp/BitonicPixelSorter_render_diag.log", "a");
-	if (file) {
-		std::fprintf(file, "[BitonicPixelSorter] %s\n", message);
-		std::fclose(file);
-	}
-#endif
-}
+#define BPS_GpuDiagLog BPS_DiagLog
 #endif
 
 } // namespace
@@ -902,6 +904,15 @@ PF_Err BPS_GPUDeviceSetup(
 			cl_dataP->path_sort_records_kernel =
 				clCreateKernel(cl_dataP->program, "BitonicBuildPathSortRecordsKernel", &result);
 			BPS_CL_ERR(result);
+		}
+
+		if (!err) {
+			const size_t dummy_path_bytes = sizeof(BpsPathSample);
+			cl_dataP->path_samples_mem =
+				clCreateBuffer(context, CL_MEM_READ_ONLY, dummy_path_bytes,
+							   0, &result);
+			BPS_CL_ERR(result);
+			cl_dataP->path_samples_capacity = 1;
 		}
 
 		if (!err) {
@@ -1109,6 +1120,9 @@ PF_Err BPS_SmartRenderGPU(
 	PF_SmartRenderExtra			*extraP,
 	const BitonicSorterParams	*paramsP)
 {
+#if defined(BPS_RENDER_DIAG)
+	BPS_PERF_SCOPE("SmartRenderGPU");
+#endif
 	PF_Err err = PF_Err_NONE;
 
 	if (pixel_format != PF_PixelFormat_GPU_BGRA128) {
@@ -1127,7 +1141,7 @@ PF_Err BPS_SmartRenderGPU(
 	const int lineCount = (paramsP->mode == BPS_MODE_AXIS)
 		? (direction ? output_worldP->height : output_worldP->width)
 		: static_cast<int>(paramsP->domainLineCount);
-	if (lineCount <= 0 && paramsP->mode != BPS_MODE_PATH) {
+	if (lineCount <= 0 && !BPS_ModeUsesMappedSort(paramsP->mode)) {
 		return PF_Err_NONE;
 	}
 
@@ -1227,13 +1241,15 @@ PF_Err BPS_SmartRenderGPU(
 	const void *mappedLineOffsetsHost = paramsP->mappedLineOffsets;
 	const void *mappedWorkOffsetsHost = paramsP->mappedWorkOffsets;
 	std::shared_ptr<const BpsPathMap> fallbackPathMap;
-	const bool needsPathMap =
-		mode == BPS_MODE_PATH &&
+	const bool needsMappedSort =
+		BPS_ModeUsesMappedSort(mode) &&
 		(mappedRecordCount <= 0 || mappedWorkItemCount <= 0 ||
 		 !mappedRecordsHost || !mappedLineOffsetsHost || !mappedWorkOffsetsHost);
+	const bool needsPathMap = needsMappedSort;
 #if defined(BPS_HAS_CUDA)
 	const bool cudaCanBuildPathMap =
 		needsPathMap &&
+		mode == BPS_MODE_PATH &&
 		extraP->input->what_gpu == PF_GPU_Framework_CUDA &&
 		pathSampleCount >= 2 &&
 		pathSamplesHost;
@@ -1243,6 +1259,7 @@ PF_Err BPS_SmartRenderGPU(
 #if defined(BPS_HAS_OPENCL)
 	const bool openclCanBuildPathMap =
 		needsPathMap &&
+		mode == BPS_MODE_PATH &&
 		extraP->input->what_gpu == PF_GPU_Framework_OPENCL &&
 		pathSampleCount >= 2 &&
 		pathSamplesHost;
@@ -1252,6 +1269,7 @@ PF_Err BPS_SmartRenderGPU(
 #if defined(BPS_HAS_HLSL)
 	const bool directxCanBuildPathMap =
 		needsPathMap &&
+		mode == BPS_MODE_PATH &&
 		extraP->input->what_gpu == PF_GPU_Framework_DIRECTX &&
 		pathSampleCount >= 2 &&
 		pathSamplesHost;
@@ -1261,6 +1279,7 @@ PF_Err BPS_SmartRenderGPU(
 #if defined(BPS_HAS_METAL)
 	const bool metalCanBuildPathMap =
 		needsPathMap &&
+		mode == BPS_MODE_PATH &&
 		extraP->input->what_gpu == PF_GPU_Framework_METAL &&
 		pathSampleCount >= 2 &&
 		pathSamplesHost;
@@ -1270,8 +1289,12 @@ PF_Err BPS_SmartRenderGPU(
 	const bool backendCanBuildPathMap =
 		cudaCanBuildPathMap || openclCanBuildPathMap ||
 		directxCanBuildPathMap || metalCanBuildPathMap;
-	if (needsPathMap && !backendCanBuildPathMap) {
-		fallbackPathMap = BPS_AcquirePathMap(width, height, *paramsP);
+	if (needsMappedSort && !backendCanBuildPathMap) {
+		if (mode == BPS_MODE_PATH) {
+			fallbackPathMap = BPS_AcquirePathMap(width, height, *paramsP);
+		} else if (BPS_ModeUsesTransformMap(mode)) {
+			fallbackPathMap = BPS_AcquireTransformMap(width, height, *paramsP);
+		}
 		if (fallbackPathMap) {
 			mappedRecordCount = static_cast<int>(fallbackPathMap->mappedRecordCount);
 			mappedWorkItemCount = static_cast<int>(fallbackPathMap->mappedWorkItemCount);
@@ -1286,19 +1309,25 @@ PF_Err BPS_SmartRenderGPU(
 	const unsigned long long pathMapKey =
 		(mode == BPS_MODE_PATH)
 			? static_cast<unsigned long long>(BPS_PathMapKey(width, height, *paramsP))
-			: 0ull;
+			: BPS_ModeUsesTransformMap(mode)
+				? static_cast<unsigned long long>(BPS_TransformMapKey(width, height, *paramsP))
+				: 0ull;
 	// Round up to the next power of two, then double it.  Doubling guarantees
 	// that in-place bitonic padding for any span [spanStart, spanStart+sortSize)
 	// never overflows the line's allocated region, even when the span starts
 	// past the halfway point (e.g. when the leading arc of a Rotation circle
 	// is entirely outside the frame and spanStart is large).
+	// Mapped-sort modes use per-lane compact work buffers; the legacy 2× padded
+	// domain stride applies only to the analytic domain-sort fallback path.
 	int domainStride = domainStrideRaw;
-	if (domainStride > 1) {
-		unsigned int v = static_cast<unsigned int>(domainStride) - 1u;
-		v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
-		domainStride = static_cast<int>(v + 1u);
+	if (!BPS_ModeUsesMappedSort(mode) || mappedRecordCount <= 0) {
+		if (domainStride > 1) {
+			unsigned int v = static_cast<unsigned int>(domainStride) - 1u;
+			v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
+			domainStride = static_cast<int>(v + 1u);
+		}
+		domainStride *= 2;
 	}
-	domainStride *= 2; // 2x ensures spanStart + sortSize <= domainStride always
 
 	if (err) {
 		return err;
@@ -1339,27 +1368,27 @@ PF_Err BPS_SmartRenderGPU(
 			reinterpret_cast<cl_command_queue>(device_info.command_queuePV);
 		cl_context context = reinterpret_cast<cl_context>(device_info.contextPV);
 
-		// Path samples buffer (dummy 1-sample when unused so the arg is valid).
+		// Path samples buffer (pooled; dummy 1-sample when unused).
 		const size_t path_count =
 			pathSampleCount > 0 ? static_cast<size_t>(pathSampleCount) : 1u;
 		const size_t path_bytes = path_count * sizeof(BpsPathSample);
 		cl_int path_cl_result = CL_SUCCESS;
-		cl_mem path_mem = clCreateBuffer(context, CL_MEM_READ_ONLY, path_bytes,
-										 0, &path_cl_result);
-		BPS_CL_ERR(path_cl_result);
-		if (!err) {
-			std::vector<BpsPathSample> path_upload(path_count);
-			if (pathSampleCount > 0 && pathSamplesHost) {
-				std::memcpy(path_upload.data(), pathSamplesHost,
-							static_cast<size_t>(pathSampleCount) * sizeof(BpsPathSample));
+		if (!cl_dataP->path_samples_mem ||
+			static_cast<size_t>(cl_dataP->path_samples_capacity) < path_count) {
+			if (cl_dataP->path_samples_mem) {
+				(void)clReleaseMemObject(cl_dataP->path_samples_mem);
 			}
-			BPS_CL_ERR(clEnqueueWriteBuffer(queue, path_mem, CL_TRUE, 0, path_bytes,
-											path_upload.data(), 0, 0, 0));
+			cl_dataP->path_samples_mem =
+				clCreateBuffer(context, CL_MEM_READ_ONLY, path_bytes, 0, &path_cl_result);
+			BPS_CL_ERR(path_cl_result);
+			cl_dataP->path_samples_capacity = static_cast<int>(path_count);
+		}
+		cl_mem path_mem = cl_dataP->path_samples_mem;
+		if (!err && pathSampleCount > 0 && pathSamplesHost) {
+			BPS_CL_ERR(clEnqueueWriteBuffer(queue, path_mem, CL_FALSE, 0, path_bytes,
+											pathSamplesHost, 0, 0, 0));
 		}
 		if (err) {
-			if (path_mem) {
-				(void)clReleaseMemObject(path_mem);
-			}
 			return err;
 		}
 
@@ -1414,11 +1443,10 @@ PF_Err BPS_SmartRenderGPU(
 			const size_t global = static_cast<size_t>(lineCount) * local;
 			BPS_CL_ERR(clEnqueueNDRangeKernel(queue, cl_dataP->sort_kernel, 1, 0,
 											  &global, &local, 0, 0, 0));
-			(void)clReleaseMemObject(path_mem);
 			return err;
 		}
 
-		if (mode == BPS_MODE_PATH) {
+		if (BPS_ModeUsesMappedSort(mode)) {
 			cl_uint copy_index = 0;
 			BPS_CL_ERR(clSetKernelArg(cl_dataP->copy_kernel, copy_index++, sizeof(cl_mem), &cl_src_mem));
 			BPS_CL_ERR(clSetKernelArg(cl_dataP->copy_kernel, copy_index++, sizeof(cl_mem), &cl_dst_mem));
@@ -1482,7 +1510,6 @@ PF_Err BPS_SmartRenderGPU(
 			if (err || mappedRecordCount <= 0 || mappedWorkItemCount <= 0 ||
 				(!using_gpu_path_map &&
 				 (!mappedRecordsHost || !mappedLineOffsetsHost || !mappedWorkOffsetsHost))) {
-				(void)clReleaseMemObject(path_mem);
 				return err;
 			}
 
@@ -1580,12 +1607,10 @@ PF_Err BPS_SmartRenderGPU(
 			if (!using_gpu_path_map && work_offsets_mem) (void)clReleaseMemObject(work_offsets_mem);
 			if (!using_gpu_path_map && line_offsets_mem) (void)clReleaseMemObject(line_offsets_mem);
 			if (!using_gpu_path_map && records_mem) (void)clReleaseMemObject(records_mem);
-			(void)clReleaseMemObject(path_mem);
 			return err;
 		}
 
 		if (domainStride <= 0 || outputWidth <= 0 || outputHeight <= 0) {
-			(void)clReleaseMemObject(path_mem);
 			return PF_Err_NONE;
 		}
 		const size_t domainCount =
@@ -1593,17 +1618,29 @@ PF_Err BPS_SmartRenderGPU(
 		const size_t domainBytes = domainCount * sizeof(cl_uint);
 		const size_t keysBytes = domainCount * sizeof(cl_float);
 		cl_int cl_result = CL_SUCCESS;
-		cl_mem domain_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, domainBytes, 0, &cl_result);
-		BPS_CL_ERR(cl_result);
-		cl_mem keys_mem = 0;
-		if (!err) {
-			keys_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, keysBytes, 0, &cl_result);
-			BPS_CL_ERR(cl_result);
-		}
-		if (err) {
-			if (domain_mem) {
-				(void)clReleaseMemObject(domain_mem);
+		if (!cl_dataP->domain_pool_mem || cl_dataP->domain_pool_bytes < domainBytes) {
+			if (cl_dataP->domain_pool_mem) {
+				(void)clReleaseMemObject(cl_dataP->domain_pool_mem);
+				cl_dataP->domain_pool_mem = 0;
 			}
+			cl_dataP->domain_pool_mem =
+				clCreateBuffer(context, CL_MEM_READ_WRITE, domainBytes, 0, &cl_result);
+			BPS_CL_ERR(cl_result);
+			cl_dataP->domain_pool_bytes = domainBytes;
+		}
+		if (!cl_dataP->keys_pool_mem || cl_dataP->keys_pool_bytes < keysBytes) {
+			if (cl_dataP->keys_pool_mem) {
+				(void)clReleaseMemObject(cl_dataP->keys_pool_mem);
+				cl_dataP->keys_pool_mem = 0;
+			}
+			cl_dataP->keys_pool_mem =
+				clCreateBuffer(context, CL_MEM_READ_WRITE, keysBytes, 0, &cl_result);
+			BPS_CL_ERR(cl_result);
+			cl_dataP->keys_pool_bytes = keysBytes;
+		}
+		cl_mem domain_mem = cl_dataP->domain_pool_mem;
+		cl_mem keys_mem = cl_dataP->keys_pool_mem;
+		if (err) {
 			return err;
 		}
 
@@ -1689,9 +1726,6 @@ PF_Err BPS_SmartRenderGPU(
 											  global, local, 0, 0, 0));
 		}
 
-		(void)clReleaseMemObject(keys_mem);
-		(void)clReleaseMemObject(domain_mem);
-		(void)clReleaseMemObject(path_mem);
 		return err;
 	}
 #endif
@@ -2012,7 +2046,7 @@ PF_Err BPS_SmartRenderGPU(
 			return err;
 		}
 
-		if (mode == BPS_MODE_PATH) {
+		if (BPS_ModeUsesMappedSort(mode)) {
 			{
 				DXShaderExecution copy_execution(
 					dx_dataP->context,

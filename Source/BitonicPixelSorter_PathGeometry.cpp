@@ -953,6 +953,83 @@ bool BPS_ClassifyMappedPixel(
 		return true;
 	}
 
+	if (prm.mode == BPS_MODE_FREE_ANGLE) {
+		if (prm.domainLineCount <= 0) {
+			return false;
+		}
+		const double p = static_cast<double>(x) * prm.angleCos +
+						 static_cast<double>(y) * prm.angleSin;
+		const double q = -static_cast<double>(x) * prm.angleSin +
+						  static_cast<double>(y) * prm.angleCos;
+		const A_long line = RoundToLong(q) - prm.freeQMin;
+		if (line < 0 || line >= prm.domainLineCount) {
+			return false;
+		}
+		*line_out = line;
+		*pos_key_out = static_cast<float>(p);
+		return true;
+	}
+
+	if (prm.mode == BPS_MODE_ROTATION) {
+		if (prm.domainLineCount <= 0) {
+			return false;
+		}
+		const double dx = static_cast<double>(x) - prm.centerX;
+		const double dy = static_cast<double>(y) - prm.centerY;
+		const A_long line = RoundToLong(std::sqrt(dx * dx + dy * dy));
+		if (line < 0 || line >= prm.domainLineCount) {
+			return false;
+		}
+		const A_long lineLen = (line <= 0)
+			? 1
+			: static_cast<A_long>(std::ceil(2.0 * kPi * static_cast<double>(line)));
+		A_long pos = 0;
+		if (lineLen > 1) {
+			const double rx = dx * prm.angleCos + dy * prm.angleSin;
+			const double ry = -dx * prm.angleSin + dy * prm.angleCos;
+			double theta = std::atan2(rx, -ry);
+			if (theta < 0.0) {
+				theta += 2.0 * kPi;
+			}
+			pos = RoundToLong((theta / (2.0 * kPi)) * static_cast<double>(lineLen));
+			if (pos >= lineLen) {
+				pos -= lineLen;
+			}
+		}
+		*line_out = line;
+		*pos_key_out = static_cast<float>(pos);
+		return true;
+	}
+
+	if (prm.mode == BPS_MODE_RADIAL) {
+		if (prm.domainLineCount <= 0) {
+			return false;
+		}
+		const double dx = static_cast<double>(x) - prm.centerX;
+		const double dy = static_cast<double>(y) - prm.centerY;
+		const A_long pos = RoundToLong(std::sqrt(dx * dx + dy * dy));
+		if (pos < 0 || pos >= prm.radialLength) {
+			return false;
+		}
+		double theta = std::atan2(dy, dx);
+		if (theta < 0.0) {
+			theta += 2.0 * kPi;
+		}
+		A_long line = (prm.radialLineCount <= 1)
+			? 0
+			: RoundToLong((theta / (2.0 * kPi)) *
+						  static_cast<double>(prm.radialLineCount));
+		if (line >= prm.radialLineCount) {
+			line -= prm.radialLineCount;
+		}
+		if (line < 0 || line >= prm.domainLineCount) {
+			return false;
+		}
+		*line_out = line;
+		*pos_key_out = static_cast<float>(pos);
+		return true;
+	}
+
 	return false;
 }
 
@@ -1206,6 +1283,133 @@ void ComputePathField(
 	*fieldOut = std::move(*src);
 }
 
+// Build a pixel-owned map for analytic transform modes (Free Angle / Rotation /
+// Radial / Swirl). Each pixel is classified once; lanes are sorted by posKey.
+void BuildTransformMap(
+	A_long frameW,
+	A_long frameH,
+	const BitonicSorterParams &prm,
+	BpsPathMap *mapP)
+{
+	mapP->records.clear();
+	mapP->lineOffsets.assign(1u, 0u);
+	mapP->workOffsets.assign(1u, 0u);
+	mapP->maxLineLength = 0;
+	mapP->domainMaxLineLength = 0;
+	mapP->mappedRecordCount = 0;
+	mapP->mappedWorkItemCount = 0;
+
+	if (frameW <= 0 || frameH <= 0 || prm.domainLineCount <= 0) {
+		return;
+	}
+	const A_long lane_count = prm.domainLineCount;
+
+	const size_t pixel_count = static_cast<size_t>(frameW) *
+							   static_cast<size_t>(frameH);
+	std::vector<std::int32_t> laneOf(pixel_count);
+	std::vector<float> keyOf(pixel_count);
+
+	const unsigned int workers = JfaWorkerCount(frameH);
+	auto row_range = [&](unsigned int t, A_long &y0, A_long &y1) {
+		y0 = static_cast<A_long>((static_cast<long long>(frameH) * t) / workers);
+		y1 = static_cast<A_long>((static_cast<long long>(frameH) * (t + 1)) / workers);
+	};
+
+	std::vector<std::vector<std::uint32_t>> hist(
+		workers, std::vector<std::uint32_t>(static_cast<size_t>(lane_count), 0u));
+	RunParallel(workers, [&](unsigned int t) {
+		A_long y0 = 0, y1 = 0;
+		row_range(t, y0, y1);
+		std::vector<std::uint32_t> &h = hist[t];
+		for (A_long y = y0; y < y1; ++y) {
+			for (A_long x = 0; x < frameW; ++x) {
+				const size_t pidx = static_cast<size_t>(y) *
+					static_cast<size_t>(frameW) + static_cast<size_t>(x);
+				A_long line = 0;
+				float posKey = 0.0f;
+				if (!BPS_ClassifyMappedPixel(prm, frameW, frameH, x, y, &line, &posKey)) {
+					laneOf[pidx] = -1;
+					continue;
+				}
+				laneOf[pidx] = static_cast<std::int32_t>(line);
+				keyOf[pidx] = posKey;
+				++h[static_cast<size_t>(line)];
+			}
+		}
+	});
+
+	mapP->lineOffsets.assign(static_cast<size_t>(lane_count) + 1u, 0u);
+	std::vector<std::uint32_t> base(
+		static_cast<size_t>(workers) * static_cast<size_t>(lane_count), 0u);
+	std::uint32_t running = 0;
+	for (A_long lane = 0; lane < lane_count; ++lane) {
+		mapP->lineOffsets[static_cast<size_t>(lane)] = running;
+		for (unsigned int t = 0; t < workers; ++t) {
+			base[static_cast<size_t>(t) * static_cast<size_t>(lane_count) +
+				 static_cast<size_t>(lane)] = running;
+			running += hist[t][static_cast<size_t>(lane)];
+		}
+	}
+	mapP->lineOffsets[static_cast<size_t>(lane_count)] = running;
+	mapP->records.resize(running);
+
+	RunParallel(workers, [&](unsigned int t) {
+		A_long y0 = 0, y1 = 0;
+		row_range(t, y0, y1);
+		std::vector<std::uint32_t> cursor(static_cast<size_t>(lane_count));
+		for (A_long lane = 0; lane < lane_count; ++lane) {
+			cursor[static_cast<size_t>(lane)] =
+				base[static_cast<size_t>(t) * static_cast<size_t>(lane_count) +
+					 static_cast<size_t>(lane)];
+		}
+		for (A_long y = y0; y < y1; ++y) {
+			for (A_long x = 0; x < frameW; ++x) {
+				const size_t pidx = static_cast<size_t>(y) *
+					static_cast<size_t>(frameW) + static_cast<size_t>(x);
+				const std::int32_t lane = laneOf[pidx];
+				if (lane < 0) {
+					continue;
+				}
+				const std::uint32_t dst = cursor[static_cast<size_t>(lane)]++;
+				mapP->records[dst] = BpsMappedPixelRecord{
+					keyOf[pidx], static_cast<std::uint32_t>(pidx)};
+			}
+		}
+	});
+
+	mapP->workOffsets.assign(static_cast<size_t>(lane_count) + 1u, 0u);
+	std::uint32_t work_offset = 0;
+	std::uint32_t max_line_length = 0;
+	for (A_long lane = 0; lane < lane_count; ++lane) {
+		mapP->workOffsets[static_cast<size_t>(lane)] = work_offset;
+		const std::uint32_t len =
+			mapP->lineOffsets[static_cast<size_t>(lane) + 1u] -
+			mapP->lineOffsets[static_cast<size_t>(lane)];
+		max_line_length = (std::max)(max_line_length, len);
+		work_offset += len + NextPow2U32(len);
+	}
+	mapP->workOffsets[static_cast<size_t>(lane_count)] = work_offset;
+
+	RunParallel(workers, [&](unsigned int t) {
+		std::vector<BpsMappedPixelRecord> scratch;
+		for (A_long lane = static_cast<A_long>(t); lane < lane_count;
+			 lane += static_cast<A_long>(workers)) {
+			const std::uint32_t b0 = mapP->lineOffsets[static_cast<size_t>(lane)];
+			const std::uint32_t b1 =
+				mapP->lineOffsets[static_cast<size_t>(lane) + 1u];
+			const std::uint32_t len = b1 - b0;
+			if (len > 1u) {
+				RadixSortMappedRecordSpan(mapP->records.data() + b0, len, &scratch);
+			}
+		}
+	});
+
+	mapP->mappedRecordCount = static_cast<A_long>(running);
+	mapP->mappedWorkItemCount = static_cast<A_long>(work_offset);
+	mapP->maxLineLength = static_cast<A_long>(max_line_length);
+	mapP->domainMaxLineLength = static_cast<A_long>(max_line_length);
+}
+
 // Build the Path-mode pixel map: low-res Jump Flooding for the nearest-point
 // field, then a parallel counting sort (per-thread histograms -> disjoint
 // scatter -> parallel per-lane sort). No per-lane heap vectors, all cores used.
@@ -1399,7 +1603,7 @@ struct PathMapCacheEntry {
 
 std::mutex g_pathMapCacheMutex;
 std::vector<PathMapCacheEntry> g_pathMapCache;	// front = most recent
-constexpr size_t kPathMapCacheCapacity = 4;
+constexpr size_t kPathMapCacheCapacity = 16;
 
 } // namespace
 
@@ -1450,6 +1654,81 @@ std::shared_ptr<const BpsPathMap> BPS_AcquirePathMap(
 		for (const PathMapCacheEntry &entry : g_pathMapCache) {
 			if (entry.key == key && entry.map) {
 				return entry.map;	// another thread won the race
+			}
+		}
+		PathMapCacheEntry entry;
+		entry.key = key;
+		entry.map = built;
+		g_pathMapCache.insert(g_pathMapCache.begin(), entry);
+		if (g_pathMapCache.size() > kPathMapCacheCapacity) {
+			g_pathMapCache.pop_back();
+		}
+	}
+	return built;
+}
+
+std::uint64_t ComputeTransformMapKey(A_long frameW, A_long frameH, const BitonicSorterParams &prm)
+{
+	std::uint64_t h = 1469598103934665603ull;
+	const A_long header[] = {
+		frameW, frameH, prm.mode, prm.direction,
+		prm.freePMin, prm.freeQMin, prm.freeLineLength, prm.freeLineCount,
+		prm.radialLength, prm.radialLineCount, prm.swirlLineMin,
+		prm.domainLineCount, prm.domainMaxLineLength
+	};
+	h = HashBytes(h, header, sizeof(header));
+	const float floats[] = {
+		prm.angleCos, prm.angleSin, prm.angleRadians,
+		prm.centerX, prm.centerY, prm.swirlK
+	};
+	h = HashBytes(h, floats, sizeof(floats));
+	return h;
+}
+
+std::uint64_t BPS_TransformMapKey(
+	A_long frameW,
+	A_long frameH,
+	const BitonicSorterParams &prm)
+{
+	return ComputeTransformMapKey(frameW, frameH, prm);
+}
+
+std::shared_ptr<const BpsPathMap> BPS_AcquireTransformMap(
+	A_long frameW,
+	A_long frameH,
+	const BitonicSorterParams &prm)
+{
+	if (!BPS_ModeUsesTransformMap(prm.mode) || frameW <= 0 || frameH <= 0 ||
+		prm.domainLineCount <= 0) {
+		return nullptr;
+	}
+
+	const std::uint64_t key = BPS_TransformMapKey(frameW, frameH, prm);
+
+	{
+		std::lock_guard<std::mutex> lock(g_pathMapCacheMutex);
+		for (size_t i = 0; i < g_pathMapCache.size(); ++i) {
+			if (g_pathMapCache[i].key == key && g_pathMapCache[i].map) {
+				std::shared_ptr<const BpsPathMap> hit = g_pathMapCache[i].map;
+				if (i != 0) {
+					const PathMapCacheEntry entry = g_pathMapCache[i];
+					g_pathMapCache.erase(g_pathMapCache.begin() +
+										 static_cast<std::ptrdiff_t>(i));
+					g_pathMapCache.insert(g_pathMapCache.begin(), entry);
+				}
+				return hit;
+			}
+		}
+	}
+
+	std::shared_ptr<BpsPathMap> built = std::make_shared<BpsPathMap>();
+	BuildTransformMap(frameW, frameH, prm, built.get());
+
+	{
+		std::lock_guard<std::mutex> lock(g_pathMapCacheMutex);
+		for (const PathMapCacheEntry &entry : g_pathMapCache) {
+			if (entry.key == key && entry.map) {
+				return entry.map;
 			}
 		}
 		PathMapCacheEntry entry;

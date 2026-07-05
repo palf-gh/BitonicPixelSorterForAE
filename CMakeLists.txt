@@ -153,6 +153,8 @@ set(SOURCES
 	Source/BitonicPixelSorter_GpuHost.cpp
 	Source/BitonicPixelSorter_PathGeometry.cpp
 	Source/BitonicPixelSorter_PathGeometry.h
+	Source/BPS_PerfDiag.h
+	Source/BPS_PerfDiag.cpp
 	Localise/AELocalise.h
 	Localise/AE_SDK.h
 	Localise/LocKeys.h

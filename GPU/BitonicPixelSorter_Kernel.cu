@@ -43,6 +43,8 @@
 #define BPS_PATH_DIR_NORMAL 1
 #define BPS_PATH_DIR_TANGENT 2
 #define BPS_SWIRL_K_EPS 1.0e-4f
+#define BPS_MODE_USES_MAPPED_SORT(m) \
+	((m) >= BPS_MODE_FREE_ANGLE && (m) <= BPS_MODE_PATH)
 
 struct BpsPathSampleGpu {
 	float x;
@@ -73,6 +75,46 @@ struct BpsCudaPathMap {
 namespace {
 std::mutex g_cudaPathMapMutex;
 BpsCudaPathMap g_cudaPathMap;
+
+struct BpsCudaDomainPool {
+	unsigned int *domain = nullptr;
+	float *keys = nullptr;
+	size_t capacityBytes = 0;
+};
+
+static BpsCudaDomainPool g_cudaDomainPool;
+
+static cudaError_t bps_acquire_cuda_domain_buffers(
+	size_t domainBytes,
+	size_t keysBytes,
+	unsigned int **domainOut,
+	float **keysOut)
+{
+	const size_t needed = domainBytes + keysBytes;
+	if (g_cudaDomainPool.capacityBytes < needed) {
+		cudaFree(g_cudaDomainPool.keys);
+		cudaFree(g_cudaDomainPool.domain);
+		g_cudaDomainPool.domain = nullptr;
+		g_cudaDomainPool.keys = nullptr;
+		g_cudaDomainPool.capacityBytes = 0;
+
+		cudaError_t result = cudaMalloc((void **)&g_cudaDomainPool.domain, domainBytes);
+		if (result != cudaSuccess) {
+			return result;
+		}
+		result = cudaMalloc((void **)&g_cudaDomainPool.keys, keysBytes);
+		if (result != cudaSuccess) {
+			cudaFree(g_cudaDomainPool.domain);
+			g_cudaDomainPool.domain = nullptr;
+			return result;
+		}
+		g_cudaDomainPool.capacityBytes = needed;
+	}
+
+	*domainOut = g_cudaDomainPool.domain;
+	*keysOut = g_cudaDomainPool.keys;
+	return cudaSuccess;
+}
 }
 
 #define BPS_CRITERION_LUMINANCE 1
@@ -179,6 +221,35 @@ __device__ __forceinline__ float bps_sample_key(const BpsKeySource &src, int x, 
 	return bps_sort_key(src.tex[idx], keyCriterion);
 }
 
+__device__ __forceinline__ bool bps_unified_keys(
+	const BpsKeySource &criterionSrc,
+	const BpsKeySource &triggerSrc,
+	int criterion,
+	int trigger)
+{
+	return criterion == trigger &&
+		   criterionSrc.tex == triggerSrc.tex &&
+		   criterionSrc.pitch == triggerSrc.pitch &&
+		   criterionSrc.originX == triggerSrc.originX &&
+		   criterionSrc.originY == triggerSrc.originY &&
+		   criterionSrc.width == triggerSrc.width &&
+		   criterionSrc.height == triggerSrc.height;
+}
+
+__device__ __forceinline__ float bps_sample_trigger_key(
+	const BpsKeySource &criterionSrc,
+	const BpsKeySource &triggerSrc,
+	int x,
+	int y,
+	int criterion,
+	int trigger)
+{
+	if (bps_unified_keys(criterionSrc, triggerSrc, criterion, trigger)) {
+		return bps_sample_key(criterionSrc, x, y, criterion);
+	}
+	return bps_sample_key(triggerSrc, x, y, trigger);
+}
+
 // Recover layer coordinates from a source-world linear index.
 __device__ __forceinline__ float bps_sample_key_from_src_index(
 	const BpsKeySource &src,
@@ -194,6 +265,24 @@ __device__ __forceinline__ float bps_sample_key_from_src_index(
 	const int x = (int)(srcIndex % (unsigned int)srcPitch) + inputOriginX;
 	const int y = (int)(srcIndex / (unsigned int)srcPitch) + inputOriginY;
 	return bps_sample_key(src, x, y, keyCriterion);
+}
+
+__device__ __forceinline__ float bps_sample_trigger_key_from_src_index(
+	const BpsKeySource &criterionSrc,
+	const BpsKeySource &triggerSrc,
+	int srcPitch,
+	int inputOriginX,
+	int inputOriginY,
+	unsigned int srcIndex,
+	int criterion,
+	int trigger)
+{
+	if (bps_unified_keys(criterionSrc, triggerSrc, criterion, trigger)) {
+		return bps_sample_key_from_src_index(criterionSrc, srcPitch, inputOriginX,
+											 inputOriginY, srcIndex, criterion);
+	}
+	return bps_sample_key_from_src_index(triggerSrc, srcPitch, inputOriginX,
+										 inputOriginY, srcIndex, trigger);
 }
 
 
@@ -794,7 +883,8 @@ __global__ void BitonicSortKernel(
 									  swirlK, swirlLineMin, pathDirection, pathSMin, pathNMin,
 									  pathSampleCount, pathSamples, &x, &y) &&
 					BPS_SRC_IN_WORLD(x, y)) {
-					float br = bps_sample_key(triggerSrc, x, y, trigger);
+					float br = bps_sample_trigger_key(
+						criterionSrc, triggerSrc, x, y, criterion, trigger);
 					if (bps_is_affected(br, thresholdMin, thresholdMax, affect)) break;
 				}
 				spanStart++;
@@ -810,7 +900,8 @@ __global__ void BitonicSortKernel(
 									   swirlK, swirlLineMin, pathDirection, pathSMin, pathNMin,
 									   pathSampleCount, pathSamples, &x, &y) ||
 					!BPS_SRC_IN_WORLD(x, y)) break;
-				float br = bps_sample_key(triggerSrc, x, y, trigger);
+				float br = bps_sample_trigger_key(
+					criterionSrc, triggerSrc, x, y, criterion, trigger);
 				if (!bps_is_affected(br, thresholdMin, thresholdMax, affect)) break;
 				spanEnd++;
 			}
@@ -1022,7 +1113,9 @@ __global__ void BitonicSortDomainKernel(
 				const unsigned int pos =
 					__float_as_uint(keys[BPS_DOMAIN_INDEX(runStart)]);
 				const unsigned int srcIndex = domain[BPS_DOMAIN_INDEX(pos)];
-				const float br = bps_sample_key_from_src_index(triggerSrc, srcPitch, inputOriginX, inputOriginY, srcIndex, trigger);
+				const float br = bps_sample_trigger_key_from_src_index(
+					criterionSrc, triggerSrc, srcPitch, inputOriginX, inputOriginY,
+					srcIndex, criterion, trigger);
 				if (bps_is_affected(br, thresholdMin, thresholdMax, affect)) break;
 				runStart++;
 			}
@@ -1032,7 +1125,9 @@ __global__ void BitonicSortDomainKernel(
 				const unsigned int pos =
 					__float_as_uint(keys[BPS_DOMAIN_INDEX(runEnd)]);
 				const unsigned int srcIndex = domain[BPS_DOMAIN_INDEX(pos)];
-				const float br = bps_sample_key_from_src_index(triggerSrc, srcPitch, inputOriginX, inputOriginY, srcIndex, trigger);
+				const float br = bps_sample_trigger_key_from_src_index(
+					criterionSrc, triggerSrc, srcPitch, inputOriginX, inputOriginY,
+					srcIndex, criterion, trigger);
 				if (!bps_is_affected(br, thresholdMin, thresholdMax, affect)) break;
 				runEnd++;
 			}
@@ -1528,7 +1623,9 @@ __global__ void BitonicSortMappedKernel(
 			while (runStart < lineSize) {
 				const unsigned int srcIndex = domain[workBase + runStart];
 				if (srcIndex != 0xffffffffu) {
-					const float br = bps_sample_key_from_src_index(triggerSrc, srcPitch, inputOriginX, inputOriginY, srcIndex, trigger);
+					const float br = bps_sample_trigger_key_from_src_index(
+					criterionSrc, triggerSrc, srcPitch, inputOriginX, inputOriginY,
+					srcIndex, criterion, trigger);
 					if (bps_is_affected(br, thresholdMin, thresholdMax, affect)) break;
 				}
 				runStart++;
@@ -1537,7 +1634,9 @@ __global__ void BitonicSortMappedKernel(
 			while (runEnd < lineSize) {
 				const unsigned int srcIndex = domain[workBase + runEnd];
 				if (srcIndex == 0xffffffffu) break;
-				const float br = bps_sample_key_from_src_index(triggerSrc, srcPitch, inputOriginX, inputOriginY, srcIndex, trigger);
+				const float br = bps_sample_trigger_key_from_src_index(
+					criterionSrc, triggerSrc, srcPitch, inputOriginX, inputOriginY,
+					srcIndex, criterion, trigger);
 				if (!bps_is_affected(br, thresholdMin, thresholdMax, affect)) break;
 				runEnd++;
 			}
@@ -1997,7 +2096,7 @@ extern "C" cudaError_t BitonicSort_CUDA(
 	const void *mappedLineOffsetsHost,
 	const void *mappedWorkOffsetsHost)
 {
-	if (lineCount <= 0 && mode != BPS_MODE_PATH) {
+	if (lineCount <= 0 && !BPS_MODE_USES_MAPPED_SORT(mode)) {
 		return cudaSuccess;
 	}
 
@@ -2042,7 +2141,7 @@ extern "C" cudaError_t BitonicSort_CUDA(
 		return launch_result;
 	}
 
-	if (mode == BPS_MODE_PATH) {
+	if (BPS_MODE_USES_MAPPED_SORT(mode)) {
 		dim3 copyBlock(16, 16, 1);
 		dim3 copyGrid(
 			(unsigned int)((outputWidth + 15) / 16),
@@ -2071,7 +2170,7 @@ extern "C" cudaError_t BitonicSort_CUDA(
 		float *keys = nullptr;
 		bool ownsMapBuffers = true;
 		std::unique_lock<std::mutex> cacheLock;
-		if (useGpuPathMapBuild) {
+		if (useGpuPathMapBuild && mode == BPS_MODE_PATH) {
 			cacheLock = std::unique_lock<std::mutex>(g_cudaPathMapMutex);
 			result = bps_build_cuda_path_map(
 				width, height, lineCount, pathDirection, pathClosed, pathLength,
@@ -2189,22 +2288,14 @@ extern "C" cudaError_t BitonicSort_CUDA(
 	const size_t keysBytes = domainCount * sizeof(float);
 	unsigned int *domain = nullptr;
 	float *keys = nullptr;
-	cudaError_t result = cudaMalloc((void **)&domain, domainBytes);
+	cudaError_t result = bps_acquire_cuda_domain_buffers(domainBytes, keysBytes, &domain, &keys);
 	if (result != cudaSuccess) {
-		cudaFree(pathSamplesDev);
-		return result;
-	}
-	result = cudaMalloc((void **)&keys, keysBytes);
-	if (result != cudaSuccess) {
-		cudaFree(domain);
 		cudaFree(pathSamplesDev);
 		return result;
 	}
 
 	result = cudaMemset(domain, 0xFF, domainBytes);
 	if (result != cudaSuccess) {
-		cudaFree(keys);
-		cudaFree(domain);
 		cudaFree(pathSamplesDev);
 		return result;
 	}
@@ -2225,16 +2316,12 @@ extern "C" cudaError_t BitonicSort_CUDA(
 
 	result = cudaPeekAtLastError();
 	if (result != cudaSuccess) {
-		cudaFree(keys);
-		cudaFree(domain);
 		cudaFree(pathSamplesDev);
 		return result;
 	}
 
 	result = cudaDeviceSynchronize();
 	if (result != cudaSuccess) {
-		cudaFree(keys);
-		cudaFree(domain);
 		cudaFree(pathSamplesDev);
 		return result;
 	}
@@ -2256,15 +2343,11 @@ extern "C" cudaError_t BitonicSort_CUDA(
 
 	result = cudaPeekAtLastError();
 	if (result != cudaSuccess) {
-		cudaFree(keys);
-		cudaFree(domain);
 		cudaFree(pathSamplesDev);
 		return result;
 	}
 
 	result = cudaDeviceSynchronize();
-	cudaFree(keys);
-	cudaFree(domain);
 	cudaFree(pathSamplesDev);
 	return result;
 }

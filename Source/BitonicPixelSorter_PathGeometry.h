@@ -123,4 +123,26 @@ std::uint64_t BPS_PathMapKey(
 	A_long frame_h,
 	const BitonicSorterParams &prm);
 
+// Non-axis modes that sort via a cached pixel-owned map (Path + transform modes).
+inline bool BPS_ModeUsesMappedSort(A_long mode)
+{
+	return mode >= BPS_MODE_FREE_ANGLE && mode <= BPS_MODE_PATH;
+}
+
+inline bool BPS_ModeUsesTransformMap(A_long mode)
+{
+	return mode >= BPS_MODE_FREE_ANGLE && mode <= BPS_MODE_SWIRL;
+}
+
+// Analytic transform modes: direct per-pixel classification (no JFA).
+std::shared_ptr<const BpsPathMap> BPS_AcquireTransformMap(
+	A_long frame_w,
+	A_long frame_h,
+	const BitonicSorterParams &prm);
+
+std::uint64_t BPS_TransformMapKey(
+	A_long frame_w,
+	A_long frame_h,
+	const BitonicSorterParams &prm);
+
 #endif // BITONIC_PIXEL_SORTER_PATH_GEOMETRY_H

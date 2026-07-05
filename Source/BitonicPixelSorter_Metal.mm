@@ -47,6 +47,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <vector>
 
@@ -73,6 +74,7 @@ struct MetalGPUData {
 	int path_map_line_count;
 	int path_mapped_record_count;
 	int path_mapped_work_item_count;
+	void *path_dummy_buffer_bridge;
 };
 
 // ---------------------------------------------------------------------------
@@ -207,6 +209,85 @@ static void BPS_MetalClearPathMap(MetalGPUData *metal_dataP)
 	metal_dataP->path_mapped_work_item_count = 0;
 }
 
+static bool BPS_MetalBindHostMap(
+	MetalGPUData *metal_dataP,
+	id<MTLDevice> device,
+	int width,
+	int height,
+	int lineCount,
+	std::uint64_t mapKey,
+	const BpsMappedPixelRecord *records,
+	const std::uint32_t *lineOffsets,
+	const std::uint32_t *workOffsets,
+	int mappedRecordCount,
+	int mappedWorkItemCount,
+	id<MTLBuffer> *recordsOut,
+	id<MTLBuffer> *lineOffsetsOut,
+	id<MTLBuffer> *workOffsetsOut)
+{
+	if (!metal_dataP || !device || !recordsOut || !lineOffsetsOut || !workOffsetsOut ||
+		mappedRecordCount <= 0 || mappedWorkItemCount <= 0 ||
+		!records || !lineOffsets || !workOffsets) {
+		return false;
+	}
+
+	if (metal_dataP->path_map_key == mapKey &&
+		metal_dataP->path_map_width == width &&
+		metal_dataP->path_map_height == height &&
+		metal_dataP->path_map_line_count == lineCount &&
+		metal_dataP->path_records_buffer_bridge &&
+		metal_dataP->path_line_offsets_buffer_bridge &&
+		metal_dataP->path_work_offsets_buffer_bridge) {
+		*recordsOut =
+			(__bridge id<MTLBuffer>)metal_dataP->path_records_buffer_bridge;
+		*lineOffsetsOut =
+			(__bridge id<MTLBuffer>)metal_dataP->path_line_offsets_buffer_bridge;
+		*workOffsetsOut =
+			(__bridge id<MTLBuffer>)metal_dataP->path_work_offsets_buffer_bridge;
+		return true;
+	}
+
+	BPS_MetalClearPathMap(metal_dataP);
+
+	const NSUInteger recordsBytes =
+		(NSUInteger)mappedRecordCount * (NSUInteger)sizeof(BpsMappedPixelRecord);
+	const NSUInteger offsetsBytes =
+		((NSUInteger)lineCount + 1u) * (NSUInteger)sizeof(std::uint32_t);
+	id<MTLBuffer> recordsBuffer =
+		[device newBufferWithBytes:records
+		                    length:recordsBytes
+		                   options:MTLResourceStorageModeShared];
+	id<MTLBuffer> lineOffsetsBuffer =
+		[device newBufferWithBytes:lineOffsets
+		                    length:offsetsBytes
+		                   options:MTLResourceStorageModeShared];
+	id<MTLBuffer> workOffsetsBuffer =
+		[device newBufferWithBytes:workOffsets
+		                    length:offsetsBytes
+		                   options:MTLResourceStorageModeShared];
+	if (!recordsBuffer || !lineOffsetsBuffer || !workOffsetsBuffer) {
+		return false;
+	}
+
+	metal_dataP->path_records_buffer_bridge =
+		const_cast<void *>(CFBridgingRetain(recordsBuffer));
+	metal_dataP->path_line_offsets_buffer_bridge =
+		const_cast<void *>(CFBridgingRetain(lineOffsetsBuffer));
+	metal_dataP->path_work_offsets_buffer_bridge =
+		const_cast<void *>(CFBridgingRetain(workOffsetsBuffer));
+	metal_dataP->path_map_key = mapKey;
+	metal_dataP->path_map_width = width;
+	metal_dataP->path_map_height = height;
+	metal_dataP->path_map_line_count = lineCount;
+	metal_dataP->path_mapped_record_count = mappedRecordCount;
+	metal_dataP->path_mapped_work_item_count = mappedWorkItemCount;
+
+	*recordsOut = recordsBuffer;
+	*lineOffsetsOut = lineOffsetsBuffer;
+	*workOffsetsOut = workOffsetsBuffer;
+	return true;
+}
+
 // ---------------------------------------------------------------------------
 // BPS_MetalDeviceSetup
 // ---------------------------------------------------------------------------
@@ -330,6 +411,19 @@ PF_Err BPS_MetalDeviceSetup(
 		metal_dataP->path_sort_records_pipeline_bridge =
 			const_cast<void *>(CFBridgingRetain(path_sort_records_pipeline));
 
+		// One-sample dummy path buffer reused by Axis and other modes that do not
+		// need polyline samples (avoids a per-frame MTLBuffer allocation).
+		id<MTLBuffer> dummyPathBuffer =
+			[device newBufferWithLength:sizeof(float) * 5u
+			                    options:MTLResourceStorageModeShared];
+		if (!dummyPathBuffer) {
+			handle_suite->host_dispose_handle(gpu_dataH);
+			return PF_Err_OUT_OF_MEMORY;
+		}
+		std::memset([dummyPathBuffer contents], 0, sizeof(float) * 5u);
+		metal_dataP->path_dummy_buffer_bridge =
+			const_cast<void *>(CFBridgingRetain(dummyPathBuffer));
+
 		extraP->output->gpu_data = gpu_dataH;
 		out_dataP->out_flags2 = PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
 
@@ -369,6 +463,7 @@ PF_Err BPS_MetalDeviceSetdown(
 			// CFBridgingRelease transfers the +1 into a local ARC variable that
 			// immediately goes out of scope, decrementing the retain count.
 			BPS_MetalClearPathMap(metal_dataP);
+			BPS_MetalReleaseBridge(&metal_dataP->path_dummy_buffer_bridge);
 			BPS_MetalReleaseBridge(&metal_dataP->path_sort_records_pipeline_bridge);
 			BPS_MetalReleaseBridge(&metal_dataP->path_scatter_records_pipeline_bridge);
 			BPS_MetalReleaseBridge(&metal_dataP->path_classify_count_pipeline_bridge);
@@ -602,21 +697,24 @@ PF_Err BPS_MetalSmartRender(
 			trigger_buffer = src_buffer;
 		}
 
-		const NSUInteger pathCount =
-			paramsP->pathSampleCount > 0
-				? (NSUInteger)paramsP->pathSampleCount
-				: 1u;
-		const NSUInteger pathBytes = pathCount * sizeof(float) * 5u;
 		id<MTLBuffer> pathBuffer =
-			[device newBufferWithLength:pathBytes
-			                    options:MTLResourceStorageModeShared];
+			(__bridge id<MTLBuffer>)metal_dataP->path_dummy_buffer_bridge;
 		if (!pathBuffer) {
-			return PF_Err_OUT_OF_MEMORY;
+			return PF_Err_INTERNAL_STRUCT_DAMAGED;
 		}
-		std::memset([pathBuffer contents], 0, pathBytes);
-		if (paramsP->pathSampleCount > 0 && paramsP->pathSamples) {
-			std::memcpy([pathBuffer contents], paramsP->pathSamples,
-						(size_t)paramsP->pathSampleCount * sizeof(float) * 5u);
+		if (paramsP->mode == BPS_MODE_PATH &&
+			paramsP->pathSampleCount > 0 &&
+			paramsP->pathSamples) {
+			const NSUInteger pathBytes =
+				(NSUInteger)paramsP->pathSampleCount * sizeof(float) * 5u;
+			id<MTLBuffer> uploadedPathBuffer =
+				[device newBufferWithBytes:paramsP->pathSamples
+				                    length:pathBytes
+				                   options:MTLResourceStorageModeShared];
+			if (!uploadedPathBuffer) {
+				return PF_Err_OUT_OF_MEMORY;
+			}
+			pathBuffer = uploadedPathBuffer;
 		}
 
 		id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
@@ -638,7 +736,7 @@ PF_Err BPS_MetalSmartRender(
 			[computeEncoder dispatchThreadgroups:threadgroupsPerGrid
 			               threadsPerThreadgroup:threadsPerThreadgroup];
 			[computeEncoder endEncoding];
-		} else if (paramsP->mode == BPS_MODE_PATH) {
+		} else if (BPS_ModeUsesMappedSort(paramsP->mode)) {
 			id<MTLComputeCommandEncoder> copyEncoder =
 				[commandBuffer computeCommandEncoder];
 			[copyEncoder setComputePipelineState:copy_pipeline];
@@ -665,6 +763,7 @@ PF_Err BPS_MetalSmartRender(
 				paramsP->mappedLineOffsets &&
 				paramsP->mappedWorkOffsets;
 			if (!hasHostPathMap &&
+				paramsP->mode == BPS_MODE_PATH &&
 				paramsP->pathSampleCount >= 2 &&
 				paramsP->pathSamples) {
 				const std::uint64_t pathMapKey =
@@ -812,24 +911,40 @@ PF_Err BPS_MetalSmartRender(
 					}
 				}
 			} else if (hasHostPathMap) {
-				const NSUInteger recordsBytes =
-					(NSUInteger)paramsP->mappedRecordCount *
-					(NSUInteger)sizeof(BpsMappedPixelRecord);
-				const NSUInteger offsetsBytes =
-					((NSUInteger)lineCount + 1u) *
-					(NSUInteger)sizeof(std::uint32_t);
-				recordsBuffer =
-					[device newBufferWithBytes:paramsP->mappedRecords
-					                    length:recordsBytes
-					                   options:MTLResourceStorageModeShared];
-				lineOffsetsBuffer =
-					[device newBufferWithBytes:paramsP->mappedLineOffsets
-					                    length:offsetsBytes
-					                   options:MTLResourceStorageModeShared];
-				workOffsetsBuffer =
-					[device newBufferWithBytes:paramsP->mappedWorkOffsets
-					                    length:offsetsBytes
-					                   options:MTLResourceStorageModeShared];
+				const std::uint64_t hostMapKey =
+					(paramsP->mode == BPS_MODE_PATH)
+						? BPS_PathMapKey(width, height, *paramsP)
+						: BPS_TransformMapKey(width, height, *paramsP);
+				if (!BPS_MetalBindHostMap(
+						metal_dataP, device, width, height, lineCount, hostMapKey,
+						paramsP->mappedRecords,
+						paramsP->mappedLineOffsets,
+						paramsP->mappedWorkOffsets,
+						mappedRecordCount, mappedWorkItemCount,
+						&recordsBuffer, &lineOffsetsBuffer, &workOffsetsBuffer)) {
+					return PF_Err_OUT_OF_MEMORY;
+				}
+			} else if (BPS_ModeUsesTransformMap(paramsP->mode)) {
+				const std::shared_ptr<const BpsPathMap> transformMap =
+					BPS_AcquireTransformMap(width, height, *paramsP);
+				if (transformMap &&
+					transformMap->mappedRecordCount > 0 &&
+					transformMap->mappedWorkItemCount > 0) {
+					const std::uint64_t hostMapKey =
+						BPS_TransformMapKey(width, height, *paramsP);
+					if (!BPS_MetalBindHostMap(
+							metal_dataP, device, width, height, lineCount, hostMapKey,
+							transformMap->records.data(),
+							transformMap->lineOffsets.data(),
+							transformMap->workOffsets.data(),
+							transformMap->mappedRecordCount,
+							transformMap->mappedWorkItemCount,
+							&recordsBuffer, &lineOffsetsBuffer, &workOffsetsBuffer)) {
+						return PF_Err_OUT_OF_MEMORY;
+					}
+					mappedRecordCount = transformMap->mappedRecordCount;
+					mappedWorkItemCount = transformMap->mappedWorkItemCount;
+				}
 			}
 
 			if (mappedRecordCount > 0 &&
