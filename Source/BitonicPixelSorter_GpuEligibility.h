@@ -145,6 +145,60 @@ inline BpsGpuEligibility BPS_EvaluateGpuEligibility(
 #endif
 }
 
+inline bool BPS_UsesAxisLumaFastPath(
+	const void *src_mem,
+	const void *criterion_mem,
+	const void *trigger_mem,
+	const BitonicSorterParams &prm)
+{
+	return prm.mode == BPS_MODE_AXIS &&
+		   criterion_mem == src_mem &&
+		   trigger_mem == src_mem &&
+		   prm.criterion == BPS_CRITERION_LUMINANCE &&
+		   prm.trigger == BPS_CRITERION_LUMINANCE &&
+		   prm.affect == BPS_AFFECT_INSIDE_THRESHOLDS &&
+		   prm.cycleDegrees > -1.0e-6f &&
+		   prm.cycleDegrees < 1.0e-6f;
+}
+
+inline bool BPS_AxisSourceFullSpan(
+	int direction,
+	int width,
+	int height,
+	int inputOriginX,
+	int inputOriginY,
+	int inputWidth,
+	int inputHeight,
+	int outputOriginX,
+	int outputOriginY,
+	int outputWidth,
+	int outputHeight)
+{
+	return direction
+		? (inputOriginX == 0 &&
+		   inputWidth == width &&
+		   inputOriginY <= outputOriginY &&
+		   inputOriginY + inputHeight >= outputOriginY + outputHeight)
+		: (inputOriginY == 0 &&
+		   inputHeight == height &&
+		   inputOriginX <= outputOriginX &&
+		   inputOriginX + inputWidth >= outputOriginX + outputWidth);
+}
+
+inline bool BPS_AxisOutputFullSpan(
+	int direction,
+	int width,
+	int height,
+	int outputOriginX,
+	int outputOriginY,
+	int outputWidth,
+	int outputHeight)
+{
+	return direction
+		? (outputOriginX == 0 && outputWidth == width)
+		: (outputOriginY == 0 && outputHeight == height);
+}
+
 const char *BPS_ActiveGpuFrameworkName();
 const char *BPS_ActiveGpuDeviceName();
 bool BPS_IsGpuDeviceReady();

@@ -1264,6 +1264,29 @@ void CopyInput(uint3 dispatchThreadID : SV_DispatchThreadID)
 	StorePixel(sortTex, dstIndex, pixel);
 }
 
+struct BpsJfaCellGpu
+{
+	float qx;
+	float qy;
+	float s;
+	float tx;
+	float ty;
+	float d2;
+};
+
+BpsJfaCellGpu LoadJfaCell(uint index)
+{
+	const uint base = index * 24u;
+	BpsJfaCellGpu cell;
+	cell.qx = asfloat(pathTex.Load(base + 0u));
+	cell.qy = asfloat(pathTex.Load(base + 4u));
+	cell.s = asfloat(pathTex.Load(base + 8u));
+	cell.tx = asfloat(pathTex.Load(base + 12u));
+	cell.ty = asfloat(pathTex.Load(base + 16u));
+	cell.d2 = asfloat(pathTex.Load(base + 20u));
+	return cell;
+}
+
 [RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=3)),DescriptorTable(SRV(t0,numDescriptors=4))")]
 [numthreads(16, 16, 1)]
 void BuildPathClassifyCount(uint3 dispatchThreadID : SV_DispatchThreadID)
@@ -1274,18 +1297,26 @@ void BuildPathClassifyCount(uint3 dispatchThreadID : SV_DispatchThreadID)
 		return;
 	}
 
+	const int gridW = freePMin;
+	const int gridH = freeQMin;
+	const int jfaFactor = swirlLineMin;
+
 	const uint pidx = (uint)(y * width + x);
 	sortTex.Store(pidx * 4u, 0xffffffffu);
 
-	float s = 0.0f;
-	float n = 0.0f;
-	if (!BpsPathClosest((float)x, (float)y, s, n)) {
+	const int cx = min(x / jfaFactor, gridW - 1);
+	const int cy = min(y / jfaFactor, gridH - 1);
+	const BpsJfaCellGpu cell = LoadJfaCell((uint)(cy * gridW + cx));
+	if (!isfinite(cell.d2)) {
 		return;
 	}
 
+	const float dxp = (float)x - cell.qx;
+	const float dyp = (float)y - cell.qy;
+	const float n = -cell.ty * dxp + cell.tx * dyp;
 	int lane = 0;
 	float order = 0.0f;
-	if (!BpsPathLaneOrder(s, n, lane, order)) {
+	if (!BpsPathLaneOrder(cell.s, n, lane, order)) {
 		return;
 	}
 

@@ -952,8 +952,17 @@ kernel void BitonicCopyInputKernel(
 	sortTex[dstIndex] = pixel;
 }
 
+struct BpsJfaCellGpu {
+	float qx;
+	float qy;
+	float s;
+	float tx;
+	float ty;
+	float d2;
+};
+
 kernel void BitonicBuildPathClassifyCountKernel(
-	device const BpsPathSampleGpu *pathSamples [[buffer(0)]],
+	device const BpsJfaCellGpu *jfaField [[buffer(0)]],
 	device int               *laneOf     [[buffer(1)]],
 	device float             *keyOf      [[buffer(2)]],
 	device atomic_uint       *laneCounts [[buffer(3)]],
@@ -966,18 +975,26 @@ kernel void BitonicBuildPathClassifyCountKernel(
 		return;
 	}
 
+	const int gridW = p.freePMin;
+	const int gridH = p.freeQMin;
+	const int jfaFactor = p.swirlLineMin;
+
 	const uint pidx = (uint)(y * p.width + x);
 	laneOf[pidx] = -1;
 
-	float s = 0.0f;
-	float n = 0.0f;
-	if (!bps_path_closest(pathSamples, p.pathSampleCount, (float)x, (float)y, &s, &n)) {
+	const int cx = min(x / jfaFactor, gridW - 1);
+	const int cy = min(y / jfaFactor, gridH - 1);
+	const BpsJfaCellGpu cell = jfaField[(uint)(cy * gridW + cx)];
+	if (!isfinite(cell.d2)) {
 		return;
 	}
 
+	const float dxp = (float)x - cell.qx;
+	const float dyp = (float)y - cell.qy;
+	const float n = -cell.ty * dxp + cell.tx * dyp;
 	int lane = 0;
 	float order = 0.0f;
-	if (!bps_path_lane_order(p, s, n, &lane, &order)) {
+	if (!bps_path_lane_order(p, cell.s, n, &lane, &order)) {
 		return;
 	}
 	laneOf[pidx] = lane;
@@ -1196,5 +1213,273 @@ kernel void BitonicSortMappedKernel(
 		threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 
 		cursor = runEnd + 1u;
+	}
+}
+
+inline float bps_luma(float4 c)
+{
+	return clamp(0.298912f * c.z + 0.586611f * c.y + 0.114478f * c.x, 0.0f, 1.0f);
+}
+
+inline uint bps_axis_src_index_pos(constant BitonicSortParams &p, uint gid, uint pos)
+{
+	const int x = p.direction ? (int)pos : (p.inputOriginX + (int)gid);
+	const int y = p.direction ? (p.inputOriginY + (int)gid) : (int)pos;
+	return bps_src_index_xy(p, x, y);
+}
+
+inline uint bps_axis_dst_index_pos(constant BitonicSortParams &p, uint gid, uint pos)
+{
+	const int x = p.direction ? (int)pos : (p.outputOriginX + (int)gid);
+	const int y = p.direction ? (p.outputOriginY + (int)gid) : (int)pos;
+	return bps_dst_index_xy(p, x, y);
+}
+
+kernel void BitonicSortAxisLumaKernel(
+	device const float4       *srcTex  [[buffer(0)]],
+	device float4             *sortTex [[buffer(1)]],
+	constant BitonicSortParams &p      [[buffer(2)]],
+	uint gid  [[threadgroup_position_in_grid]],
+	uint gtid [[thread_position_in_threadgroup]])
+{
+	threadgroup float scratchKey[MAX_SIZE];
+	threadgroup uint  scratchIndex[MAX_SIZE];
+
+	const uint size = bps_line_size(p, gid);
+	if (size == 0u || size > MAX_SIZE) {
+		return;
+	}
+
+	for (uint pos = gtid; pos < size; pos += MAX_THREADS) {
+		int x = 0;
+		int y = 0;
+		if (bps_coord_for_pos(p, nullptr, gid, pos, &x, &y) &&
+			bps_dst_in_world(p, x, y)) {
+			sortTex[bps_dst_index_xy(p, x, y)] = bps_src_in_world(p, x, y)
+				? srcTex[bps_src_index_xy(p, x, y)]
+				: float4(0.0f, 0.0f, 0.0f, 0.0f);
+		}
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+
+	uint cursor = 0u;
+	while (cursor < size) {
+		if (gtid == 0u) {
+			uint spanStart = cursor;
+			while (spanStart < size) {
+				int x = 0;
+				int y = 0;
+				if (bps_coord_for_pos(p, nullptr, gid, spanStart, &x, &y) &&
+					bps_src_in_world(p, x, y)) {
+					const float br = bps_luma(srcTex[bps_src_index_xy(p, x, y)]);
+					if (br >= p.thresholdMin && br <= p.thresholdMax) {
+						break;
+					}
+				}
+				spanStart++;
+			}
+
+			uint spanEnd = spanStart;
+			while (spanEnd < size) {
+				int x = 0;
+				int y = 0;
+				if (!bps_coord_for_pos(p, nullptr, gid, spanEnd, &x, &y) ||
+					!bps_src_in_world(p, x, y)) {
+					break;
+				}
+				const float br = bps_luma(srcTex[bps_src_index_xy(p, x, y)]);
+				if (br < p.thresholdMin || br > p.thresholdMax) {
+					break;
+				}
+				spanEnd++;
+			}
+
+			scratchIndex[0] = spanStart;
+			scratchIndex[1] = spanEnd;
+			scratchIndex[2] = spanEnd - spanStart;
+			scratchIndex[3] = bps_next_pow2(scratchIndex[2]);
+		}
+		threadgroup_barrier(mem_flags::mem_threadgroup);
+
+		const uint spanStart = scratchIndex[0];
+		const uint spanEnd = scratchIndex[1];
+		const uint spanSize = scratchIndex[2];
+		const uint sortSize = scratchIndex[3];
+		threadgroup_barrier(mem_flags::mem_threadgroup);
+
+		if (spanStart >= size || spanSize == 0u) {
+			break;
+		}
+
+		const bool ascending = p.ordering != 0;
+		for (uint i = gtid; i < sortSize; i += MAX_THREADS) {
+			if (i < spanSize) {
+				const uint pos = spanStart + i;
+				int x = 0;
+				int y = 0;
+				const bool valid = bps_coord_for_pos(p, nullptr, gid, pos, &x, &y) &&
+					bps_src_in_world(p, x, y);
+				const uint srcIndex = valid ? bps_src_index_xy(p, x, y) : 0xffffffffu;
+				scratchKey[i] = valid
+					? bps_luma(srcTex[srcIndex])
+					: (ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX);
+				scratchIndex[i] = srcIndex;
+			} else {
+				scratchKey[i] = ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX;
+				scratchIndex[i] = 0xffffffffu;
+			}
+		}
+		threadgroup_barrier(mem_flags::mem_threadgroup);
+
+		for (uint k = 2u; k <= sortSize; k <<= 1) {
+			for (uint j = k >> 1; j > 0u; j >>= 1) {
+				for (uint i = gtid; i < sortSize; i += MAX_THREADS) {
+					const uint partner = i ^ j;
+					if (partner > i) {
+						bool stageAscending = (i & k) == 0u;
+						if (!ascending) {
+							stageAscending = !stageAscending;
+						}
+						const float keyA = scratchKey[i];
+						const float keyB = scratchKey[partner];
+						const uint indexA = scratchIndex[i];
+						const uint indexB = scratchIndex[partner];
+						const bool before = bps_before(keyA, indexA, keyB, indexB);
+						if (before != stageAscending) {
+							scratchKey[i] = keyB;
+							scratchKey[partner] = keyA;
+							scratchIndex[i] = indexB;
+							scratchIndex[partner] = indexA;
+						}
+					}
+				}
+				threadgroup_barrier(mem_flags::mem_threadgroup);
+			}
+		}
+
+		for (uint i = gtid; i < spanSize; i += MAX_THREADS) {
+			const uint pos = spanStart + i;
+			int x = 0;
+			int y = 0;
+			if (bps_coord_for_pos(p, nullptr, gid, pos, &x, &y) &&
+				bps_dst_in_world(p, x, y) && scratchIndex[i] != 0xffffffffu) {
+				sortTex[bps_dst_index_xy(p, x, y)] = srcTex[scratchIndex[i]];
+			}
+		}
+		threadgroup_barrier(mem_flags::mem_threadgroup);
+
+		cursor = spanEnd + 1u;
+	}
+}
+
+kernel void BitonicSortAxisLumaFullKernel(
+	device const float4       *srcTex  [[buffer(0)]],
+	device float4             *sortTex [[buffer(1)]],
+	constant BitonicSortParams &p      [[buffer(2)]],
+	uint gid  [[threadgroup_position_in_grid]],
+	uint gtid [[thread_position_in_threadgroup]])
+{
+	threadgroup float scratchKey[MAX_SIZE];
+	threadgroup uint  scratchIndex[MAX_SIZE];
+
+	const uint size = bps_line_size(p, gid);
+	if (size == 0u || size > MAX_SIZE) {
+		return;
+	}
+
+	for (uint pos = gtid; pos < size; pos += MAX_THREADS) {
+		sortTex[bps_axis_dst_index_pos(p, gid, pos)] =
+			srcTex[bps_axis_src_index_pos(p, gid, pos)];
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+
+	uint cursor = 0u;
+	while (cursor < size) {
+		if (gtid == 0u) {
+			uint spanStart = cursor;
+			while (spanStart < size) {
+				const float br = bps_luma(srcTex[bps_axis_src_index_pos(p, gid, spanStart)]);
+				if (br >= p.thresholdMin && br <= p.thresholdMax) {
+					break;
+				}
+				spanStart++;
+			}
+
+			uint spanEnd = spanStart;
+			while (spanEnd < size) {
+				const float br = bps_luma(srcTex[bps_axis_src_index_pos(p, gid, spanEnd)]);
+				if (br < p.thresholdMin || br > p.thresholdMax) {
+					break;
+				}
+				spanEnd++;
+			}
+
+			scratchIndex[0] = spanStart;
+			scratchIndex[1] = spanEnd;
+			scratchIndex[2] = spanEnd - spanStart;
+			scratchIndex[3] = bps_next_pow2(scratchIndex[2]);
+		}
+		threadgroup_barrier(mem_flags::mem_threadgroup);
+
+		const uint spanStart = scratchIndex[0];
+		const uint spanEnd = scratchIndex[1];
+		const uint spanSize = scratchIndex[2];
+		const uint sortSize = scratchIndex[3];
+		threadgroup_barrier(mem_flags::mem_threadgroup);
+
+		if (spanStart >= size || spanSize == 0u) {
+			break;
+		}
+
+		const bool ascending = p.ordering != 0;
+		for (uint i = gtid; i < sortSize; i += MAX_THREADS) {
+			if (i < spanSize) {
+				const uint pos = spanStart + i;
+				const uint srcIndex = bps_axis_src_index_pos(p, gid, pos);
+				scratchKey[i] = bps_luma(srcTex[srcIndex]);
+				scratchIndex[i] = srcIndex;
+			} else {
+				scratchKey[i] = ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX;
+				scratchIndex[i] = 0xffffffffu;
+			}
+		}
+		threadgroup_barrier(mem_flags::mem_threadgroup);
+
+		for (uint k = 2u; k <= sortSize; k <<= 1) {
+			for (uint j = k >> 1; j > 0u; j >>= 1) {
+				for (uint i = gtid; i < sortSize; i += MAX_THREADS) {
+					const uint partner = i ^ j;
+					if (partner > i) {
+						bool stageAscending = (i & k) == 0u;
+						if (!ascending) {
+							stageAscending = !stageAscending;
+						}
+						const float keyA = scratchKey[i];
+						const float keyB = scratchKey[partner];
+						const uint indexA = scratchIndex[i];
+						const uint indexB = scratchIndex[partner];
+						const bool before = bps_before(keyA, indexA, keyB, indexB);
+						if (before != stageAscending) {
+							scratchKey[i] = keyB;
+							scratchKey[partner] = keyA;
+							scratchIndex[i] = indexB;
+							scratchIndex[partner] = indexA;
+						}
+					}
+				}
+				threadgroup_barrier(mem_flags::mem_threadgroup);
+			}
+		}
+
+		for (uint i = gtid; i < spanSize; i += MAX_THREADS) {
+			const uint pos = spanStart + i;
+			const uint srcIndex = scratchIndex[i];
+			if (srcIndex != 0xffffffffu) {
+				sortTex[bps_axis_dst_index_pos(p, gid, pos)] = srcTex[srcIndex];
+			}
+		}
+		threadgroup_barrier(mem_flags::mem_threadgroup);
+
+		cursor = spanEnd + 1u;
 	}
 }

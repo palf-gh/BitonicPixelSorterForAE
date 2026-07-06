@@ -101,6 +101,8 @@ struct OpenCLGPUData {
 	cl_kernel path_classify_count_kernel;
 	cl_kernel path_scatter_records_kernel;
 	cl_kernel path_sort_records_kernel;
+	cl_kernel axis_luma_kernel;
+	cl_kernel axis_luma_full_kernel;
 	cl_mem path_samples_mem;
 	int path_samples_capacity;
 	cl_mem path_records_mem;
@@ -181,6 +183,14 @@ static void ReleaseOpenCLData(OpenCLGPUData *cl_dataP)
 			(void)clReleaseKernel(cl_dataP->path_classify_count_kernel);
 			cl_dataP->path_classify_count_kernel = 0;
 		}
+		if (cl_dataP->axis_luma_kernel) {
+			(void)clReleaseKernel(cl_dataP->axis_luma_kernel);
+			cl_dataP->axis_luma_kernel = 0;
+		}
+		if (cl_dataP->axis_luma_full_kernel) {
+			(void)clReleaseKernel(cl_dataP->axis_luma_full_kernel);
+			cl_dataP->axis_luma_full_kernel = 0;
+		}
 		if (cl_dataP->apply_domain_kernel) {
 			(void)clReleaseKernel(cl_dataP->apply_domain_kernel);
 			cl_dataP->apply_domain_kernel = 0;
@@ -224,6 +234,8 @@ struct DirectXGPUData {
 	ShaderObjectPtr path_classify_count_shader;
 	ShaderObjectPtr path_scatter_records_shader;
 	ShaderObjectPtr path_sort_records_shader;
+	ShaderObjectPtr axis_luma_shader;
+	ShaderObjectPtr axis_luma_full_shader;
 	Microsoft::WRL::ComPtr<ID3D12Resource> path_records_resource;
 	Microsoft::WRL::ComPtr<ID3D12Resource> path_line_offsets_resource;
 	Microsoft::WRL::ComPtr<ID3D12Resource> path_work_offsets_resource;
@@ -309,6 +321,8 @@ static void ReleaseDirectXData(DirectXGPUData *dx_dataP)
 		dx_dataP->path_sort_records_shader.reset();
 		dx_dataP->path_scatter_records_shader.reset();
 		dx_dataP->path_classify_count_shader.reset();
+		dx_dataP->axis_luma_shader.reset();
+		dx_dataP->axis_luma_full_shader.reset();
 		dx_dataP->apply_domain_shader.reset();
 		dx_dataP->mapped_sort_shader.reset();
 		dx_dataP->copy_shader.reset();
@@ -468,7 +482,6 @@ PF_Err BPS_BuildOpenCLPathMap(
 	OpenCLGPUData *cl_dataP,
 	cl_context context,
 	cl_command_queue queue,
-	cl_mem path_mem,
 	int width,
 	int height,
 	int lineCount,
@@ -477,12 +490,12 @@ PF_Err BPS_BuildOpenCLPathMap(
 	float pathLength,
 	int pathSMin,
 	int pathNMin,
-	int pathSampleCount,
+	const BitonicSorterParams &prm,
 	unsigned long long pathMapKey)
 {
-	if (!cl_dataP || !context || !queue || !path_mem ||
+	if (!cl_dataP || !context || !queue ||
 		width <= 0 || height <= 0 || lineCount <= 0 ||
-		pathSampleCount < 2) {
+		prm.pathSampleCount < 2 || !prm.pathSamples) {
 		return PF_Err_INTERNAL_STRUCT_DAMAGED;
 	}
 
@@ -532,10 +545,35 @@ PF_Err BPS_BuildOpenCLPathMap(
 		((static_cast<size_t>(width) + 15u) / 16u) * 16u,
 		((static_cast<size_t>(height) + 15u) / 16u) * 16u
 	};
+
+	BpsGpuJfaField jfaField;
+	if (!BPS_ComputeGpuJfaField(width, height, prm, &jfaField)) {
+		return PF_Err_INTERNAL_STRUCT_DAMAGED;
+	}
+	const std::vector<BpsJfaCellGpu> jfaCells = BPS_PackGpuJfaCells(jfaField);
+	const int gridW = static_cast<int>(jfaField.gridW);
+	const int gridH = static_cast<int>(jfaField.gridH);
+	const int jfaFactor = static_cast<int>(jfaField.factor);
+	const size_t jfaBytes = jfaCells.size() * sizeof(BpsJfaCellGpu);
+
+	cl_mem jfa_mem = 0;
+	if (!err) {
+		jfa_mem = clCreateBuffer(context, CL_MEM_READ_ONLY, jfaBytes, 0, &cl_result);
+		if (cl_result != CL_SUCCESS) {
+			err = CL2Err(cl_result);
+		}
+	}
+	if (!err) {
+		err = CL2Err(clEnqueueWriteBuffer(queue, jfa_mem, CL_TRUE, 0, jfaBytes,
+										 jfaCells.data(), 0, 0, 0));
+	}
+
 	if (!err) {
 		cl_uint arg = 0;
-		err = CL2Err(clSetKernelArg(cl_dataP->path_classify_count_kernel, arg++, sizeof(cl_mem), &path_mem));
-		if (!err) err = CL2Err(clSetKernelArg(cl_dataP->path_classify_count_kernel, arg++, sizeof(int), &pathSampleCount));
+		err = CL2Err(clSetKernelArg(cl_dataP->path_classify_count_kernel, arg++, sizeof(cl_mem), &jfa_mem));
+		if (!err) err = CL2Err(clSetKernelArg(cl_dataP->path_classify_count_kernel, arg++, sizeof(int), &gridW));
+		if (!err) err = CL2Err(clSetKernelArg(cl_dataP->path_classify_count_kernel, arg++, sizeof(int), &gridH));
+		if (!err) err = CL2Err(clSetKernelArg(cl_dataP->path_classify_count_kernel, arg++, sizeof(int), &jfaFactor));
 		if (!err) err = CL2Err(clSetKernelArg(cl_dataP->path_classify_count_kernel, arg++, sizeof(int), &width));
 		if (!err) err = CL2Err(clSetKernelArg(cl_dataP->path_classify_count_kernel, arg++, sizeof(int), &height));
 		if (!err) err = CL2Err(clSetKernelArg(cl_dataP->path_classify_count_kernel, arg++, sizeof(int), &lineCount));
@@ -642,6 +680,7 @@ PF_Err BPS_BuildOpenCLPathMap(
 	if (counts_mem) (void)clReleaseMemObject(counts_mem);
 	if (key_mem) (void)clReleaseMemObject(key_mem);
 	if (lane_mem) (void)clReleaseMemObject(lane_mem);
+	if (jfa_mem) (void)clReleaseMemObject(jfa_mem);
 
 	if (err) {
 		if (work_offsets_mem) (void)clReleaseMemObject(work_offsets_mem);
@@ -907,6 +946,18 @@ PF_Err BPS_GPUDeviceSetup(
 		}
 
 		if (!err) {
+			cl_dataP->axis_luma_kernel =
+				clCreateKernel(cl_dataP->program, "BitonicSortAxisLumaKernel", &result);
+			BPS_CL_ERR(result);
+		}
+
+		if (!err) {
+			cl_dataP->axis_luma_full_kernel =
+				clCreateKernel(cl_dataP->program, "BitonicSortAxisLumaFullKernel", &result);
+			BPS_CL_ERR(result);
+		}
+
+		if (!err) {
 			const size_t dummy_path_bytes = sizeof(BpsPathSample);
 			cl_dataP->path_samples_mem =
 				clCreateBuffer(context, CL_MEM_READ_ONLY, dummy_path_bytes,
@@ -1019,6 +1070,20 @@ PF_Err BPS_GPUDeviceSetup(
 			BPS_DX_ERR(BPS_LoadEmbeddedDirectXPathSortRecordsShader(
 				dx_dataP->context,
 				dx_dataP->path_sort_records_shader));
+		}
+
+		if (!err) {
+			dx_dataP->axis_luma_shader = std::make_shared<ShaderObject>();
+			BPS_DX_ERR(BPS_LoadEmbeddedDirectXAxisLumaSortShader(
+				dx_dataP->context,
+				dx_dataP->axis_luma_shader));
+		}
+
+		if (!err) {
+			dx_dataP->axis_luma_full_shader = std::make_shared<ShaderObject>();
+			BPS_DX_ERR(BPS_LoadEmbeddedDirectXAxisLumaFullSortShader(
+				dx_dataP->context,
+				dx_dataP->axis_luma_full_shader));
 		}
 
 		if (!err) {
@@ -1403,6 +1468,48 @@ PF_Err BPS_SmartRenderGPU(
 		};
 
 		if (mode == BPS_MODE_AXIS) {
+			if (BPS_UsesAxisLumaFastPath(cl_src_mem, cl_criterion_mem, cl_trigger_mem, *paramsP)) {
+				const bool fullSpan =
+					BPS_AxisSourceFullSpan(
+						direction, width, height,
+						inputOriginX, inputOriginY, inputWidth, inputHeight,
+						outputOriginX, outputOriginY, outputWidth, outputHeight) &&
+					BPS_AxisOutputFullSpan(
+						direction, width, height,
+						outputOriginX, outputOriginY, outputWidth, outputHeight);
+				cl_kernel axis_kernel = fullSpan
+					? cl_dataP->axis_luma_full_kernel
+					: cl_dataP->axis_luma_kernel;
+				cl_uint param_index = 0;
+				BPS_CL_ERR(clSetKernelArg(axis_kernel, param_index++, sizeof(cl_mem), &cl_src_mem));
+				BPS_CL_ERR(clSetKernelArg(axis_kernel, param_index++, sizeof(cl_mem), &cl_dst_mem));
+				BPS_CL_ERR(clSetKernelArg(axis_kernel, param_index++, sizeof(int), &srcPitch));
+				BPS_CL_ERR(clSetKernelArg(axis_kernel, param_index++, sizeof(int), &dstPitch));
+				BPS_CL_ERR(clSetKernelArg(axis_kernel, param_index++, sizeof(int), &width));
+				BPS_CL_ERR(clSetKernelArg(axis_kernel, param_index++, sizeof(int), &height));
+				BPS_CL_ERR(clSetKernelArg(axis_kernel, param_index++, sizeof(int), &inputOriginX));
+				BPS_CL_ERR(clSetKernelArg(axis_kernel, param_index++, sizeof(int), &inputOriginY));
+				if (!fullSpan) {
+					BPS_CL_ERR(clSetKernelArg(axis_kernel, param_index++, sizeof(int), &inputWidth));
+					BPS_CL_ERR(clSetKernelArg(axis_kernel, param_index++, sizeof(int), &inputHeight));
+				}
+				BPS_CL_ERR(clSetKernelArg(axis_kernel, param_index++, sizeof(int), &outputOriginX));
+				BPS_CL_ERR(clSetKernelArg(axis_kernel, param_index++, sizeof(int), &outputOriginY));
+				if (!fullSpan) {
+					BPS_CL_ERR(clSetKernelArg(axis_kernel, param_index++, sizeof(int), &outputWidth));
+					BPS_CL_ERR(clSetKernelArg(axis_kernel, param_index++, sizeof(int), &outputHeight));
+				}
+				BPS_CL_ERR(clSetKernelArg(axis_kernel, param_index++, sizeof(int), &direction));
+				BPS_CL_ERR(clSetKernelArg(axis_kernel, param_index++, sizeof(int), &ordering));
+				BPS_CL_ERR(clSetKernelArg(axis_kernel, param_index++, sizeof(float), &paramsP->thresholdMin));
+				BPS_CL_ERR(clSetKernelArg(axis_kernel, param_index++, sizeof(float), &paramsP->thresholdMax));
+				const size_t local = 256;
+				const size_t global = static_cast<size_t>(lineCount) * local;
+				BPS_CL_ERR(clEnqueueNDRangeKernel(queue, axis_kernel, 1, 0,
+												  &global, &local, 0, 0, 0));
+				return err;
+			}
+
 			cl_uint param_index = 0;
 			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(cl_mem), &cl_src_mem));
 			BPS_CL_ERR(clSetKernelArg(cl_dataP->sort_kernel, param_index++, sizeof(cl_mem), &cl_dst_mem));
@@ -1476,9 +1583,9 @@ PF_Err BPS_SmartRenderGPU(
 			cl_mem gpu_work_offsets_mem = 0;
 			if (!err && openclCanBuildPathMap) {
 				PF_Err build_err = BPS_BuildOpenCLPathMap(
-					cl_dataP, context, queue, path_mem,
+					cl_dataP, context, queue,
 					width, height, lineCount, pathDirection, pathClosed,
-					pathLength, pathSMin, pathNMin, pathSampleCount,
+					pathLength, pathSMin, pathNMin, *paramsP,
 					pathMapKey);
 				if (build_err == PF_Err_NONE &&
 					cl_dataP->path_mapped_record_count > 0 &&
@@ -2011,6 +2118,34 @@ PF_Err BPS_SmartRenderGPU(
 		}
 
 		if (mode == BPS_MODE_AXIS) {
+			if (BPS_UsesAxisLumaFastPath(
+					reinterpret_cast<const void *>(src_mem),
+					reinterpret_cast<const void *>(criterion_mem),
+					reinterpret_cast<const void *>(trigger_mem),
+					*paramsP)) {
+				const bool fullSpan =
+					BPS_AxisSourceFullSpan(
+						direction, width, height,
+						inputOriginX, inputOriginY, inputWidth, inputHeight,
+						outputOriginX, outputOriginY, outputWidth, outputHeight) &&
+					BPS_AxisOutputFullSpan(
+						direction, width, height,
+						outputOriginX, outputOriginY, outputWidth, outputHeight);
+				DXShaderExecution axis_execution(
+					dx_dataP->context,
+					fullSpan ? dx_dataP->axis_luma_full_shader : dx_dataP->axis_luma_shader,
+					3);
+				BPS_DX_ERR(axis_execution.SetParamBuffer(&dx_params, sizeof(dx_params)));
+				BPS_DX_ERR(axis_execution.SetUnorderedAccessView(
+					reinterpret_cast<ID3D12Resource *>(dst_mem),
+					dst_bytes));
+				BPS_DX_ERR(axis_execution.SetShaderResourceView(
+					reinterpret_cast<ID3D12Resource *>(src_mem),
+					src_bytes));
+				BPS_DX_ERR(axis_execution.Execute(static_cast<UINT>(lineCount), 1));
+				return err;
+			}
+
 			DXShaderExecution shader_execution(
 				dx_dataP->context,
 				dx_dataP->sort_shader,
@@ -2136,29 +2271,43 @@ PF_Err BPS_SmartRenderGPU(
 					ERR(create_uploaded_buffer(zero_counts.data(), counts_bytes,
 												counts_resource, counts_upload));
 					if (!err) {
-						dx_dataP->context->mCommandList->CopyResource(
-							path_resource.Get(), path_upload.Get());
-						D3D12_RESOURCE_BARRIER barriers[2] = {};
-						barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-						barriers[0].Transition.pResource = path_resource.Get();
-						barriers[0].Transition.Subresource = 0;
-						barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-						barriers[0].Transition.StateAfter =
-							D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-						barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-						barriers[1].Transition.pResource = counts_resource.Get();
-						barriers[1].Transition.Subresource = 0;
-						barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-						barriers[1].Transition.StateAfter =
-							D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-						dx_dataP->context->mCommandList->ResourceBarrier(2, barriers);
+						BpsGpuJfaField jfaField;
+						if (!BPS_ComputeGpuJfaField(width, height, *paramsP, &jfaField)) {
+							err = PF_Err_INTERNAL_STRUCT_DAMAGED;
+						}
+						const std::vector<BpsJfaCellGpu> jfaCells =
+							BPS_PackGpuJfaCells(jfaField);
+						const UINT jfa_bytes =
+							static_cast<UINT>(jfaCells.size() * sizeof(BpsJfaCellGpu));
+						Microsoft::WRL::ComPtr<ID3D12Resource> jfa_resource;
+						Microsoft::WRL::ComPtr<ID3D12Resource> jfa_upload;
+						if (!err) {
+							err = create_uploaded_buffer(
+								jfaCells.data(), jfa_bytes,
+								jfa_resource, jfa_upload);
+						}
+						if (!err) {
+							D3D12_RESOURCE_BARRIER barrier = {};
+							barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+							barrier.Transition.pResource = counts_resource.Get();
+							barrier.Transition.Subresource = 0;
+							barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+							barrier.Transition.StateAfter =
+								D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+							dx_dataP->context->mCommandList->ResourceBarrier(1, &barrier);
+						}
+
+						DirectXSortParams classify_params = dx_params;
+						classify_params.freePMin = static_cast<int>(jfaField.gridW);
+						classify_params.freeQMin = static_cast<int>(jfaField.gridH);
+						classify_params.swirlLineMin = static_cast<int>(jfaField.factor);
 
 						DXShaderExecution classify_execution(
 							dx_dataP->context,
 							dx_dataP->path_classify_count_shader,
 							8);
 						BPS_DX_ERR(classify_execution.SetParamBuffer(
-							&dx_params, sizeof(dx_params)));
+							&classify_params, sizeof(classify_params)));
 						BPS_DX_ERR(classify_execution.SetUnorderedAccessView(
 							lane_resource.Get(), lane_bytes));
 						BPS_DX_ERR(classify_execution.SetUnorderedAccessView(
@@ -2175,7 +2324,7 @@ PF_Err BPS_SmartRenderGPU(
 							reinterpret_cast<ID3D12Resource *>(trigger_mem),
 							trigger_bytes));
 						BPS_DX_ERR(classify_execution.SetShaderResourceView(
-							path_resource.Get(), path_bytes));
+							jfa_resource.Get(), jfa_bytes));
 						const UINT classify_x = static_cast<UINT>((width + 15) / 16);
 						const UINT classify_y = static_cast<UINT>((height + 15) / 16);
 						BPS_DX_ERR(classify_execution.Execute(classify_x, classify_y));

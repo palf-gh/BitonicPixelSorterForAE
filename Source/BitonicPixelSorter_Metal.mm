@@ -42,6 +42,7 @@
 #import <Foundation/Foundation.h>
 
 #include "BPS_MetalBackend.h"
+#include "BitonicPixelSorter_GpuEligibility.h"
 #include "BitonicPixelSorter_PathGeometry.h"
 #include "BitonicPixelSorter_Kernel.metal.h"	// kBitonicPixelSorter_Kernel_MetalString
 
@@ -65,6 +66,8 @@ struct MetalGPUData {
 	void *path_classify_count_pipeline_bridge;
 	void *path_scatter_records_pipeline_bridge;
 	void *path_sort_records_pipeline_bridge;
+	void *axis_luma_pipeline_bridge;
+	void *axis_luma_full_pipeline_bridge;
 	void *path_records_buffer_bridge;
 	void *path_line_offsets_buffer_bridge;
 	void *path_work_offsets_buffer_bridge;
@@ -340,7 +343,7 @@ PF_Err BPS_MetalDeviceSetup(
 			return PF_Err_INTERNAL_STRUCT_DAMAGED;
 		}
 
-		NSString *kernel_names[8] = {
+		NSString *kernel_names[10] = {
 			@"BitonicSortKernel",
 			@"BitonicSortDomainKernel",
 			@"BitonicApplyDomainKernel",
@@ -348,11 +351,13 @@ PF_Err BPS_MetalDeviceSetup(
 			@"BitonicSortMappedKernel",
 			@"BitonicBuildPathClassifyCountKernel",
 			@"BitonicBuildPathScatterRecordsKernel",
-			@"BitonicBuildPathSortRecordsKernel"
+			@"BitonicBuildPathSortRecordsKernel",
+			@"BitonicSortAxisLumaKernel",
+			@"BitonicSortAxisLumaFullKernel"
 		};
-		id<MTLComputePipelineState> pipelines[8] = {
-			nil, nil, nil, nil, nil, nil, nil, nil};
-		for (int i = 0; i < 8; ++i) {
+		id<MTLComputePipelineState> pipelines[10] = {
+			nil, nil, nil, nil, nil, nil, nil, nil, nil, nil};
+		for (int i = 0; i < 10; ++i) {
 			id<MTLFunction> function = [library newFunctionWithName:kernel_names[i]];
 			if (!function) {
 				return PF_Err_INTERNAL_STRUCT_DAMAGED;
@@ -378,6 +383,8 @@ PF_Err BPS_MetalDeviceSetup(
 		id<MTLComputePipelineState> path_classify_count_pipeline = pipelines[5];
 		id<MTLComputePipelineState> path_scatter_records_pipeline = pipelines[6];
 		id<MTLComputePipelineState> path_sort_records_pipeline = pipelines[7];
+		id<MTLComputePipelineState> axis_luma_pipeline = pipelines[8];
+		id<MTLComputePipelineState> axis_luma_full_pipeline = pipelines[9];
 
 		// Allocate the PF_Handle to hold MetalGPUData.
 		PF_Handle gpu_dataH = handle_suite->host_new_handle(sizeof(MetalGPUData));
@@ -410,6 +417,10 @@ PF_Err BPS_MetalDeviceSetup(
 			const_cast<void *>(CFBridgingRetain(path_scatter_records_pipeline));
 		metal_dataP->path_sort_records_pipeline_bridge =
 			const_cast<void *>(CFBridgingRetain(path_sort_records_pipeline));
+		metal_dataP->axis_luma_pipeline_bridge =
+			const_cast<void *>(CFBridgingRetain(axis_luma_pipeline));
+		metal_dataP->axis_luma_full_pipeline_bridge =
+			const_cast<void *>(CFBridgingRetain(axis_luma_full_pipeline));
 
 		// One-sample dummy path buffer reused by Axis and other modes that do not
 		// need polyline samples (avoids a per-frame MTLBuffer allocation).
@@ -464,6 +475,8 @@ PF_Err BPS_MetalDeviceSetdown(
 			// immediately goes out of scope, decrementing the retain count.
 			BPS_MetalClearPathMap(metal_dataP);
 			BPS_MetalReleaseBridge(&metal_dataP->path_dummy_buffer_bridge);
+			BPS_MetalReleaseBridge(&metal_dataP->axis_luma_full_pipeline_bridge);
+			BPS_MetalReleaseBridge(&metal_dataP->axis_luma_pipeline_bridge);
 			BPS_MetalReleaseBridge(&metal_dataP->path_sort_records_pipeline_bridge);
 			BPS_MetalReleaseBridge(&metal_dataP->path_scatter_records_pipeline_bridge);
 			BPS_MetalReleaseBridge(&metal_dataP->path_classify_count_pipeline_bridge);
@@ -599,10 +612,14 @@ PF_Err BPS_MetalSmartRender(
 			(__bridge id<MTLComputePipelineState>)metal_dataP->path_scatter_records_pipeline_bridge;
 		id<MTLComputePipelineState> path_sort_records_pipeline =
 			(__bridge id<MTLComputePipelineState>)metal_dataP->path_sort_records_pipeline_bridge;
+		id<MTLComputePipelineState> axis_luma_pipeline =
+			(__bridge id<MTLComputePipelineState>)metal_dataP->axis_luma_pipeline_bridge;
+		id<MTLComputePipelineState> axis_luma_full_pipeline =
+			(__bridge id<MTLComputePipelineState>)metal_dataP->axis_luma_full_pipeline_bridge;
 		if (!sort_pipeline || !domain_sort_pipeline || !apply_domain_pipeline ||
 			!copy_pipeline || !mapped_sort_pipeline ||
 			!path_classify_count_pipeline || !path_scatter_records_pipeline ||
-			!path_sort_records_pipeline) {
+			!path_sort_records_pipeline || !axis_luma_pipeline || !axis_luma_full_pipeline) {
 			return PF_Err_INTERNAL_STRUCT_DAMAGED;
 		}
 
@@ -720,6 +737,31 @@ PF_Err BPS_MetalSmartRender(
 		id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
 
 		if (paramsP->mode == BPS_MODE_AXIS) {
+			const bool axisLumaFastPath = BPS_UsesAxisLumaFastPath(
+				src_mem, criterion_mem, trigger_mem, *paramsP);
+			if (axisLumaFastPath) {
+				const bool fullSpan =
+					BPS_AxisSourceFullSpan(
+						direction, width, height,
+						inputOriginX, inputOriginY, inputWidth, inputHeight,
+						outputOriginX, outputOriginY, outputWidth, outputHeight) &&
+					BPS_AxisOutputFullSpan(
+						direction, width, height,
+						outputOriginX, outputOriginY, outputWidth, outputHeight);
+				id<MTLComputePipelineState> axisPipeline =
+					fullSpan ? axis_luma_full_pipeline : axis_luma_pipeline;
+				id<MTLComputeCommandEncoder> computeEncoder =
+					[commandBuffer computeCommandEncoder];
+				[computeEncoder setComputePipelineState:axisPipeline];
+				[computeEncoder setBuffer:src_buffer  offset:0 atIndex:0];
+				[computeEncoder setBuffer:dst_buffer  offset:0 atIndex:1];
+				[computeEncoder setBuffer:paramBuffer offset:0 atIndex:2];
+				MTLSize threadgroupsPerGrid  = MTLSizeMake((NSUInteger)lineCount, 1, 1);
+				MTLSize threadsPerThreadgroup = MTLSizeMake(256, 1, 1);
+				[computeEncoder dispatchThreadgroups:threadgroupsPerGrid
+				               threadsPerThreadgroup:threadsPerThreadgroup];
+				[computeEncoder endEncoding];
+			} else {
 			id<MTLComputeCommandEncoder> computeEncoder =
 				[commandBuffer computeCommandEncoder];
 
@@ -736,6 +778,7 @@ PF_Err BPS_MetalSmartRender(
 			[computeEncoder dispatchThreadgroups:threadgroupsPerGrid
 			               threadsPerThreadgroup:threadsPerThreadgroup];
 			[computeEncoder endEncoding];
+			}
 		} else if (BPS_ModeUsesMappedSort(paramsP->mode)) {
 			id<MTLComputeCommandEncoder> copyEncoder =
 				[commandBuffer computeCommandEncoder];
@@ -803,15 +846,41 @@ PF_Err BPS_MetalSmartRender(
 					std::memset([countBuffer contents], 0,
 								(NSUInteger)lineCount * sizeof(std::uint32_t));
 
+					BpsGpuJfaField jfaField;
+					if (!BPS_ComputeGpuJfaField(width, height, *paramsP, &jfaField)) {
+						return PF_Err_INTERNAL_STRUCT_DAMAGED;
+					}
+					const std::vector<BpsJfaCellGpu> jfaCells =
+						BPS_PackGpuJfaCells(jfaField);
+					id<MTLBuffer> jfaBuffer =
+						[device newBufferWithBytes:jfaCells.data()
+						                    length:jfaCells.size() * sizeof(BpsJfaCellGpu)
+						                   options:MTLResourceStorageModeShared];
+					if (!jfaBuffer) {
+						return PF_Err_OUT_OF_MEMORY;
+					}
+
+					BitonicSortParams classifyParams = metal_params;
+					classifyParams.freePMin = (int)jfaField.gridW;
+					classifyParams.freeQMin = (int)jfaField.gridH;
+					classifyParams.swirlLineMin = (int)jfaField.factor;
+					id<MTLBuffer> classifyParamBuffer =
+						[device newBufferWithBytes:&classifyParams
+						                    length:sizeof(BitonicSortParams)
+						                   options:MTLResourceStorageModeShared];
+					if (!classifyParamBuffer) {
+						return PF_Err_OUT_OF_MEMORY;
+					}
+
 					id<MTLCommandBuffer> buildCommandBuffer = [queue commandBuffer];
 					id<MTLComputeCommandEncoder> classifyEncoder =
 						[buildCommandBuffer computeCommandEncoder];
 					[classifyEncoder setComputePipelineState:path_classify_count_pipeline];
-					[classifyEncoder setBuffer:pathBuffer  offset:0 atIndex:0];
+					[classifyEncoder setBuffer:jfaBuffer  offset:0 atIndex:0];
 					[classifyEncoder setBuffer:laneBuffer  offset:0 atIndex:1];
 					[classifyEncoder setBuffer:keyBuffer   offset:0 atIndex:2];
 					[classifyEncoder setBuffer:countBuffer offset:0 atIndex:3];
-					[classifyEncoder setBuffer:paramBuffer offset:0 atIndex:4];
+					[classifyEncoder setBuffer:classifyParamBuffer offset:0 atIndex:4];
 					[classifyEncoder dispatchThreadgroups:
 						MTLSizeMake(((NSUInteger)width + 15u) / 16u,
 									((NSUInteger)height + 15u) / 16u,

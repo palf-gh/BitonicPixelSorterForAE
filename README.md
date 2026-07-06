@@ -99,7 +99,7 @@ dispatch:
 
 | Mode | GPU pipeline |
 | --- | --- |
-| Axis | Single-pass bitonic sort (`BitonicSortKernel`; CUDA may select a luminance fast path when criterion and trigger both read luminance from the source) |
+| Axis | Single-pass bitonic sort (`BitonicSortKernel`; all GPU backends may select a luminance fast path when criterion and trigger both read luminance from the source with inside-thresholds affect and zero cycle) |
 | Free Angle, Rotation, Radial, Swirl | Two-pass analytic domain sort (`SortDomain`, then `ApplyDomain`) |
 | Path | Copy input, build a pixel-owned path map on the GPU (classify → scatter → sort records), then mapped bitonic sort (`SortMapped`) |
 
@@ -112,10 +112,9 @@ reuses a device-side map keyed by path geometry. CPU fallback and non-GPU render
 acquire a shared host map instead.
 
 Path map construction follows the same three-stage pipeline on every backend.
-CUDA classifies lanes via a jump-flood nearest-point field; OpenCL, DirectX and
-Metal classify via per-pixel nearest-segment search. CPU fallback shares the JFA
-oracle with CUDA; other GPU backends may differ slightly near lane boundaries under
-extreme path curvature.
+All backends classify lanes with the same jump-flood nearest-point oracle as CPU
+fallback. CUDA runs JFA on device; OpenCL, DirectX and Metal compute the JFA field
+on the host when the geometry cache misses, upload it, then classify on the GPU.
 
 ### Repository Layout
 
@@ -386,7 +385,7 @@ CUDA / OpenCL / DirectX(HLSL) / Metal の 4 バックエンドは同じモード
 
 | モード | GPU パイプライン |
 | --- | --- |
-| 軸方向 | 単一パス bitonic sort（`BitonicSortKernel`。CUDA は criterion/trigger がソース輝度のとき luminance fast path を選択可能） |
+| 軸方向 | 単一パス bitonic sort（`BitonicSortKernel`。criterion/trigger がソース輝度かつ inside-thresholds・cycle 0 のとき全 GPU バックエンドが luminance fast path を選択可能） |
 | 自由角度・回転・放射・螺旋 | 2 パス解析 domain sort（`SortDomain` → `ApplyDomain`） |
 | パス | 入力コピー → GPU 上で path map 構築（classify → scatter → sort records）→ mapped bitonic sort（`SortMapped`） |
 
@@ -394,7 +393,7 @@ GPU SmartFX レンダーで mapped sort を使うのはパスのみです。Tran
 
 GPU レンダーではホストが Path map を事前構築しません。各バックエンドがジオメトリキー付きでデバイス側 map を構築または再利用します。CPU フォールバックと非 GPU レンダーは共有ホスト map を取得します。
 
-Path map 構築は全バックエンドで同じ 3 段パイプラインです。CUDA は jump-flood nearest-point field で lane 分類、OpenCL/DirectX/Metal は全画素 nearest-segment 探索です。CPU フォールバックは CUDA と同じ JFA オラクルを共有します。極端な曲率付近では他 GPU バックエンドで lane 境界がわずかに異なる場合があります。
+Path map 構築は全バックエンドで同じ 3 段パイプラインです。lane 分類は CPU フォールバックと同じ jump-flood nearest-point オラクルを共有します。CUDA はデバイス上で JFA を実行し、OpenCL/DirectX/Metal はジオメトリキャッシュミス時にホストで JFA フィールドを構築してアップロードしたうえで GPU classify します。
 
 ### リポジトリ構成
 
@@ -653,7 +652,7 @@ CUDA、OpenCL、DirectX/HLSL、Metal 四个 GPU 后端共享相同的模式分�
 
 | 模式 | GPU 管线 |
 | --- | --- |
-| 轴向 | 单遍 bitonic sort（`BitonicSortKernel`；CUDA 在 criterion/trigger 均读源亮度时可选用 luminance fast path） |
+| 轴向 | 单遍 bitonic sort（`BitonicSortKernel`；criterion/trigger 均为源亮度、inside-thresholds 且 cycle 为 0 时，所有 GPU 后端均可选用 luminance fast path） |
 | 自由角度、旋转、放射、螺旋 | 两遍解析 domain sort（`SortDomain`，然后 `ApplyDomain`） |
 | 路径 | 复制输入 → GPU 上构建 path map（classify → scatter → sort records）→ mapped bitonic sort（`SortMapped`） |
 
@@ -661,7 +660,7 @@ GPU SmartFX 渲染中仅路径模式使用 cached pixel-owned map。变换模式
 
 GPU 渲染时主机不预先构建 Path map；各后端按几何键在设备侧构建或复用 map。CPU 回退与非 GPU 渲染则获取共享主机 map。
 
-Path map 构建在所有后端上均为相同三阶段管线。CUDA 通过 jump-flood nearest-point field 分类 lane；OpenCL、DirectX、Metal 通过逐像素 nearest-segment 搜索。CPU 回退与 CUDA 共享 JFA 判定；极端曲率附近其他 GPU 后端的 lane 边界可能略有差异。
+Path map 构建在所有后端上均为相同三阶段管线。lane 分类与 CPU 回退共享同一 jump-flood nearest-point 判定。CUDA 在设备上运行 JFA；OpenCL、DirectX、Metal 在几何缓存未命中时在主机构建 JFA 字段并上传后在 GPU 上 classify。
 
 ### 仓库结构
 
@@ -922,7 +921,7 @@ CUDA, OpenCL, DirectX/HLSL, Metal 네 GPU 백엔드는 동일한 모드 분기�
 
 | 모드 | GPU 파이프라인 |
 | --- | --- |
-| 축 방향 | 단일 패스 bitonic sort(`BitonicSortKernel`. CUDA는 criterion/trigger가 소스 휘도일 때 luminance fast path 선택 가능) |
+| 축 방향 | 단일 패스 bitonic sort(`BitonicSortKernel`. criterion/trigger가 소스 휘도이고 inside-thresholds·cycle 0이면 모든 GPU 백엔드가 luminance fast path 선택 가능) |
 | 자유 각도, 회전, 방사, 나선 | 2패스 해석 domain sort(`SortDomain` → `ApplyDomain`) |
 | 패스 | 입력 복사 → GPU에서 path map 구축(classify → scatter → sort records) → mapped bitonic sort(`SortMapped`) |
 
@@ -930,7 +929,7 @@ GPU SmartFX 렌더에서 mapped sort를 쓰는 것은 패스뿐입니다. Transf
 
 GPU 렌더에서는 호스트가 Path map을 미리 만들지 않습니다. 각 백엔드가 geometry 키로 디바イス map을 구축하거나 재사용합니다. CPU 폴백과 비 GPU 렌더는 공유 호스트 map을 가져옵니다.
 
-Path map 구축은 모든 백엔드에서 동일한 3단계 파이프라인입니다. CUDA는 jump-flood nearest-point field로 lane을 분류하고, OpenCL/DirectX/Metal은 픽셀별 nearest-segment 탐색을 씁니다. CPU 폴백은 CUDA와 같은 JFA 오라클을 공유합니다. 극단적 곡률 근처에서는 다른 GPU 백엔드의 lane 경계가 약간 다를 수 있습니다.
+Path map 구축은 모든 백엔드에서 동일한 3단계 파이프라인입니다. lane 분류는 CPU 폴백과 같은 jump-flood nearest-point 오라클을 공유합니다. CUDA는 디바イス에서 JFA를 실행하고, OpenCL/DirectX/Metal은 geometry 캐시 미스 시 호스트에서 JFA 필드를 구축·업로드한 뒤 GPU classify를 수행합니다.
 
 ### 저장소 구조
 

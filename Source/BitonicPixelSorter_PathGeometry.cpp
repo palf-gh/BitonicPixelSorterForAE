@@ -1678,6 +1678,22 @@ bool BPS_ComputeGpuJfaField(
 	return !field_out->d2.empty();
 }
 
+std::vector<BpsJfaCellGpu> BPS_PackGpuJfaCells(const BpsGpuJfaField &field)
+{
+	const size_t count =
+		static_cast<size_t>(field.gridW) * static_cast<size_t>(field.gridH);
+	std::vector<BpsJfaCellGpu> cells(count);
+	for (size_t i = 0; i < count; ++i) {
+		cells[i].qx = field.qx[i];
+		cells[i].qy = field.qy[i];
+		cells[i].s = field.s[i];
+		cells[i].tx = field.tx[i];
+		cells[i].ty = field.ty[i];
+		cells[i].d2 = field.d2[i];
+	}
+	return cells;
+}
+
 std::uint64_t BPS_PathMapKey(
 	A_long frameW,
 	A_long frameH,

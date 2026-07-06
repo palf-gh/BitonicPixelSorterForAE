@@ -1027,20 +1027,31 @@ __kernel void BitonicCopyInputKernel(
 	dstTex[dstIndex] = pixel;
 }
 
+struct BpsJfaCellGpu {
+	float qx;
+	float qy;
+	float s;
+	float tx;
+	float ty;
+	float d2;
+};
+
 __kernel void BitonicBuildPathClassifyCountKernel(
-	__global const BpsPathSampleGpu *pathSamples,
-	int                    pathSampleCount,
-	int                    width,
-	int                    height,
-	int                    lineCount,
-	int                    pathDirection,
-	int                    pathClosed,
-	float                  pathLength,
-	int                    pathSMin,
-	int                    pathNMin,
-	__global int          *laneOf,
-	__global float        *keyOf,
-	volatile __global uint *laneCounts)
+	__global const BpsJfaCellGpu *jfaField,
+	int                              gridW,
+	int                              gridH,
+	int                              jfaFactor,
+	int                              width,
+	int                              height,
+	int                              lineCount,
+	int                              pathDirection,
+	int                              pathClosed,
+	float                            pathLength,
+	int                              pathSMin,
+	int                              pathNMin,
+	__global int                    *laneOf,
+	__global float                  *keyOf,
+	volatile __global uint          *laneCounts)
 {
 	const int x = (int)get_global_id(0);
 	const int y = (int)get_global_id(1);
@@ -1050,17 +1061,21 @@ __kernel void BitonicBuildPathClassifyCountKernel(
 	const uint pidx = (uint)(y * width + x);
 	laneOf[pidx] = -1;
 
-	float s = 0.0f;
-	float n = 0.0f;
-	if (!bps_path_closest(pathSamples, pathSampleCount, (float)x, (float)y, &s, &n)) {
+	const int cx = min(x / jfaFactor, gridW - 1);
+	const int cy = min(y / jfaFactor, gridH - 1);
+	const BpsJfaCellGpu cell = jfaField[(uint)(cy * gridW + cx)];
+	if (!isfinite(cell.d2)) {
 		return;
 	}
 
+	const float dxp = (float)x - cell.qx;
+	const float dyp = (float)y - cell.qy;
+	const float n = -cell.ty * dxp + cell.tx * dyp;
 	int lane = 0;
 	float order = 0.0f;
 	if (!bps_path_lane_order(pathDirection, pathClosed, pathLength,
 							 pathSMin, pathNMin, lineCount,
-							 s, n, &lane, &order)) {
+							 cell.s, n, &lane, &order)) {
 		return;
 	}
 	laneOf[pidx] = lane;
@@ -1342,4 +1357,316 @@ __kernel void BitonicSortMappedKernel(
 	#undef BPS_DST_IN_WORLD
 	#undef BPS_SRC_INDEX_XY
 	#undef BPS_DST_INDEX_XY
+}
+
+inline float bps_luma(float4 c)
+{
+	return clamp(0.298912f * c.z + 0.586611f * c.y + 0.114478f * c.x, 0.0f, 1.0f);
+}
+
+__kernel void BitonicSortAxisLumaKernel(
+	__global const float4 *srcTex,
+	__global float4       *dstTex,
+	int                    srcPitch,
+	int                    dstPitch,
+	int                    width,
+	int                    height,
+	int                    inputOriginX,
+	int                    inputOriginY,
+	int                    inputWidth,
+	int                    inputHeight,
+	int                    outputOriginX,
+	int                    outputOriginY,
+	int                    outputWidth,
+	int                    outputHeight,
+	int                    direction,
+	int                    ordering,
+	float                  thresholdMin,
+	float                  thresholdMax)
+{
+	__local float scratchKey[MAX_SIZE];
+	__local uint scratchIndex[MAX_SIZE];
+	__local uint s_spanStart;
+	__local uint s_spanEnd;
+	__local uint s_spanSize;
+	__local uint s_sortSize;
+
+	const uint gid = get_group_id(0);
+	const uint gtid = get_local_id(0);
+	const uint size = direction ? (uint)width : (uint)height;
+	if (size == 0u || size > MAX_SIZE) {
+		return;
+	}
+
+	const int lineLayer = direction ? (outputOriginY + (int)gid) : (outputOriginX + (int)gid);
+
+	#define BPS_AXIS_X(pos) (direction ? (int)(pos) : lineLayer)
+	#define BPS_AXIS_Y(pos) (direction ? lineLayer : (int)(pos))
+	#define BPS_SRC_IN_WORLD(x, y) ((x) >= inputOriginX && (y) >= inputOriginY && \
+									(x) < inputOriginX + inputWidth && (y) < inputOriginY + inputHeight)
+	#define BPS_DST_IN_WORLD(x, y) ((x) >= outputOriginX && (y) >= outputOriginY && \
+									(x) < outputOriginX + outputWidth && (y) < outputOriginY + outputHeight)
+	#define BPS_SRC_INDEX_XY(x, y) ((uint)(((x) - inputOriginX) + ((y) - inputOriginY) * srcPitch))
+	#define BPS_DST_INDEX_XY(x, y) ((uint)(((x) - outputOriginX) + ((y) - outputOriginY) * dstPitch))
+
+	for (uint pos = gtid; pos < size; pos += MAX_THREADS) {
+		const int x = BPS_AXIS_X(pos);
+		const int y = BPS_AXIS_Y(pos);
+		if (x >= 0 && y >= 0 && x < width && y < height && BPS_DST_IN_WORLD(x, y)) {
+			dstTex[BPS_DST_INDEX_XY(x, y)] = BPS_SRC_IN_WORLD(x, y)
+				? srcTex[BPS_SRC_INDEX_XY(x, y)]
+				: (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+		}
+	}
+	barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+	uint cursor = 0u;
+	while (cursor < size) {
+		if (gtid == 0u) {
+			uint spanStart = cursor;
+			while (spanStart < size) {
+				const int x = BPS_AXIS_X(spanStart);
+				const int y = BPS_AXIS_Y(spanStart);
+				if (x >= 0 && y >= 0 && x < width && y < height && BPS_SRC_IN_WORLD(x, y)) {
+					const float br = bps_luma(srcTex[BPS_SRC_INDEX_XY(x, y)]);
+					if (br >= thresholdMin && br <= thresholdMax) {
+						break;
+					}
+				}
+				spanStart++;
+			}
+
+			uint spanEnd = spanStart;
+			while (spanEnd < size) {
+				const int x = BPS_AXIS_X(spanEnd);
+				const int y = BPS_AXIS_Y(spanEnd);
+				if (x < 0 || y < 0 || x >= width || y >= height || !BPS_SRC_IN_WORLD(x, y)) {
+					break;
+				}
+				const float br = bps_luma(srcTex[BPS_SRC_INDEX_XY(x, y)]);
+				if (br < thresholdMin || br > thresholdMax) {
+					break;
+				}
+				spanEnd++;
+			}
+
+			const uint spanSize = spanEnd - spanStart;
+			s_spanStart = spanStart;
+			s_spanEnd = spanEnd;
+			s_spanSize = spanSize;
+			s_sortSize = bps_next_pow2(spanSize);
+		}
+		barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+		const uint spanStart = s_spanStart;
+		const uint spanEnd = s_spanEnd;
+		const uint spanSize = s_spanSize;
+		const uint sortSize = s_sortSize;
+
+		if (spanStart >= size || spanSize == 0u) {
+			break;
+		}
+
+		const bool ascending = ordering != 0;
+		for (uint i = gtid; i < sortSize; i += MAX_THREADS) {
+			if (i < spanSize) {
+				const uint pos = spanStart + i;
+				const int x = BPS_AXIS_X(pos);
+				const int y = BPS_AXIS_Y(pos);
+				const bool valid =
+					x >= 0 && y >= 0 && x < width && y < height && BPS_SRC_IN_WORLD(x, y);
+				const uint srcIndex = valid ? BPS_SRC_INDEX_XY(x, y) : 0xffffffffu;
+				scratchKey[i] = valid
+					? bps_luma(srcTex[srcIndex])
+					: (ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX);
+				scratchIndex[i] = srcIndex;
+			} else {
+				scratchKey[i] = ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX;
+				scratchIndex[i] = 0xffffffffu;
+			}
+		}
+		barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+		for (uint k = 2u; k <= sortSize; k <<= 1) {
+			for (uint j = k >> 1; j > 0u; j >>= 1) {
+				for (uint i = gtid; i < sortSize; i += MAX_THREADS) {
+					const uint partner = i ^ j;
+					if (partner > i) {
+						bool stageAscending = (i & k) == 0u;
+						if (!ascending) {
+							stageAscending = !stageAscending;
+						}
+
+						const float keyA = scratchKey[i];
+						const float keyB = scratchKey[partner];
+						const uint indexA = scratchIndex[i];
+						const uint indexB = scratchIndex[partner];
+						const bool before = bps_before(keyA, indexA, keyB, indexB);
+						if (before != stageAscending) {
+							scratchKey[i] = keyB;
+							scratchKey[partner] = keyA;
+							scratchIndex[i] = indexB;
+							scratchIndex[partner] = indexA;
+						}
+					}
+				}
+				barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+			}
+		}
+
+		for (uint i = gtid; i < spanSize; i += MAX_THREADS) {
+			const uint pos = spanStart + i;
+			const int x = BPS_AXIS_X(pos);
+			const int y = BPS_AXIS_Y(pos);
+			if (x >= 0 && y >= 0 && x < width && y < height &&
+				BPS_DST_IN_WORLD(x, y) && scratchIndex[i] != 0xffffffffu) {
+				dstTex[BPS_DST_INDEX_XY(x, y)] = srcTex[scratchIndex[i]];
+			}
+		}
+		barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+		cursor = spanEnd + 1u;
+	}
+
+	#undef BPS_AXIS_X
+	#undef BPS_AXIS_Y
+	#undef BPS_SRC_IN_WORLD
+	#undef BPS_DST_IN_WORLD
+	#undef BPS_SRC_INDEX_XY
+	#undef BPS_DST_INDEX_XY
+}
+
+__kernel void BitonicSortAxisLumaFullKernel(
+	__global const float4 *srcTex,
+	__global float4       *dstTex,
+	int                    srcPitch,
+	int                    dstPitch,
+	int                    width,
+	int                    height,
+	int                    inputOriginX,
+	int                    inputOriginY,
+	int                    outputOriginX,
+	int                    outputOriginY,
+	int                    direction,
+	int                    ordering,
+	float                  thresholdMin,
+	float                  thresholdMax)
+{
+	__local float scratchKey[MAX_SIZE];
+	__local uint scratchIndex[MAX_SIZE];
+	__local uint s_spanStart;
+	__local uint s_spanEnd;
+	__local uint s_spanSize;
+	__local uint s_sortSize;
+
+	const uint gid = get_group_id(0);
+	const uint gtid = get_local_id(0);
+	const uint size = direction ? (uint)width : (uint)height;
+	if (size == 0u || size > MAX_SIZE) {
+		return;
+	}
+
+	#define BPS_AXIS_SRC_INDEX(pos) ((uint)(inputOriginX + (direction ? (int)(pos) : (int)gid) + \
+										 (inputOriginY + (direction ? (int)gid : (int)(pos)) * srcPitch))
+	#define BPS_AXIS_DST_INDEX(pos) ((uint)(outputOriginX + (direction ? (int)(pos) : (int)gid) + \
+										 (outputOriginY + (direction ? (int)gid : (int)(pos)) * dstPitch))
+
+	for (uint pos = gtid; pos < size; pos += MAX_THREADS) {
+		dstTex[BPS_AXIS_DST_INDEX(pos)] = srcTex[BPS_AXIS_SRC_INDEX(pos)];
+	}
+	barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+	uint cursor = 0u;
+	while (cursor < size) {
+		if (gtid == 0u) {
+			uint spanStart = cursor;
+			while (spanStart < size) {
+				const float br = bps_luma(srcTex[BPS_AXIS_SRC_INDEX(spanStart)]);
+				if (br >= thresholdMin && br <= thresholdMax) {
+					break;
+				}
+				spanStart++;
+			}
+
+			uint spanEnd = spanStart;
+			while (spanEnd < size) {
+				const float br = bps_luma(srcTex[BPS_AXIS_SRC_INDEX(spanEnd)]);
+				if (br < thresholdMin || br > thresholdMax) {
+					break;
+				}
+				spanEnd++;
+			}
+
+			const uint spanSize = spanEnd - spanStart;
+			s_spanStart = spanStart;
+			s_spanEnd = spanEnd;
+			s_spanSize = spanSize;
+			s_sortSize = bps_next_pow2(spanSize);
+		}
+		barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+		const uint spanStart = s_spanStart;
+		const uint spanEnd = s_spanEnd;
+		const uint spanSize = s_spanSize;
+		const uint sortSize = s_sortSize;
+
+		if (spanStart >= size || spanSize == 0u) {
+			break;
+		}
+
+		const bool ascending = ordering != 0;
+		for (uint i = gtid; i < sortSize; i += MAX_THREADS) {
+			if (i < spanSize) {
+				const uint pos = spanStart + i;
+				const uint srcIndex = BPS_AXIS_SRC_INDEX(pos);
+				scratchKey[i] = bps_luma(srcTex[srcIndex]);
+				scratchIndex[i] = srcIndex;
+			} else {
+				scratchKey[i] = ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX;
+				scratchIndex[i] = 0xffffffffu;
+			}
+		}
+		barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+		for (uint k = 2u; k <= sortSize; k <<= 1) {
+			for (uint j = k >> 1; j > 0u; j >>= 1) {
+				for (uint i = gtid; i < sortSize; i += MAX_THREADS) {
+					const uint partner = i ^ j;
+					if (partner > i) {
+						bool stageAscending = (i & k) == 0u;
+						if (!ascending) {
+							stageAscending = !stageAscending;
+						}
+
+						const float keyA = scratchKey[i];
+						const float keyB = scratchKey[partner];
+						const uint indexA = scratchIndex[i];
+						const uint indexB = scratchIndex[partner];
+						const bool before = bps_before(keyA, indexA, keyB, indexB);
+						if (before != stageAscending) {
+							scratchKey[i] = keyB;
+							scratchKey[partner] = keyA;
+							scratchIndex[i] = indexB;
+							scratchIndex[partner] = indexA;
+						}
+					}
+				}
+				barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+			}
+		}
+
+		for (uint i = gtid; i < spanSize; i += MAX_THREADS) {
+			const uint pos = spanStart + i;
+			const uint srcIndex = scratchIndex[i];
+			if (srcIndex != 0xffffffffu) {
+				dstTex[BPS_AXIS_DST_INDEX(pos)] = srcTex[srcIndex];
+			}
+		}
+		barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+		cursor = spanEnd + 1u;
+	}
+
+	#undef BPS_AXIS_SRC_INDEX
+	#undef BPS_AXIS_DST_INDEX
 }

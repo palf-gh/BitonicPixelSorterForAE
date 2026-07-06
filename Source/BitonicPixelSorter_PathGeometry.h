@@ -160,6 +160,9 @@ bool BPS_ComputeGpuJfaField(
 	const BitonicSorterParams &prm,
 	BpsGpuJfaField *field_out);
 
+// Interleaved JFA cells for GPU classify kernels (OpenCL / DirectX / Metal).
+std::vector<BpsJfaCellGpu> BPS_PackGpuJfaCells(const BpsGpuJfaField &field);
+
 // Modes that fundamentally require a cached pixel-owned map. Analytic transform
 // modes deliberately stay off this path for GPU renders so angle changes remain
 // interactive; CPU fallback may still acquire a transform map explicitly.
