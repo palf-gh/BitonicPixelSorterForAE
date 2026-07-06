@@ -27,6 +27,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(BPS_RENDER_DIAG "Enable Bitonic Pixel Sorter render diagnostics" OFF)
+option(BPS_PERF_VARIANT "Build a performance-test variant with distinct AE name, match name, and output file" OFF)
 # Diagnostic / compatibility switch: build a pure CPU plugin with every GPU
 # backend (CUDA/OpenCL/DirectX/Metal) disabled, so the PiPL advertises no GPU
 # support and the binary links no GPU frameworks. Useful for isolating whether a
@@ -42,6 +43,18 @@ option(BPS_ENABLE_DIRECTX "Build the DirectX/HLSL backend when dxc is present" O
 option(BPS_ENABLE_METAL "Build the Metal backend on macOS when Python3 is present" ON)
 
 set(BPS_DIST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/dist")
+
+if(BPS_PERF_VARIANT)
+	set(BPS_OUTPUT_NAME "$<IF:$<CONFIG:Debug>,BitonicPixelSorter_perf_debug,BitonicPixelSorter_perf>")
+	set(BPS_BUNDLE_EXECUTABLE "BitonicPixelSorter_perf")
+	set(BPS_BUNDLE_NAME "BitonicPixelSorterPerf")
+	set(BPS_BUNDLE_IDENTIFIER "com.palf.bitonicpixelsorterperf")
+else()
+	set(BPS_OUTPUT_NAME "$<IF:$<CONFIG:Debug>,BitonicPixelSorter_debug,BitonicPixelSorter>")
+	set(BPS_BUNDLE_EXECUTABLE "BitonicPixelSorter")
+	set(BPS_BUNDLE_NAME "BitonicPixelSorter")
+	set(BPS_BUNDLE_IDENTIFIER "com.palf.bitonicpixelsorter")
+endif()
 
 set(BPS_CUDA_AVAILABLE FALSE)
 set(BPS_OPENCL_AVAILABLE FALSE)
@@ -140,6 +153,26 @@ include_directories(
 )
 
 #------------------------------------------------------------------------------
+# Standalone algorithm benchmark. This executable deliberately avoids AE SDK
+# runtime calls and consumes raw RGBA so Axis sort changes can be measured
+# directly outside After Effects.
+#------------------------------------------------------------------------------
+add_executable(bps_axis_bench
+	tools/axis_sort_bench.cpp)
+target_compile_features(bps_axis_bench PRIVATE cxx_std_17)
+if(MSVC)
+	target_compile_options(bps_axis_bench PRIVATE /utf-8)
+endif()
+foreach(_bps_config IN ITEMS Debug Release RelWithDebInfo MinSizeRel)
+	string(TOUPPER "${_bps_config}" _bps_config_upper)
+	set_target_properties(bps_axis_bench PROPERTIES
+		"RUNTIME_OUTPUT_DIRECTORY_${_bps_config_upper}"
+		"${CMAKE_CURRENT_BINARY_DIR}/tools/${_bps_config}")
+endforeach()
+unset(_bps_config)
+unset(_bps_config_upper)
+
+#------------------------------------------------------------------------------
 # Sources (plugin + the few SDK utility translation units it links).
 #------------------------------------------------------------------------------
 set(SOURCES
@@ -172,6 +205,32 @@ set(SOURCES
 # GPU kernel translation units (added when their toolchain is available).
 if(BPS_CUDA_AVAILABLE)
 	list(APPEND SOURCES "GPU/BitonicPixelSorter_Kernel.cu")
+	find_package(CUDAToolkit REQUIRED)
+
+	add_executable(bps_cuda_axis_bench
+		tools/cuda_axis_bench.cpp
+		GPU/BitonicPixelSorter_Kernel.cu)
+	target_compile_features(bps_cuda_axis_bench PRIVATE cxx_std_17)
+	set_target_properties(bps_cuda_axis_bench PROPERTIES
+		CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+		CUDA_RUNTIME_LIBRARY None
+		CUDA_SEPARABLE_COMPILATION OFF)
+	target_link_libraries(bps_cuda_axis_bench PRIVATE CUDA::cudart)
+	if(MSVC)
+		target_compile_options(bps_cuda_axis_bench PRIVATE
+			$<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+			$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
+			$<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:-Xcompiler=/MDd>
+			$<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CONFIG:Debug>>>:-Xcompiler=/MD>)
+	endif()
+	foreach(_bps_config IN ITEMS Debug Release RelWithDebInfo MinSizeRel)
+		string(TOUPPER "${_bps_config}" _bps_config_upper)
+		set_target_properties(bps_cuda_axis_bench PROPERTIES
+			"RUNTIME_OUTPUT_DIRECTORY_${_bps_config_upper}"
+			"${CMAKE_CURRENT_BINARY_DIR}/tools/${_bps_config}")
+	endforeach()
+	unset(_bps_config)
+	unset(_bps_config_upper)
 endif()
 
 if(BPS_OPENCL_AVAILABLE)
@@ -203,6 +262,8 @@ if(BPS_HLSL_AVAILABLE)
 	# Axis single-pass, non-axis domain sort, and non-axis apply entry points.
 	set(BPS_DIRECTX_SHADER_ENTRIES
 		"main|BitonicSortKernel"
+		"SortAxisLuma|BitonicSortAxisLuma"
+		"SortAxisLumaFull|BitonicSortAxisLumaFull"
 		"SortDomain|BitonicSortDomain"
 		"ApplyDomain|BitonicApplyDomain"
 		"CopyInput|BitonicCopyInput"
@@ -263,6 +324,25 @@ if(BPS_HLSL_AVAILABLE)
 
 	add_custom_target(${PROJECT_NAME}_directx_shaders
 		DEPENDS ${BPS_DIRECTX_SHADER_HEADERS})
+
+	add_executable(bps_dx_axis_bench
+		tools/dx_axis_bench.cpp
+		${BPS_DIRECTX_SHADER_HEADERS})
+	add_dependencies(bps_dx_axis_bench ${PROJECT_NAME}_directx_shaders)
+	target_compile_features(bps_dx_axis_bench PRIVATE cxx_std_17)
+	target_include_directories(bps_dx_axis_bench PRIVATE "${BPS_GENERATED_DIR}")
+	target_link_libraries(bps_dx_axis_bench PRIVATE d3d12 dxgi)
+	if(MSVC)
+		target_compile_options(bps_dx_axis_bench PRIVATE /utf-8)
+	endif()
+	foreach(_bps_config IN ITEMS Debug Release RelWithDebInfo MinSizeRel)
+		string(TOUPPER "${_bps_config}" _bps_config_upper)
+		set_target_properties(bps_dx_axis_bench PROPERTIES
+			"RUNTIME_OUTPUT_DIRECTORY_${_bps_config_upper}"
+			"${CMAKE_CURRENT_BINARY_DIR}/tools/${_bps_config}")
+	endforeach()
+	unset(_bps_config)
+	unset(_bps_config_upper)
 endif()
 
 #------------------------------------------------------------------------------
@@ -324,6 +404,11 @@ endif()
 set(PIPL_R "${CMAKE_CURRENT_SOURCE_DIR}/PiPL/BitonicPixelSorterPiPL.r")
 set(TARGET_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/Source/BitonicPixelSorter_Target.h")
 
+set(BPS_PIPL_VARIANT_DEFINES)
+if(BPS_PERF_VARIANT)
+	list(APPEND BPS_PIPL_VARIANT_DEFINES "-DBPS_PERF_VARIANT=1")
+endif()
+
 if(WIN32)
 	#--------------------------------------------------------------------------
 	# Windows: build PiPL .rc via MSVC /EP preprocess + PiPLtool, per config.
@@ -346,6 +431,7 @@ if(WIN32)
 			-D "BPS_PIPL_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
 			-D "BPS_PIPL_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}"
 			-D "BPS_PIPL_DEBUG=1"
+			-D "BPS_PIPL_PERF_VARIANT=${BPS_PERF_VARIANT}"
 			-D "BPS_PIPL_HAS_CUDA=${BPS_CUDA_AVAILABLE}"
 			-D "BPS_PIPL_HAS_OPENCL=${BPS_OPENCL_AVAILABLE}"
 			-D "BPS_PIPL_HAS_HLSL=${BPS_HLSL_AVAILABLE}"
@@ -364,6 +450,7 @@ if(WIN32)
 			-D "BPS_PIPL_AESDK=${AESDK_ROOT}"
 			-D "BPS_PIPL_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
 			-D "BPS_PIPL_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+			-D "BPS_PIPL_PERF_VARIANT=${BPS_PERF_VARIANT}"
 			-D "BPS_PIPL_HAS_CUDA=${BPS_CUDA_AVAILABLE}"
 			-D "BPS_PIPL_HAS_OPENCL=${BPS_OPENCL_AVAILABLE}"
 			-D "BPS_PIPL_HAS_HLSL=${BPS_HLSL_AVAILABLE}"
@@ -389,7 +476,7 @@ if(WIN32)
 
 	# Debug builds get a "_debug" suffix so they can sit beside Release.
 	set_target_properties(${PROJECT_NAME} PROPERTIES
-		OUTPUT_NAME "$<IF:$<CONFIG:Debug>,BitonicPixelSorter_debug,BitonicPixelSorter>")
+		OUTPUT_NAME "${BPS_OUTPUT_NAME}")
 
 elseif(APPLE)
 	#--------------------------------------------------------------------------
@@ -424,6 +511,7 @@ elseif(APPLE)
 			-I "${CMAKE_CURRENT_SOURCE_DIR}/Source"
 			-D __MACH__ -D AE_OS_MAC -D DEBUG=1 -D BPS_DEBUG_BUILD=1
 			${BPS_PIPL_BACKEND_DEFINES}
+			${BPS_PIPL_VARIANT_DEFINES}
 			-o "${PIPL_I_DEBUG}" "${PIPL_R}"
 		DEPENDS "${PIPL_R}" "${TARGET_HEADER}"
 		COMMENT "Preprocessing PiPL resource (Debug)...")
@@ -436,6 +524,7 @@ elseif(APPLE)
 			-I "${CMAKE_CURRENT_SOURCE_DIR}/Source"
 			-D __MACH__ -D AE_OS_MAC
 			${BPS_PIPL_BACKEND_DEFINES}
+			${BPS_PIPL_VARIANT_DEFINES}
 			-o "${PIPL_I_RELEASE}" "${PIPL_R}"
 		DEPENDS "${PIPL_R}" "${TARGET_HEADER}"
 		COMMENT "Preprocessing PiPL resource (Release)...")
@@ -465,17 +554,17 @@ elseif(APPLE)
 	add_library(${PROJECT_NAME} MODULE ${SOURCES})
 	add_dependencies(${PROJECT_NAME} ${PROJECT_NAME}_pipl)
 
-	set(BUNDLE_EXECUTABLE "BitonicPixelSorter")
-	set(BUNDLE_NAME "BitonicPixelSorter")
-	string(TOLOWER "${BUNDLE_NAME}" BUNDLE_NAME_LOWER)
+	set(BUNDLE_EXECUTABLE "${BPS_BUNDLE_EXECUTABLE}")
+	set(BUNDLE_NAME "${BPS_BUNDLE_NAME}")
+	set(BUNDLE_IDENTIFIER "${BPS_BUNDLE_IDENTIFIER}")
 	configure_file("${CMAKE_CURRENT_SOURCE_DIR}/Mac/Info.plist.in"
 				   "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" @ONLY)
 
 	set_target_properties(${PROJECT_NAME} PROPERTIES
 		BUNDLE TRUE
 		BUNDLE_EXTENSION "plugin"
-		OUTPUT_NAME "$<IF:$<CONFIG:Debug>,BitonicPixelSorter_debug,BitonicPixelSorter>"
-		MACOSX_BUNDLE_GUI_IDENTIFIER "com.palf.bitonicpixelsorter"
+		OUTPUT_NAME "${BPS_OUTPUT_NAME}"
+		MACOSX_BUNDLE_GUI_IDENTIFIER "${BPS_BUNDLE_IDENTIFIER}"
 		OSX_ARCHITECTURES "x86_64;arm64"
 		XCODE_ATTRIBUTE_GCC_SYMBOLS_PRIVATE_EXTERN "NO")
 
@@ -519,6 +608,10 @@ endif()
 # Keep PluginDataEntryFunction2 and PiPL match names aligned per configuration.
 target_compile_definitions(${PROJECT_NAME} PRIVATE
 	$<$<CONFIG:Debug>:BPS_DEBUG_BUILD=1>)
+
+if(BPS_PERF_VARIANT)
+	target_compile_definitions(${PROJECT_NAME} PRIVATE BPS_PERF_VARIANT=1)
+endif()
 
 # Microsoft-recommended compatibility shim: revert std::mutex to its pre-VS16.10
 # constructor so a plugin built with a newer MSVC STL still works when loaded

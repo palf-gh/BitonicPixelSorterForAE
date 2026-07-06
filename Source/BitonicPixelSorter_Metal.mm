@@ -912,9 +912,7 @@ PF_Err BPS_MetalSmartRender(
 				}
 			} else if (hasHostPathMap) {
 				const std::uint64_t hostMapKey =
-					(paramsP->mode == BPS_MODE_PATH)
-						? BPS_PathMapKey(width, height, *paramsP)
-						: BPS_TransformMapKey(width, height, *paramsP);
+					BPS_PathMapKey(width, height, *paramsP);
 				if (!BPS_MetalBindHostMap(
 						metal_dataP, device, width, height, lineCount, hostMapKey,
 						paramsP->mappedRecords,
@@ -924,26 +922,26 @@ PF_Err BPS_MetalSmartRender(
 						&recordsBuffer, &lineOffsetsBuffer, &workOffsetsBuffer)) {
 					return PF_Err_OUT_OF_MEMORY;
 				}
-			} else if (BPS_ModeUsesTransformMap(paramsP->mode)) {
-				const std::shared_ptr<const BpsPathMap> transformMap =
-					BPS_AcquireTransformMap(width, height, *paramsP);
-				if (transformMap &&
-					transformMap->mappedRecordCount > 0 &&
-					transformMap->mappedWorkItemCount > 0) {
+			} else if (paramsP->mode == BPS_MODE_PATH) {
+				const std::shared_ptr<const BpsPathMap> pathMap =
+					BPS_AcquirePathMap(width, height, *paramsP);
+				if (pathMap &&
+					pathMap->mappedRecordCount > 0 &&
+					pathMap->mappedWorkItemCount > 0) {
 					const std::uint64_t hostMapKey =
-						BPS_TransformMapKey(width, height, *paramsP);
+						BPS_PathMapKey(width, height, *paramsP);
 					if (!BPS_MetalBindHostMap(
 							metal_dataP, device, width, height, lineCount, hostMapKey,
-							transformMap->records.data(),
-							transformMap->lineOffsets.data(),
-							transformMap->workOffsets.data(),
-							transformMap->mappedRecordCount,
-							transformMap->mappedWorkItemCount,
+							pathMap->records.data(),
+							pathMap->lineOffsets.data(),
+							pathMap->workOffsets.data(),
+							pathMap->mappedRecordCount,
+							pathMap->mappedWorkItemCount,
 							&recordsBuffer, &lineOffsetsBuffer, &workOffsetsBuffer)) {
 						return PF_Err_OUT_OF_MEMORY;
 					}
-					mappedRecordCount = transformMap->mappedRecordCount;
-					mappedWorkItemCount = transformMap->mappedWorkItemCount;
+					mappedRecordCount = pathMap->mappedRecordCount;
+					mappedWorkItemCount = pathMap->mappedWorkItemCount;
 				}
 			}
 

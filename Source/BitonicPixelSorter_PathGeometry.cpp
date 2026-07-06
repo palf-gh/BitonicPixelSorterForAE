@@ -1033,7 +1033,6 @@ bool BPS_ClassifyMappedPixel(
 	return false;
 }
 
-namespace {
 
 // Nearest-point field: for every frame pixel, the closest polyline point q
 // (qx, qy), its arc length (s) and unit tangent (tx, ty), plus the squared
@@ -1166,6 +1165,53 @@ inline A_long JfaGridFactor(A_long frameW, A_long frameH)
 		f = 3;
 	}
 	return f;
+}
+
+A_long BPS_JfaGridFactor(A_long frame_w, A_long frame_h)
+{
+	return JfaGridFactor(frame_w, frame_h);
+}
+
+static void NormaliseTangentHost(float *tx, float *ty)
+{
+	const float len = std::sqrt((*tx) * (*tx) + (*ty) * (*ty));
+	if (len > kEps) {
+		*tx /= len;
+		*ty /= len;
+	} else {
+		*tx = 1.0f;
+		*ty = 0.0f;
+	}
+}
+
+std::vector<BpsPathSample> BPS_BuildGpuPathSeeds(
+	const BpsPathSample *samples,
+	A_long sample_count)
+{
+	std::vector<BpsPathSample> seeds;
+	if (!samples || sample_count < 2) {
+		return seeds;
+	}
+	for (A_long i = 0; i < sample_count - 1; ++i) {
+		const BpsPathSample p0 = samples[i];
+		const BpsPathSample p1 = samples[i + 1];
+		const float dx = p1.x - p0.x;
+		const float dy = p1.y - p0.y;
+		const float len = std::sqrt(dx * dx + dy * dy);
+		const int steps = (std::max)(1, static_cast<int>(std::ceil(len)));
+		for (int k = (i > 0) ? 1 : 0; k <= steps; ++k) {
+			const float t = static_cast<float>(k) / static_cast<float>(steps);
+			BpsPathSample seed;
+			seed.x = p0.x + dx * t;
+			seed.y = p0.y + dy * t;
+			seed.s = p0.s + (p1.s - p0.s) * t;
+			seed.tx = p0.tx + (p1.tx - p0.tx) * t;
+			seed.ty = p0.ty + (p1.ty - p0.ty) * t;
+			NormaliseTangentHost(&seed.tx, &seed.ty);
+			seeds.push_back(seed);
+		}
+	}
+	return seeds;
 }
 
 // Run `fn(threadIndex)` across `workers` threads and join.
@@ -1605,7 +1651,32 @@ std::mutex g_pathMapCacheMutex;
 std::vector<PathMapCacheEntry> g_pathMapCache;	// front = most recent
 constexpr size_t kPathMapCacheCapacity = 16;
 
-} // namespace
+bool BPS_ComputeGpuJfaField(
+	A_long frame_w,
+	A_long frame_h,
+	const BitonicSorterParams &prm,
+	BpsGpuJfaField *field_out)
+{
+	if (!field_out || frame_w <= 0 || frame_h <= 0 ||
+		!prm.pathSamples || prm.pathSampleCount < 2) {
+		return false;
+	}
+	JfaField field;
+	A_long grid_w = 0;
+	A_long grid_h = 0;
+	A_long factor = 1;
+	ComputePathField(frame_w, frame_h, prm, &field, &grid_w, &grid_h, &factor);
+	field_out->qx = std::move(field.qx);
+	field_out->qy = std::move(field.qy);
+	field_out->s = std::move(field.s);
+	field_out->tx = std::move(field.tx);
+	field_out->ty = std::move(field.ty);
+	field_out->d2 = std::move(field.d2);
+	field_out->gridW = grid_w;
+	field_out->gridH = grid_h;
+	field_out->factor = factor;
+	return !field_out->d2.empty();
+}
 
 std::uint64_t BPS_PathMapKey(
 	A_long frameW,

@@ -547,8 +547,7 @@ DisposePreRenderData(void *pre_render_dataPV)
 
 //-----------------------------------------------------------------------------
 // Re-bind the params' host pointers after vector reallocation / cache lookup.
-// Path mode reads from the shared, cached BpsPathMap; other mapped modes read
-// from the pre-render data's own vectors.
+// Path mode, and CPU transform fallback, read from a shared cached BpsPathMap.
 static void
 BPS_BindMappedPointers(BitonicPreRenderData *dataP)
 {
@@ -760,10 +759,6 @@ PreRender(
 		dataP->pathMap =
 			BPS_AcquirePathMap(BPS_RenderWidth(in_data), BPS_RenderHeight(in_data), *infoP);
 	}
-	if (!err && BPS_ModeUsesTransformMap(infoP->mode)) {
-		dataP->pathMap =
-			BPS_AcquireTransformMap(BPS_RenderWidth(in_data), BPS_RenderHeight(in_data), *infoP);
-	}
 
 	if (gpu_eligibility.render_possible) {
 		extraP->output->flags |= PF_RenderOutputFlag_GPU_RENDER_POSSIBLE;
@@ -913,14 +908,16 @@ SmartRender(
 	}
 	BitonicSorterParams *infoP = &dataP->params;
 	BPS_BindMappedPointers(dataP);
-	if (!dataP->pathMap && BPS_ModeUsesMappedSort(infoP->mode)) {
-		if (infoP->mode == BPS_MODE_PATH) {
-			dataP->pathMap =
-				BPS_AcquirePathMap(BPS_RenderWidth(in_data), BPS_RenderHeight(in_data), *infoP);
-		} else if (BPS_ModeUsesTransformMap(infoP->mode)) {
-			dataP->pathMap =
-				BPS_AcquireTransformMap(BPS_RenderWidth(in_data), BPS_RenderHeight(in_data), *infoP);
-		}
+	// GPU path builds its map on the device (cached by geometry key). CPU fallback
+	// and non-GPU renders acquire the shared host map here.
+	if (!isGPU && !dataP->pathMap && infoP->mode == BPS_MODE_PATH) {
+		dataP->pathMap =
+			BPS_AcquirePathMap(BPS_RenderWidth(in_data), BPS_RenderHeight(in_data), *infoP);
+		BPS_BindMappedPointers(dataP);
+	}
+	if (!isGPU && !dataP->pathMap && BPS_ModeUsesTransformMap(infoP->mode)) {
+		dataP->pathMap =
+			BPS_AcquireTransformMap(BPS_RenderWidth(in_data), BPS_RenderHeight(in_data), *infoP);
 		BPS_BindMappedPointers(dataP);
 	}
 

@@ -10,6 +10,14 @@ bool BPS_LoadEmbeddedDirectXSortShader(
 	const DXContextPtr &context,
 	ShaderObjectPtr &out_shader);
 
+bool BPS_LoadEmbeddedDirectXAxisLumaSortShader(
+	const DXContextPtr &context,
+	ShaderObjectPtr &out_shader);
+
+bool BPS_LoadEmbeddedDirectXAxisLumaFullSortShader(
+	const DXContextPtr &context,
+	ShaderObjectPtr &out_shader);
+
 bool BPS_LoadEmbeddedDirectXDomainSortShader(
 	const DXContextPtr &context,
 	ShaderObjectPtr &out_shader);

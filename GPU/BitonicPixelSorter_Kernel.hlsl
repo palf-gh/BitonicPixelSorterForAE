@@ -555,6 +555,233 @@ uint DstIndexXY(int x, int y)
 	return (uint)((x - outputOriginX) + (y - outputOriginY) * dstPitch);
 }
 
+float BpsLuma(float4 c)
+{
+	return saturate(0.298912f * c.z + 0.586611f * c.y + 0.114478f * c.x);
+}
+
+int BpsAxisLineLayer(uint gid)
+{
+	return direction != 0 ? outputOriginY + (int)gid : outputOriginX + (int)gid;
+}
+
+void BpsAxisCoordForPos(uint gid, uint pos, out int x, out int y)
+{
+	const int lineLayer = BpsAxisLineLayer(gid);
+	x = direction != 0 ? (int)pos : lineLayer;
+	y = direction != 0 ? lineLayer : (int)pos;
+}
+
+uint BpsAxisSrcIndexPos(uint gid, uint pos)
+{
+	int x = 0;
+	int y = 0;
+	BpsAxisCoordForPos(gid, pos, x, y);
+	return (uint)((x - inputOriginX) + (y - inputOriginY) * srcPitch);
+}
+
+uint BpsAxisDstIndexPos(uint gid, uint pos)
+{
+	int x = 0;
+	int y = 0;
+	BpsAxisCoordForPos(gid, pos, x, y);
+	return (uint)((x - outputOriginX) + (y - outputOriginY) * dstPitch);
+}
+
+void BpsAxisLumaSortCore(
+	uint gid,
+	uint gtid,
+	uint size,
+	bool fullSpan)
+{
+	uint cursor = 0u;
+	while (cursor < size) {
+		if (gtid == 0u) {
+			uint spanStart = cursor;
+			while (spanStart < size) {
+				float br = 0.0f;
+				if (fullSpan) {
+					br = BpsLuma(LoadPixel(srcTex, BpsAxisSrcIndexPos(gid, spanStart)));
+				} else {
+					int x = 0;
+					int y = 0;
+					BpsAxisCoordForPos(gid, spanStart, x, y);
+					if (x >= 0 && y >= 0 && x < width && y < height && SrcInWorld(x, y)) {
+						br = BpsLuma(LoadPixel(srcTex, SrcIndexXY(x, y)));
+					} else {
+						br = thresholdMax + 1.0f;
+					}
+				}
+				if (br >= thresholdMin && br <= thresholdMax) {
+					break;
+				}
+				spanStart++;
+			}
+
+			uint spanEnd = spanStart;
+			while (spanEnd < size) {
+				float br = 0.0f;
+				if (fullSpan) {
+					br = BpsLuma(LoadPixel(srcTex, BpsAxisSrcIndexPos(gid, spanEnd)));
+				} else {
+					int x = 0;
+					int y = 0;
+					BpsAxisCoordForPos(gid, spanEnd, x, y);
+					if (x < 0 || y < 0 || x >= width || y >= height || !SrcInWorld(x, y)) {
+						br = thresholdMax + 1.0f;
+					} else {
+						br = BpsLuma(LoadPixel(srcTex, SrcIndexXY(x, y)));
+					}
+				}
+				if (br < thresholdMin || br > thresholdMax) {
+					break;
+				}
+				spanEnd++;
+			}
+
+			scratchIndex[0] = spanStart;
+			scratchIndex[1] = spanEnd;
+			scratchIndex[2] = spanEnd - spanStart;
+			scratchIndex[3] = BpsNextPow2(scratchIndex[2]);
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		const uint spanStart = scratchIndex[0];
+		const uint spanEnd = scratchIndex[1];
+		const uint spanSize = scratchIndex[2];
+		const uint sortSize = scratchIndex[3];
+
+		GroupMemoryBarrierWithGroupSync();
+
+		if (spanStart >= size || spanSize == 0u) {
+			break;
+		}
+
+		const bool ascending = ordering != 0;
+		for (uint loadIndex = gtid; loadIndex < sortSize; loadIndex += MAX_THREADS) {
+			if (loadIndex < spanSize) {
+				const uint pos = spanStart + loadIndex;
+				uint srcIndex = 0xffffffffu;
+				float key = ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX;
+				if (fullSpan) {
+					srcIndex = BpsAxisSrcIndexPos(gid, pos);
+					key = BpsLuma(LoadPixel(srcTex, srcIndex));
+				} else {
+					int x = 0;
+					int y = 0;
+					BpsAxisCoordForPos(gid, pos, x, y);
+					const bool valid =
+						x >= 0 && y >= 0 && x < width && y < height && SrcInWorld(x, y);
+					srcIndex = valid ? SrcIndexXY(x, y) : 0xffffffffu;
+					key = valid
+						? BpsLuma(LoadPixel(srcTex, srcIndex))
+						: (ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX);
+				}
+				scratchKey[loadIndex] = key;
+				scratchIndex[loadIndex] = srcIndex;
+			} else {
+				scratchKey[loadIndex] = ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX;
+				scratchIndex[loadIndex] = 0xffffffffu;
+			}
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		for (uint k = 2u; k <= sortSize; k <<= 1) {
+			for (uint j = k >> 1; j > 0u; j >>= 1) {
+				for (uint sortIndex = gtid; sortIndex < sortSize; sortIndex += MAX_THREADS) {
+					const uint partner = sortIndex ^ j;
+					if (partner > sortIndex) {
+						bool stageAscending = (sortIndex & k) == 0u;
+						if (!ascending) {
+							stageAscending = !stageAscending;
+						}
+
+						const float keyA = scratchKey[sortIndex];
+						const float keyB = scratchKey[partner];
+						const uint indexA = scratchIndex[sortIndex];
+						const uint indexB = scratchIndex[partner];
+						const bool before = BpsBefore(keyA, indexA, keyB, indexB);
+						if (before != stageAscending) {
+							scratchKey[sortIndex] = keyB;
+							scratchKey[partner] = keyA;
+							scratchIndex[sortIndex] = indexB;
+							scratchIndex[partner] = indexA;
+						}
+					}
+				}
+				GroupMemoryBarrierWithGroupSync();
+			}
+		}
+
+		for (uint writeIndex = gtid; writeIndex < spanSize; writeIndex += MAX_THREADS) {
+			const uint pos = spanStart + writeIndex;
+			const uint srcIndex = scratchIndex[writeIndex];
+			if (srcIndex == 0xffffffffu) {
+				continue;
+			}
+			if (fullSpan) {
+				StorePixel(sortTex, BpsAxisDstIndexPos(gid, pos), LoadPixel(srcTex, srcIndex));
+			} else {
+				int x = 0;
+				int y = 0;
+				BpsAxisCoordForPos(gid, pos, x, y);
+				if (x >= 0 && y >= 0 && x < width && y < height && DstInWorld(x, y)) {
+					StorePixel(sortTex, DstIndexXY(x, y), LoadPixel(srcTex, srcIndex));
+				}
+			}
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		cursor = spanEnd + 1u;
+	}
+}
+
+[RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=1)),DescriptorTable(SRV(t0,numDescriptors=1))")]
+[numthreads(256, 1, 1)]
+void SortAxisLuma(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
+{
+	const uint gid = groupID.x;
+	const uint gtid = groupThreadID.x;
+	const uint size = direction != 0u ? (uint)width : (uint)height;
+	if (size == 0u || size > MAX_SIZE) {
+		return;
+	}
+
+	for (uint pos = gtid; pos < size; pos += MAX_THREADS) {
+		int x = 0;
+		int y = 0;
+		BpsAxisCoordForPos(gid, pos, x, y);
+		if (x >= 0 && y >= 0 && x < width && y < height && DstInWorld(x, y)) {
+			StorePixel(sortTex, DstIndexXY(x, y),
+				SrcInWorld(x, y) ? LoadPixel(srcTex, SrcIndexXY(x, y))
+								 : float4(0.0f, 0.0f, 0.0f, 0.0f));
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	BpsAxisLumaSortCore(gid, gtid, size, false);
+}
+
+[RootSignature("DescriptorTable(CBV(b0,numDescriptors=1)),DescriptorTable(UAV(u0,numDescriptors=1)),DescriptorTable(SRV(t0,numDescriptors=1))")]
+[numthreads(256, 1, 1)]
+void SortAxisLumaFull(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
+{
+	const uint gid = groupID.x;
+	const uint gtid = groupThreadID.x;
+	const uint size = direction != 0u ? (uint)width : (uint)height;
+	if (size == 0u || size > MAX_SIZE) {
+		return;
+	}
+
+	for (uint pos = gtid; pos < size; pos += MAX_THREADS) {
+		StorePixel(sortTex, BpsAxisDstIndexPos(gid, pos),
+			LoadPixel(srcTex, BpsAxisSrcIndexPos(gid, pos)));
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	BpsAxisLumaSortCore(gid, gtid, size, true);
+}
+
 uint DomainIndex(uint gid, uint pos)
 {
 	return (uint)((int)gid * domainStride + (int)pos);

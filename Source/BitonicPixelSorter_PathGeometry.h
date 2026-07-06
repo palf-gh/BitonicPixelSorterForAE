@@ -42,7 +42,8 @@ struct BitonicPreRenderData {
 	std::vector<BpsMappedPixelRecord> mappedRecords;
 	std::vector<std::uint32_t> mappedLineOffsets;
 	std::vector<std::uint32_t> mappedWorkOffsets;
-	// Path mode uses a cached, shared map instead of the vectors above.
+	// Path mode, and CPU transform fallback, use a cached shared map instead of
+	// the vectors above.
 	std::shared_ptr<const BpsPathMap> pathMap;
 	// True when PreRender successfully reserved a non-None key-source layer.
 	// GPU worlds often have a null CPU `data` pointer, so SmartRender must not
@@ -123,10 +124,48 @@ std::uint64_t BPS_PathMapKey(
 	A_long frame_h,
 	const BitonicSorterParams &prm);
 
-// Non-axis modes that sort via a cached pixel-owned map (Path + transform modes).
+// Low-resolution JFA grid factor shared by CPU and GPU path-map builders.
+A_long BPS_JfaGridFactor(A_long frame_w, A_long frame_h);
+
+// Dense arc-length seed list for GPU JFA path-map construction.
+std::vector<BpsPathSample> BPS_BuildGpuPathSeeds(
+	const BpsPathSample *samples,
+	A_long sample_count);
+
+// Low-resolution nearest-point field for GPU path classify (matches CPU JFA).
+struct BpsJfaCellGpu {
+	float qx;
+	float qy;
+	float s;
+	float tx;
+	float ty;
+	float d2;
+};
+
+struct BpsGpuJfaField {
+	std::vector<float> qx;
+	std::vector<float> qy;
+	std::vector<float> s;
+	std::vector<float> tx;
+	std::vector<float> ty;
+	std::vector<float> d2;
+	A_long gridW = 0;
+	A_long gridH = 0;
+	A_long factor = 1;
+};
+
+bool BPS_ComputeGpuJfaField(
+	A_long frame_w,
+	A_long frame_h,
+	const BitonicSorterParams &prm,
+	BpsGpuJfaField *field_out);
+
+// Modes that fundamentally require a cached pixel-owned map. Analytic transform
+// modes deliberately stay off this path for GPU renders so angle changes remain
+// interactive; CPU fallback may still acquire a transform map explicitly.
 inline bool BPS_ModeUsesMappedSort(A_long mode)
 {
-	return mode >= BPS_MODE_FREE_ANGLE && mode <= BPS_MODE_PATH;
+	return mode == BPS_MODE_PATH;
 }
 
 inline bool BPS_ModeUsesTransformMap(A_long mode)

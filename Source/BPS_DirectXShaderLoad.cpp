@@ -4,6 +4,10 @@
 
 #include "BitonicSortKernel.cso.h"
 #include "BitonicSortKernel.rs.h"
+#include "BitonicSortAxisLuma.cso.h"
+#include "BitonicSortAxisLuma.rs.h"
+#include "BitonicSortAxisLumaFull.cso.h"
+#include "BitonicSortAxisLumaFull.rs.h"
 #include "BitonicSortDomain.cso.h"
 #include "BitonicSortDomain.rs.h"
 #include "BitonicApplyDomain.cso.h"
@@ -80,6 +84,32 @@ bool BPS_LoadEmbeddedDirectXSortShader(
 		bps_directx_embedded::kBitonicSortKernel_rs_size,
 		bps_directx_embedded::kBitonicSortKernel_cso,
 		bps_directx_embedded::kBitonicSortKernel_cso_size);
+}
+
+bool BPS_LoadEmbeddedDirectXAxisLumaSortShader(
+	const DXContextPtr &context,
+	ShaderObjectPtr &out_shader)
+{
+	return BPS_LoadEmbeddedDirectXShader(
+		context,
+		out_shader,
+		bps_directx_embedded::kBitonicSortAxisLuma_rs,
+		bps_directx_embedded::kBitonicSortAxisLuma_rs_size,
+		bps_directx_embedded::kBitonicSortAxisLuma_cso,
+		bps_directx_embedded::kBitonicSortAxisLuma_cso_size);
+}
+
+bool BPS_LoadEmbeddedDirectXAxisLumaFullSortShader(
+	const DXContextPtr &context,
+	ShaderObjectPtr &out_shader)
+{
+	return BPS_LoadEmbeddedDirectXShader(
+		context,
+		out_shader,
+		bps_directx_embedded::kBitonicSortAxisLumaFull_rs,
+		bps_directx_embedded::kBitonicSortAxisLumaFull_rs_size,
+		bps_directx_embedded::kBitonicSortAxisLumaFull_cso,
+		bps_directx_embedded::kBitonicSortAxisLumaFull_cso_size);
 }
 
 bool BPS_LoadEmbeddedDirectXDomainSortShader(

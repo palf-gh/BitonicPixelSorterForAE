@@ -13,6 +13,7 @@
 #   BPS_PIPL_BINARY_DIR  build dir
 # Optional:
 #   BPS_PIPL_DEBUG       if set, defines _DEBUG / BPS_DEBUG_BUILD
+#   BPS_PIPL_PERF_VARIANT if set, defines BPS_PERF_VARIANT for separate AE identity
 #   BPS_PIPL_HAS_CUDA    if set, defines BPS_HAS_CUDA for PiPL flag parity
 #   BPS_PIPL_HAS_OPENCL  if set, defines BPS_HAS_OPENCL for PiPL flag parity
 #   BPS_PIPL_HAS_HLSL    if set, defines BPS_HAS_HLSL for PiPL flag parity
@@ -35,6 +36,9 @@ set(_args
 )
 if(BPS_PIPL_DEBUG)
 	list(APPEND _args /D "_DEBUG" /D "BPS_DEBUG_BUILD=1")
+endif()
+if(BPS_PIPL_PERF_VARIANT)
+	list(APPEND _args /D "BPS_PERF_VARIANT=1")
 endif()
 if(BPS_PIPL_HAS_CUDA)
 	list(APPEND _args /D "BPS_HAS_CUDA=1")

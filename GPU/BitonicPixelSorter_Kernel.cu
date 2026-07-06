@@ -44,7 +44,7 @@
 #define BPS_PATH_DIR_TANGENT 2
 #define BPS_SWIRL_K_EPS 1.0e-4f
 #define BPS_MODE_USES_MAPPED_SORT(m) \
-	((m) >= BPS_MODE_FREE_ANGLE && (m) <= BPS_MODE_PATH)
+	((m) == BPS_MODE_PATH)
 
 struct BpsPathSampleGpu {
 	float x;
@@ -132,6 +132,11 @@ static cudaError_t bps_acquire_cuda_domain_buffers(
 #define BPS_AFFECT_INSIDE_THRESHOLDS 1
 #define BPS_AFFECT_OUTSIDE_THRESHOLDS 2
 
+__device__ __forceinline__ float bps_luma(float4 c)
+{
+	return __saturatef(0.298912f * c.z + 0.586611f * c.y + 0.114478f * c.x);
+}
+
 __device__ __forceinline__ float bps_sort_key(float4 c, int criterion)
 {
 	// BGRA: R=.z, G=.y, B=.x
@@ -183,7 +188,7 @@ __device__ __forceinline__ float bps_sort_key(float4 c, int criterion)
 		}
 		return __saturatef(hue * (1.0f / 6.0f));
 	}
-	return __saturatef(0.298912f * c.z + 0.586611f * c.y + 0.114478f * c.x);
+	return bps_luma(c);
 }
 
 __device__ __forceinline__ bool bps_is_affected(
@@ -404,6 +409,314 @@ __device__ __forceinline__ bool bps_before(
 	if (keyA < keyB) return true;
 	if (keyA > keyB) return false;
 	return indexA < indexB;
+}
+
+__global__ void BitonicSortAxisLumaKernel(
+	const float4 *srcTex,
+	float4       *sortTex,
+	int           srcPitch,
+	int           dstPitch,
+	int           width,
+	int           height,
+	int           inputOriginX,
+	int           inputOriginY,
+	int           inputWidth,
+	int           inputHeight,
+	int           outputOriginX,
+	int           outputOriginY,
+	int           outputWidth,
+	int           outputHeight,
+	int           direction,
+	int           ordering,
+	float         thresholdMin,
+	float         thresholdMax)
+{
+	__shared__ float scratchKey[MAX_SIZE];
+	__shared__ unsigned int scratchIndex[MAX_SIZE];
+	__shared__ unsigned int s_spanStart;
+	__shared__ unsigned int s_spanEnd;
+	__shared__ unsigned int s_spanSize;
+	__shared__ unsigned int s_sortSize;
+
+	const unsigned int gid = blockIdx.x;
+	const unsigned int gtid = threadIdx.x;
+	const unsigned int size = direction ? (unsigned int)width : (unsigned int)height;
+	if (size == 0u || size > MAX_SIZE) {
+		return;
+	}
+
+	const int lineLayer = direction ? (outputOriginY + (int)gid) : (outputOriginX + (int)gid);
+
+	#define BPS_AXIS_X(pos) (direction ? (int)(pos) : lineLayer)
+	#define BPS_AXIS_Y(pos) (direction ? lineLayer : (int)(pos))
+	#define BPS_SRC_IN_WORLD(x, y) ((x) >= inputOriginX && (y) >= inputOriginY && \
+									(x) < inputOriginX + inputWidth && (y) < inputOriginY + inputHeight)
+	#define BPS_DST_IN_WORLD(x, y) ((x) >= outputOriginX && (y) >= outputOriginY && \
+									(x) < outputOriginX + outputWidth && (y) < outputOriginY + outputHeight)
+	#define BPS_SRC_INDEX_XY(x, y) ((unsigned int)(((x) - inputOriginX) + ((y) - inputOriginY) * srcPitch))
+	#define BPS_DST_INDEX_XY(x, y) ((unsigned int)(((x) - outputOriginX) + ((y) - outputOriginY) * dstPitch))
+
+	for (unsigned int pos = gtid; pos < size; pos += MAX_THREADS) {
+		const int x = BPS_AXIS_X(pos);
+		const int y = BPS_AXIS_Y(pos);
+		if (x >= 0 && y >= 0 && x < width && y < height && BPS_DST_IN_WORLD(x, y)) {
+			sortTex[BPS_DST_INDEX_XY(x, y)] = BPS_SRC_IN_WORLD(x, y)
+				? srcTex[BPS_SRC_INDEX_XY(x, y)]
+				: make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+		}
+	}
+	__syncthreads();
+
+	unsigned int cursor = 0u;
+	while (cursor < size) {
+		if (gtid == 0u) {
+			unsigned int spanStart = cursor;
+			while (spanStart < size) {
+				const int x = BPS_AXIS_X(spanStart);
+				const int y = BPS_AXIS_Y(spanStart);
+				if (x >= 0 && y >= 0 && x < width && y < height && BPS_SRC_IN_WORLD(x, y)) {
+					const float br = bps_luma(srcTex[BPS_SRC_INDEX_XY(x, y)]);
+					if (br >= thresholdMin && br <= thresholdMax) {
+						break;
+					}
+				}
+				spanStart++;
+			}
+
+			unsigned int spanEnd = spanStart;
+			while (spanEnd < size) {
+				const int x = BPS_AXIS_X(spanEnd);
+				const int y = BPS_AXIS_Y(spanEnd);
+				if (x < 0 || y < 0 || x >= width || y >= height || !BPS_SRC_IN_WORLD(x, y)) {
+					break;
+				}
+				const float br = bps_luma(srcTex[BPS_SRC_INDEX_XY(x, y)]);
+				if (br < thresholdMin || br > thresholdMax) {
+					break;
+				}
+				spanEnd++;
+			}
+
+			const unsigned int spanSize = spanEnd - spanStart;
+			s_spanStart = spanStart;
+			s_spanEnd = spanEnd;
+			s_spanSize = spanSize;
+			s_sortSize = bps_next_pow2(spanSize);
+		}
+		__syncthreads();
+
+		const unsigned int spanStart = s_spanStart;
+		const unsigned int spanEnd = s_spanEnd;
+		const unsigned int spanSize = s_spanSize;
+		const unsigned int sortSize = s_sortSize;
+
+		if (spanStart >= size || spanSize == 0u) {
+			break;
+		}
+
+		const bool ascending = ordering != 0;
+		for (unsigned int i = gtid; i < sortSize; i += MAX_THREADS) {
+			if (i < spanSize) {
+				const unsigned int pos = spanStart + i;
+				const int x = BPS_AXIS_X(pos);
+				const int y = BPS_AXIS_Y(pos);
+				const bool valid =
+					x >= 0 && y >= 0 && x < width && y < height && BPS_SRC_IN_WORLD(x, y);
+				const unsigned int srcIndex = valid ? BPS_SRC_INDEX_XY(x, y) : 0xffffffffu;
+				scratchKey[i] = valid
+					? bps_luma(srcTex[srcIndex])
+					: (ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX);
+				scratchIndex[i] = srcIndex;
+			} else {
+				scratchKey[i] = ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX;
+				scratchIndex[i] = 0xffffffffu;
+			}
+		}
+		__syncthreads();
+
+		for (unsigned int k = 2u; k <= sortSize; k <<= 1) {
+			for (unsigned int j = k >> 1; j > 0u; j >>= 1) {
+				for (unsigned int i = gtid; i < sortSize; i += MAX_THREADS) {
+					const unsigned int partner = i ^ j;
+					if (partner > i) {
+						bool stageAscending = (i & k) == 0u;
+						if (!ascending) {
+							stageAscending = !stageAscending;
+						}
+
+						const float keyA = scratchKey[i];
+						const float keyB = scratchKey[partner];
+						const unsigned int indexA = scratchIndex[i];
+						const unsigned int indexB = scratchIndex[partner];
+						const bool before = bps_before(keyA, indexA, keyB, indexB);
+						if (before != stageAscending) {
+							scratchKey[i] = keyB;
+							scratchKey[partner] = keyA;
+							scratchIndex[i] = indexB;
+							scratchIndex[partner] = indexA;
+						}
+					}
+				}
+				__syncthreads();
+			}
+		}
+
+		for (unsigned int i = gtid; i < spanSize; i += MAX_THREADS) {
+			const unsigned int pos = spanStart + i;
+			const int x = BPS_AXIS_X(pos);
+			const int y = BPS_AXIS_Y(pos);
+			if (x >= 0 && y >= 0 && x < width && y < height &&
+				BPS_DST_IN_WORLD(x, y) && scratchIndex[i] != 0xffffffffu) {
+				sortTex[BPS_DST_INDEX_XY(x, y)] = srcTex[scratchIndex[i]];
+			}
+		}
+		__syncthreads();
+
+		cursor = spanEnd + 1u;
+	}
+
+	#undef BPS_AXIS_X
+	#undef BPS_AXIS_Y
+	#undef BPS_SRC_IN_WORLD
+	#undef BPS_DST_IN_WORLD
+	#undef BPS_SRC_INDEX_XY
+	#undef BPS_DST_INDEX_XY
+}
+
+__global__ void BitonicSortAxisLumaFullKernel(
+	const float4 *srcTex,
+	float4       *sortTex,
+	int           srcPitch,
+	int           dstPitch,
+	int           width,
+	int           height,
+	int           inputOriginX,
+	int           inputOriginY,
+	int           outputOriginX,
+	int           outputOriginY,
+	int           direction,
+	int           ordering,
+	float         thresholdMin,
+	float         thresholdMax)
+{
+	__shared__ float scratchKey[MAX_SIZE];
+	__shared__ unsigned int scratchIndex[MAX_SIZE];
+	__shared__ unsigned int s_spanStart;
+	__shared__ unsigned int s_spanEnd;
+	__shared__ unsigned int s_spanSize;
+	__shared__ unsigned int s_sortSize;
+
+	const unsigned int gid = blockIdx.x;
+	const unsigned int gtid = threadIdx.x;
+	const unsigned int size = direction ? (unsigned int)width : (unsigned int)height;
+	if (size == 0u || size > MAX_SIZE) {
+		return;
+	}
+
+	const int lineLayer = direction ? (outputOriginY + (int)gid) : (outputOriginX + (int)gid);
+
+	#define BPS_AXIS_X(pos) (direction ? (int)(pos) : lineLayer)
+	#define BPS_AXIS_Y(pos) (direction ? lineLayer : (int)(pos))
+	#define BPS_SRC_INDEX_POS(pos) ((unsigned int)((BPS_AXIS_X(pos) - inputOriginX) + \
+									(BPS_AXIS_Y(pos) - inputOriginY) * srcPitch))
+	#define BPS_DST_INDEX_POS(pos) ((unsigned int)((BPS_AXIS_X(pos) - outputOriginX) + \
+									(BPS_AXIS_Y(pos) - outputOriginY) * dstPitch))
+
+	for (unsigned int pos = gtid; pos < size; pos += MAX_THREADS) {
+		sortTex[BPS_DST_INDEX_POS(pos)] = srcTex[BPS_SRC_INDEX_POS(pos)];
+	}
+	__syncthreads();
+
+	unsigned int cursor = 0u;
+	while (cursor < size) {
+		if (gtid == 0u) {
+			unsigned int spanStart = cursor;
+			while (spanStart < size) {
+				const float br = bps_luma(srcTex[BPS_SRC_INDEX_POS(spanStart)]);
+				if (br >= thresholdMin && br <= thresholdMax) {
+					break;
+				}
+				spanStart++;
+			}
+
+			unsigned int spanEnd = spanStart;
+			while (spanEnd < size) {
+				const float br = bps_luma(srcTex[BPS_SRC_INDEX_POS(spanEnd)]);
+				if (br < thresholdMin || br > thresholdMax) {
+					break;
+				}
+				spanEnd++;
+			}
+
+			const unsigned int spanSize = spanEnd - spanStart;
+			s_spanStart = spanStart;
+			s_spanEnd = spanEnd;
+			s_spanSize = spanSize;
+			s_sortSize = bps_next_pow2(spanSize);
+		}
+		__syncthreads();
+
+		const unsigned int spanStart = s_spanStart;
+		const unsigned int spanEnd = s_spanEnd;
+		const unsigned int spanSize = s_spanSize;
+		const unsigned int sortSize = s_sortSize;
+
+		if (spanStart >= size || spanSize == 0u) {
+			break;
+		}
+
+		const bool ascending = ordering != 0;
+		for (unsigned int i = gtid; i < sortSize; i += MAX_THREADS) {
+			if (i < spanSize) {
+				const unsigned int srcIndex = BPS_SRC_INDEX_POS(spanStart + i);
+				scratchKey[i] = bps_luma(srcTex[srcIndex]);
+				scratchIndex[i] = srcIndex;
+			} else {
+				scratchKey[i] = ascending ? BPS_FLOAT_MAX : -BPS_FLOAT_MAX;
+				scratchIndex[i] = 0xffffffffu;
+			}
+		}
+		__syncthreads();
+
+		for (unsigned int k = 2u; k <= sortSize; k <<= 1) {
+			for (unsigned int j = k >> 1; j > 0u; j >>= 1) {
+				for (unsigned int i = gtid; i < sortSize; i += MAX_THREADS) {
+					const unsigned int partner = i ^ j;
+					if (partner > i) {
+						bool stageAscending = (i & k) == 0u;
+						if (!ascending) {
+							stageAscending = !stageAscending;
+						}
+
+						const float keyA = scratchKey[i];
+						const float keyB = scratchKey[partner];
+						const unsigned int indexA = scratchIndex[i];
+						const unsigned int indexB = scratchIndex[partner];
+						const bool before = bps_before(keyA, indexA, keyB, indexB);
+						if (before != stageAscending) {
+							scratchKey[i] = keyB;
+							scratchKey[partner] = keyA;
+							scratchIndex[i] = indexB;
+							scratchIndex[partner] = indexA;
+						}
+					}
+				}
+				__syncthreads();
+			}
+		}
+
+		for (unsigned int i = gtid; i < spanSize; i += MAX_THREADS) {
+			sortTex[BPS_DST_INDEX_POS(spanStart + i)] = srcTex[scratchIndex[i]];
+		}
+		__syncthreads();
+
+		cursor = spanEnd + 1u;
+	}
+
+	#undef BPS_AXIS_X
+	#undef BPS_AXIS_Y
+	#undef BPS_SRC_INDEX_POS
+	#undef BPS_DST_INDEX_POS
 }
 
 __device__ __forceinline__ int bps_round_to_int(float value)
@@ -974,7 +1287,8 @@ __global__ void BitonicSortKernel(
 		for (unsigned int i = gtid; i < spanSize; i += MAX_THREADS) {
 			const unsigned int pos = spanStart + i;
 			const unsigned int shift = bps_cycle_shift(spanSize, cycleDegrees);
-			const unsigned int sortedIndex = (i + spanSize - shift) % spanSize;
+			const unsigned int sortedIndex =
+				shift == 0u ? i : ((i + spanSize - shift) % spanSize);
 			int x = 0, y = 0;
 			if (bps_coord_for_pos(mode, direction, gid, pos, width, height,
 								  outputOriginX, outputOriginY, lineCount,
@@ -1198,7 +1512,8 @@ __global__ void BitonicSortDomainKernel(
 		// those over the source and leaves unsorted areas pristine.
 		const unsigned int affectedBit = (spanSize >= 2u) ? 0x80000000u : 0u;
 		for (unsigned int i = gtid; i < spanSize; i += MAX_THREADS) {
-			const unsigned int sortedIndex = (i + spanSize - shift) % spanSize;
+			const unsigned int sortedIndex =
+				shift == 0u ? i : ((i + spanSize - shift) % spanSize);
 			const unsigned int pos =
 				__float_as_uint(keys[BPS_DOMAIN_INDEX(runStart + i)]);
 			const unsigned int srcIndex =
@@ -1694,7 +2009,8 @@ __global__ void BitonicSortMappedKernel(
 
 		const unsigned int shift = bps_cycle_shift(spanSize, cycleDegrees);
 		for (unsigned int i = gtid; i < spanSize; i += MAX_THREADS) {
-			const unsigned int sortedIndex = (i + spanSize - shift) % spanSize;
+			const unsigned int sortedIndex =
+				shift == 0u ? i : ((i + spanSize - shift) % spanSize);
 			const unsigned int srcIndex = domain[sortBase + sortedIndex];
 			const unsigned int pixelIndex = records[begin + runStart + i].pixelIndex;
 			const int x = (int)(pixelIndex % (unsigned int)width);
@@ -2033,6 +2349,172 @@ static cudaError_t bps_build_cuda_path_map(
 // Follow SDK_Invert_ProcAmp: launch on the default stream and synchronise with
 // cudaDeviceSynchronize(). The host-provided CUstream in command_queuePV is not
 // passed through the CUDA runtime launch API in the Adobe sample.
+static cudaError_t bps_finish_cuda_launch()
+{
+	cudaError_t launch_result = cudaPeekAtLastError();
+	if (launch_result != cudaSuccess) {
+		return launch_result;
+	}
+	return cudaDeviceSynchronize();
+}
+
+static bool bps_axis_luma_fast_path(
+	const void *src,
+	const void *criterionMem,
+	const void *triggerMem,
+	int mode,
+	int criterion,
+	int trigger,
+	int affect,
+	float cycleDegrees)
+{
+	return mode == BPS_MODE_AXIS &&
+		   criterionMem == src &&
+		   triggerMem == src &&
+		   criterion == BPS_CRITERION_LUMINANCE &&
+		   trigger == BPS_CRITERION_LUMINANCE &&
+		   affect == BPS_AFFECT_INSIDE_THRESHOLDS &&
+		   cycleDegrees > -1.0e-6f &&
+		   cycleDegrees < 1.0e-6f;
+}
+
+static bool bps_axis_source_full_span(
+	int direction,
+	int width,
+	int height,
+	int inputOriginX,
+	int inputOriginY,
+	int inputWidth,
+	int inputHeight,
+	int outputOriginX,
+	int outputOriginY,
+	int outputWidth,
+	int outputHeight)
+{
+	return direction
+		? (inputOriginX == 0 &&
+		   inputWidth == width &&
+		   inputOriginY <= outputOriginY &&
+		   inputOriginY + inputHeight >= outputOriginY + outputHeight)
+		: (inputOriginY == 0 &&
+		   inputHeight == height &&
+		   inputOriginX <= outputOriginX &&
+		   inputOriginX + inputWidth >= outputOriginX + outputWidth);
+}
+
+static bool bps_axis_output_full_span(
+	int direction,
+	int width,
+	int height,
+	int outputOriginX,
+	int outputOriginY,
+	int outputWidth,
+	int outputHeight)
+{
+	return direction
+		? (outputOriginX == 0 && outputWidth == width)
+		: (outputOriginY == 0 && outputHeight == height);
+}
+
+static cudaError_t bps_launch_axis_luma_cuda(
+	const void *src,
+	void *dst,
+	int srcPitch,
+	int dstPitch,
+	int width,
+	int height,
+	int inputOriginX,
+	int inputOriginY,
+	int inputWidth,
+	int inputHeight,
+	int outputOriginX,
+	int outputOriginY,
+	int outputWidth,
+	int outputHeight,
+	int direction,
+	int ordering,
+	float thresholdMin,
+	float thresholdMax,
+	int lineCount,
+	bool fullSpan)
+{
+	if (lineCount <= 0) {
+		return cudaSuccess;
+	}
+
+	if (fullSpan) {
+		BitonicSortAxisLumaFullKernel<<<lineCount, MAX_THREADS, 0>>>(
+			(const float4 *)src, (float4 *)dst,
+			srcPitch, dstPitch, width, height,
+			inputOriginX, inputOriginY, outputOriginX, outputOriginY,
+			direction, ordering, thresholdMin, thresholdMax);
+	} else {
+		BitonicSortAxisLumaKernel<<<lineCount, MAX_THREADS, 0>>>(
+			(const float4 *)src, (float4 *)dst,
+			srcPitch, dstPitch, width, height,
+			inputOriginX, inputOriginY, inputWidth, inputHeight,
+			outputOriginX, outputOriginY, outputWidth, outputHeight,
+			direction, ordering, thresholdMin, thresholdMax);
+	}
+
+	return bps_finish_cuda_launch();
+}
+
+extern "C" cudaError_t BitonicSortAxisLuma_CUDA_Bench(
+	const void *src,
+	void       *dst,
+	int         srcPitch,
+	int         dstPitch,
+	int         width,
+	int         height,
+	int         inputOriginX,
+	int         inputOriginY,
+	int         inputWidth,
+	int         inputHeight,
+	int         outputOriginX,
+	int         outputOriginY,
+	int         outputWidth,
+	int         outputHeight,
+	int         direction,
+	int         ordering,
+	float       thresholdMin,
+	float       thresholdMax,
+	int         fastMode)
+{
+	const int lineCount = direction ? outputHeight : outputWidth;
+	if (lineCount <= 0) {
+		return cudaSuccess;
+	}
+
+	if (fastMode != 0) {
+		return bps_launch_axis_luma_cuda(
+			src, dst,
+			srcPitch, dstPitch, width, height,
+			inputOriginX, inputOriginY, inputWidth, inputHeight,
+			outputOriginX, outputOriginY, outputWidth, outputHeight,
+			direction, ordering, thresholdMin, thresholdMax,
+			lineCount, fastMode == 2);
+	}
+
+	BitonicSortKernel<<<lineCount, MAX_THREADS, 0>>>(
+		(const float4 *)src, (float4 *)dst,
+		(const float4 *)src, (const float4 *)src,
+		srcPitch, inputOriginX, inputOriginY, inputWidth, inputHeight,
+		srcPitch, inputOriginX, inputOriginY, inputWidth, inputHeight,
+		srcPitch, dstPitch, width, height,
+		inputOriginX, inputOriginY, inputWidth, inputHeight,
+		outputOriginX, outputOriginY, outputWidth, outputHeight,
+		BPS_MODE_AXIS, direction, ordering,
+		BPS_CRITERION_LUMINANCE, BPS_CRITERION_LUMINANCE,
+		BPS_AFFECT_INSIDE_THRESHOLDS, 0.0f, lineCount,
+		0, 0, 0, 0,
+		thresholdMin, thresholdMax,
+		1.0f, 0.0f, 0.0f, 0.0f,
+		0.0f, 0, 0, 0, 0, 0, nullptr);
+
+	return bps_finish_cuda_launch();
+}
+
 extern "C" cudaError_t BitonicSort_CUDA(
 	const void *src,
 	const void *criterionMem,
@@ -2098,6 +2580,26 @@ extern "C" cudaError_t BitonicSort_CUDA(
 {
 	if (lineCount <= 0 && !BPS_MODE_USES_MAPPED_SORT(mode)) {
 		return cudaSuccess;
+	}
+
+	if (bps_axis_luma_fast_path(
+			src, criterionMem, triggerMem,
+			mode, criterion, trigger, affect, cycleDegrees)) {
+		const bool fullSpan =
+			bps_axis_source_full_span(
+				direction, width, height,
+				inputOriginX, inputOriginY, inputWidth, inputHeight,
+				outputOriginX, outputOriginY, outputWidth, outputHeight) &&
+			bps_axis_output_full_span(
+				direction, width, height,
+				outputOriginX, outputOriginY, outputWidth, outputHeight);
+		return bps_launch_axis_luma_cuda(
+			src, dst,
+			srcPitch, dstPitch, width, height,
+			inputOriginX, inputOriginY, inputWidth, inputHeight,
+			outputOriginX, outputOriginY, outputWidth, outputHeight,
+			direction, ordering, thresholdMin, thresholdMax,
+			lineCount, fullSpan);
 	}
 
 	BpsPathSampleGpu *pathSamplesDev = nullptr;

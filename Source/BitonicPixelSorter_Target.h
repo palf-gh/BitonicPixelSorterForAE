@@ -15,7 +15,15 @@
 //-----------------------------------------------------------------------------
 // Identity
 //-----------------------------------------------------------------------------
-#if defined(_DEBUG) || defined(DEBUG) || defined(BPS_DEBUG_BUILD)
+#if defined(BPS_PERF_VARIANT)
+	#if defined(_DEBUG) || defined(DEBUG) || defined(BPS_DEBUG_BUILD)
+		#define NAME			"Bitonic Pixel Sorter perf debug"
+		#define MATCHNAME		"PALF BitonicPixelSorter perf debug"
+	#else
+		#define NAME			"Bitonic Pixel Sorter perf"
+		#define MATCHNAME		"PALF BitonicPixelSorter perf"
+	#endif
+#elif defined(_DEBUG) || defined(DEBUG) || defined(BPS_DEBUG_BUILD)
 	#define NAME			"Bitonic Pixel Sorter debug"
 	#define MATCHNAME		"PALF BitonicPixelSorter debug"
 #else

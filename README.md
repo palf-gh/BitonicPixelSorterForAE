@@ -2,7 +2,7 @@
 
 [English](#english) · [日本語](#日本語) · [中文](#中文) · [한국어](#한국어)
 
-**Current plug-in version: 1.1 (release)**
+**Current plug-in version: 1.1.1 (release)**
 
 ---
 
@@ -32,9 +32,11 @@ The current AE port contains:
 - English, Japanese, Simplified Chinese and Korean parameter strings.
 - A self-contained CMake build that references only the Adobe After Effects SDK
   Examples tree plus vendored, header-only local helpers.
-- Swirl and Path use the shared CPU/GPU pixel-owned transformed path map so
-  each in-frame output pixel is owned once and rounded-domain holes or
-  collisions cannot destruct the image.
+- Path mode uses a shared CPU/GPU pixel-owned path map so each in-frame output
+  pixel is owned once and rounded-domain holes or collisions cannot destruct the
+  image. Free Angle, Rotation, Radial and Swirl use analytic domain sorting on
+  GPU renders (interactive angle/centre changes) and may use a host transform map
+  on CPU fallback only.
 
 Metal compiles and links into the universal `.plugin`, with the compute kernel
 embedded as runtime-compiled Metal source. It has been validated on Apple
@@ -89,6 +91,31 @@ polyline. Open path endpoints inside the frame are extended along their tangent
 to the frame edge; closed paths are not extended. Self-intersections are handled
 deterministically by nearest-segment ownership, with ties resolved by lower
 arc length, then segment order, then pixel order.
+
+### GPU rendering
+
+All four GPU backends (CUDA, OpenCL, DirectX/HLSL, Metal) share the same mode
+dispatch:
+
+| Mode | GPU pipeline |
+| --- | --- |
+| Axis | Single-pass bitonic sort (`BitonicSortKernel`; CUDA may select a luminance fast path when criterion and trigger both read luminance from the source) |
+| Free Angle, Rotation, Radial, Swirl | Two-pass analytic domain sort (`SortDomain`, then `ApplyDomain`) |
+| Path | Copy input, build a pixel-owned path map on the GPU (classify → scatter → sort records), then mapped bitonic sort (`SortMapped`) |
+
+Path is the only mode that uses a cached pixel-owned map on GPU SmartFX renders.
+Transform modes stay on the analytic domain path so angle and centre edits remain
+responsive.
+
+On GPU renders the host does not pre-build the Path map. Each backend builds or
+reuses a device-side map keyed by path geometry. CPU fallback and non-GPU renders
+acquire a shared host map instead.
+
+Path map construction follows the same three-stage pipeline on every backend.
+CUDA classifies lanes via a jump-flood nearest-point field; OpenCL, DirectX and
+Metal classify via per-pixel nearest-segment search. CPU fallback shares the JFA
+oracle with CUDA; other GPU backends may differ slightly near lane boundaries under
+extreme path curvature.
 
 ### Repository Layout
 
@@ -244,6 +271,9 @@ Validated:
   non-fatal noinline warning.
 - macOS universal `.plugin` ad-hoc signed with PiPL embedded in `__plgin` and
   `Contents/Resources`.
+- v1.1.1: GPU mode dispatch aligned across CUDA, OpenCL, DirectX and Metal;
+  Path GPU renders no longer acquire a redundant CPU path map each frame; Metal
+  Path map failure falls back to the shared host map like other backends.
 
 Still pending:
 
@@ -274,7 +304,7 @@ Adobe After Effects プラグイン版フォークです。アルゴリズムと
 Effects SDK エフェクトプラグインとして再構成し、アクティブなリポジトリ構成から
 Unity プロジェクトの表層を取り除いています。
 
-**現在のプラグインバージョン: 1.1（リリース）**
+**現在のプラグインバージョン: 1.1.1（リリース）**
 
 ### 概要
 
@@ -292,9 +322,11 @@ Bitonic Pixel Sorter は、選択したトリガーキーがしきい値範囲�
 - 英語・日本語・簡体中国語・韓国語のパラメータ文字列。
 - Adobe After Effects SDK の Examples ツリーと、同梱のヘッダオンリー
   ローカルヘルパーのみを参照する自己完結型 CMake ビルド。
-- 螺旋とパスは CPU/GPU 共通の画素所有型変形パスマップを使い、フレーム内の
-  各出力画素を一度だけ所有することで、丸め domain の穴や衝突による破壊的
-  artefact を避けます。
+- パスモードは CPU/GPU 共通の画素所有型パスマップを使い、フレーム内の各出力
+  画素を一度だけ所有することで、丸め domain の穴や衝突による破壊的 artefact を
+  避けます。自由角度・回転・放射・螺旋は GPU レンダーでは解析 domain ソート
+  （角度/中心の変更に追従）を使い、CPU フォールバック時のみホスト側 transform map
+  を取得します。
 
 Metal はユニバーサル `.plugin` としてコンパイル・リンクされ、
 コンピュートカーネルはランタイムコンパイルされる Metal ソースとして埋め込まれます。
@@ -347,6 +379,22 @@ Effect Controls パネルと同じ名前・順番です。
 描画端まで延長し、クローズパスは延長しません。自己交差は最近傍セグメントの
 Voronoi 的な所属として扱い、等距離の場合は短い arc length、セグメント順、
 画素順で決定的に解決します。
+
+### GPU レンダリング
+
+CUDA / OpenCL / DirectX(HLSL) / Metal の 4 バックエンドは同じモード分岐を共有します。
+
+| モード | GPU パイプライン |
+| --- | --- |
+| 軸方向 | 単一パス bitonic sort（`BitonicSortKernel`。CUDA は criterion/trigger がソース輝度のとき luminance fast path を選択可能） |
+| 自由角度・回転・放射・螺旋 | 2 パス解析 domain sort（`SortDomain` → `ApplyDomain`） |
+| パス | 入力コピー → GPU 上で path map 構築（classify → scatter → sort records）→ mapped bitonic sort（`SortMapped`） |
+
+GPU SmartFX レンダーで mapped sort を使うのはパスのみです。Transform 系は解析 domain 経路のままなので、角度や中心の編集が軽快です。
+
+GPU レンダーではホストが Path map を事前構築しません。各バックエンドがジオメトリキー付きでデバイス側 map を構築または再利用します。CPU フォールバックと非 GPU レンダーは共有ホスト map を取得します。
+
+Path map 構築は全バックエンドで同じ 3 段パイプラインです。CUDA は jump-flood nearest-point field で lane 分類、OpenCL/DirectX/Metal は全画素 nearest-segment 探索です。CPU フォールバックは CUDA と同じ JFA オラクルを共有します。極端な曲率付近では他 GPU バックエンドで lane 境界がわずかに異なる場合があります。
 
 ### リポジトリ構成
 
@@ -502,6 +550,9 @@ GPU バックエンドの検証状況:
   非致命的な noinline 警告のみを出力。
 - macOS ユニバーサル `.plugin` の ad-hoc 署名と、`__plgin` /
   `Contents/Resources` への PiPL 埋め込み。
+- v1.1.1: CUDA / OpenCL / DirectX / Metal の GPU モード分岐を整合。Path GPU
+  レンダーで毎フレーム CPU path map を取得しないよう修正。Metal の Path map
+  構築失敗時も他バックエンド同様に共有ホスト map へフォールバック。
 
 未対応:
 
@@ -529,7 +580,7 @@ GPU バックエンドの検証状況:
 Adobe After Effects 插件分支。算法与归属仍以原项目为准。本分支将代码库重组为
 自包含的 After Effects SDK 效果插件，并从当前仓库布局中移除了 Unity 项目表层。
 
-**当前插件版本：1.1（发布版）**
+**当前插件版本：1.1.1（发布版）**
 
 ### 概述
 
@@ -545,8 +596,9 @@ Bitonic Pixel Sorter 对所选触发键落在阈值范围内或范围外的连�
 - 英语、日语、简体中文和韩语参数字符串。
 - 仅引用 Adobe After Effects SDK Examples 树及随附仅头文件本地辅助代码的
   自包含 CMake 构建。
-- 螺旋与路径模式使用 CPU/GPU 共用的像素所属变换路径图，确保帧内每个输出像素
-  仅被拥有一次，避免舍入域空洞或碰撞造成的破坏性伪影。
+- 路径模式使用 CPU/GPU 共用的像素所属路径图，确保帧内每个输出像素仅被拥有一次，
+  避免舍入域空洞或碰撞造成的破坏性伪影。自由角度、旋转、放射与螺旋在 GPU 渲染时
+  使用解析 domain 排序（角度/中心编辑更流畅）；CPU 回退时才获取主机 transform map。
 
 Metal 可编译并链接为通用 `.plugin`，计算内核以运行时编译的 Metal 源码形式
 嵌入。已在 Apple Silicon Mac 的 After Effects 2023 至 2026 中验证。
@@ -594,6 +646,22 @@ Metal 可编译并链接为通用 `.plugin`，计算内核以运行时编译的 
 路径模式将每个输出像素分配到采样折线的最近线段。开放路径在帧内的端点沿切线
 延伸至画面边缘；闭合路径不延伸。自交按最近线段所属关系确定性处理，距离相同时
 按较短弧长、线段顺序、像素顺序解决。
+
+### GPU 渲染
+
+CUDA、OpenCL、DirectX/HLSL、Metal 四个 GPU 后端共享相同的模式分派：
+
+| 模式 | GPU 管线 |
+| --- | --- |
+| 轴向 | 单遍 bitonic sort（`BitonicSortKernel`；CUDA 在 criterion/trigger 均读源亮度时可选用 luminance fast path） |
+| 自由角度、旋转、放射、螺旋 | 两遍解析 domain sort（`SortDomain`，然后 `ApplyDomain`） |
+| 路径 | 复制输入 → GPU 上构建 path map（classify → scatter → sort records）→ mapped bitonic sort（`SortMapped`） |
+
+GPU SmartFX 渲染中仅路径模式使用 cached pixel-owned map。变换模式保持解析 domain 路径，角度与中心编辑更轻量。
+
+GPU 渲染时主机不预先构建 Path map；各后端按几何键在设备侧构建或复用 map。CPU 回退与非 GPU 渲染则获取共享主机 map。
+
+Path map 构建在所有后端上均为相同三阶段管线。CUDA 通过 jump-flood nearest-point field 分类 lane；OpenCL、DirectX、Metal 通过逐像素 nearest-segment 搜索。CPU 回退与 CUDA 共享 JFA 判定；极端曲率附近其他 GPU 后端的 lane 边界可能略有差异。
 
 ### 仓库结构
 
@@ -741,6 +809,9 @@ GPU 后端验证情况：
 - 直接 OpenCL 运行时编译检查通过；NVIDIA 编译器仅发出非致命的 noinline 警告。
 - macOS 通用 `.plugin` 的 ad-hoc 签名，以及 PiPL 嵌入 `__plgin` 与
   `Contents/Resources`。
+- v1.1.1：CUDA、OpenCL、DirectX、Metal 的 GPU 模式分派已对齐；Path GPU 渲染
+  不再每帧获取冗余 CPU path map；Metal Path map 构建失败时与其他后端一样回退到
+  共享主机 map。
 
 尚待完成：
 
@@ -769,7 +840,7 @@ Adobe After Effects 플러그인 포크입니다. 알고리즘과 귀속의 원�
 이펙트 플러그인으로 재구성했으며, 활성 저장소 레이아웃에서 Unity 프로젝트
 표면을 제거했습니다.
 
-**현재 플러그인 버전: 1.1(릴리스)**
+**현재 플러그인 버전: 1.1.1(릴리스)**
 
 ### 개요
 
@@ -787,9 +858,11 @@ Bitonic Pixel Sorter는 선택한 트리거 키가 임계값 범위 안 또는 �
 - 영어, 일본어, 간체 중국어, 한국어 매개변수 문자열.
 - Adobe After Effects SDK Examples 트리와 동봉된 헤더 전용 로컬 헬퍼만
   참조하는 자체 완결형 CMake 빌드.
-- 나선과 패스 모드는 CPU/GPU 공통의 픽셀 소유형 변형 경로 맵을 사용해
-  프레임 내 각 출력 픽셀이 한 번만 소유되도록 하며, 반올림 domain의 구멍이나
-  충돌로 인한 파괴적 artefact를 방지합니다.
+- 패스 모드는 CPU/GPU 공통의 픽셀 소유형 패스 맵을 사용해 프레임 내 각 출력
+  픽셀이 한 번만 소유되도록 하며, 반올림 domain의 구멍이나 충돌로 인한 파괴적
+  artefact를 방지합니다. 자유 각도·회전·방사·나선은 GPU 렌더에서 해석 domain
+  정렬(각도/중심 편집에 반응)을 쓰고, CPU 폴백에서만 호스트 transform map을
+  가져옵니다.
 
 Metal은 유니버설 `.plugin`으로 컴파일 및 링크되며, 컴퓨트 커널은 런타임
 컴파일되는 Metal 소스로 임베드됩니다. Apple Silicon Mac의 After Effects
@@ -842,6 +915,22 @@ Metal은 유니버설 `.plugin`으로 컴파일 및 링크되며, 컴퓨트 커�
 연장하고, 닫힌 패스는 연장하지 않습니다. 자기 교차는 가장 가까운 세그먼트
 소유로 결정적으로 처리하며, 동일 거리일 때는 더 짧은 arc length, 세그먼트
 순서, 픽셀 순서로 해결합니다.
+
+### GPU 렌더링
+
+CUDA, OpenCL, DirectX/HLSL, Metal 네 GPU 백엔드는 동일한 모드 분기를 공유합니다.
+
+| 모드 | GPU 파이프라인 |
+| --- | --- |
+| 축 방향 | 단일 패스 bitonic sort(`BitonicSortKernel`. CUDA는 criterion/trigger가 소스 휘도일 때 luminance fast path 선택 가능) |
+| 자유 각도, 회전, 방사, 나선 | 2패스 해석 domain sort(`SortDomain` → `ApplyDomain`) |
+| 패스 | 입력 복사 → GPU에서 path map 구축(classify → scatter → sort records) → mapped bitonic sort(`SortMapped`) |
+
+GPU SmartFX 렌더에서 mapped sort를 쓰는 것은 패스뿐입니다. Transform 모드는 해석 domain 경로를 유지해 각도·중심 편집이 가볍습니다.
+
+GPU 렌더에서는 호스트가 Path map을 미리 만들지 않습니다. 각 백엔드가 geometry 키로 디바イス map을 구축하거나 재사용합니다. CPU 폴백과 비 GPU 렌더는 공유 호스트 map을 가져옵니다.
+
+Path map 구축은 모든 백엔드에서 동일한 3단계 파이프라인입니다. CUDA는 jump-flood nearest-point field로 lane을 분류하고, OpenCL/DirectX/Metal은 픽셀별 nearest-segment 탐색을 씁니다. CPU 폴백은 CUDA와 같은 JFA 오라클을 공유합니다. 극단적 곡률 근처에서는 다른 GPU 백엔드의 lane 경계가 약간 다를 수 있습니다.
 
 ### 저장소 구조
 
@@ -996,6 +1085,9 @@ GPU 백엔드 검증 상황:
   noinline 경고만 출력.
 - macOS 유니버설 `.plugin` ad-hoc 서명 및 PiPL `__plgin` /
   `Contents/Resources` 임베드.
+- v1.1.1: CUDA/OpenCL/DirectX/Metal GPU 모드 분기 정렬. Path GPU 렌더에서
+  매 프레임 CPU path map을 가져오지 않도록 수정. Metal Path map 구축 실패 시
+  다른 백엔드와 같이 공유 호스트 map으로 폴백.
 
 아직 남은 항목:
 

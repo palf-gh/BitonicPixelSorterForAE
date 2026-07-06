@@ -91,6 +91,10 @@ inline float SortKey(float r, float g, float b, float a, A_long criterion) {
 	}
 }
 
+inline float LumaKey(float r, float g, float b) {
+	return Saturate(0.298912f * r + 0.586611f * g + 0.114478f * b);
+}
+
 inline float SortKeyUnit(const PF_Pixel8 &p, A_long criterion) {
 	const float inv = 1.0f / 255.0f;
 	return SortKey(p.red * inv, p.green * inv, p.blue * inv, p.alpha * inv, criterion);
@@ -104,6 +108,20 @@ inline float SortKeyUnit(const PF_Pixel16 &p, A_long criterion) {
 
 inline float SortKeyUnit(const PF_PixelFloat &p, A_long criterion) {
 	return SortKey(p.red, p.green, p.blue, p.alpha, criterion);
+}
+
+inline float LumaKeyUnit(const PF_Pixel8 &p) {
+	const float inv = 1.0f / 255.0f;
+	return LumaKey(p.red * inv, p.green * inv, p.blue * inv);
+}
+
+inline float LumaKeyUnit(const PF_Pixel16 &p) {
+	const float inv = 1.0f / 32768.0f;
+	return LumaKey(p.red * inv, p.green * inv, p.blue * inv);
+}
+
+inline float LumaKeyUnit(const PF_PixelFloat &p) {
+	return LumaKey(p.red, p.green, p.blue);
 }
 
 template <typename T>
@@ -268,10 +286,17 @@ inline void SortRunIntoLine(Scratch &scratch,
 	}
 
 	const size_t shift = CycleShiftFor(scratch.run.size(), prm);
-	for (size_t i = 0; i < scratch.run.size(); ++i) {
-		const size_t dest = (i + shift) % scratch.run.size();
-		scratch.sortedLine[static_cast<size_t>(start) + dest] =
-			scratch.sourceLine[static_cast<size_t>(scratch.run[i].index)];
+	if (shift == 0u) {
+		for (size_t i = 0; i < scratch.run.size(); ++i) {
+			scratch.sortedLine[static_cast<size_t>(start) + i] =
+				scratch.sourceLine[static_cast<size_t>(scratch.run[i].index)];
+		}
+	} else {
+		for (size_t i = 0; i < scratch.run.size(); ++i) {
+			const size_t dest = (i + shift) % scratch.run.size();
+			scratch.sortedLine[static_cast<size_t>(start) + dest] =
+				scratch.sourceLine[static_cast<size_t>(scratch.run[i].index)];
+		}
 	}
 }
 
@@ -301,11 +326,19 @@ inline void SortRunAtPositions(Scratch &scratch,
 	}
 
 	const size_t shift = CycleShiftFor(scratch.run.size(), prm);
-	for (size_t i = 0; i < scratch.run.size(); ++i) {
-		const size_t dest = (i + shift) % scratch.run.size();
-		const size_t dest_pos = static_cast<size_t>(positions[dest]);
-		scratch.sortedLine[dest_pos] =
-			scratch.sourceLine[static_cast<size_t>(scratch.run[i].index)];
+	if (shift == 0u) {
+		for (size_t i = 0; i < scratch.run.size(); ++i) {
+			const size_t dest_pos = static_cast<size_t>(positions[i]);
+			scratch.sortedLine[dest_pos] =
+				scratch.sourceLine[static_cast<size_t>(scratch.run[i].index)];
+		}
+	} else {
+		for (size_t i = 0; i < scratch.run.size(); ++i) {
+			const size_t dest = (i + shift) % scratch.run.size();
+			const size_t dest_pos = static_cast<size_t>(positions[dest]);
+			scratch.sortedLine[dest_pos] =
+				scratch.sourceLine[static_cast<size_t>(scratch.run[i].index)];
+		}
 	}
 }
 
@@ -523,6 +556,159 @@ inline bool GenericDomainPosForPixel(const BitonicSorterParams &prm,
 	*lineP = line;
 	*posP = pos;
 	return true;
+}
+
+inline bool UsesAxisLumaFastPath(PF_EffectWorld *inputP,
+								 PF_EffectWorld *criterionP,
+								 PF_EffectWorld *triggerP,
+								 const BitonicSorterParams &prm) {
+	return prm.mode == BPS_MODE_AXIS &&
+		   criterionP == inputP &&
+		   triggerP == inputP &&
+		   prm.criterion == BPS_CRITERION_LUMINANCE &&
+		   prm.trigger == BPS_CRITERION_LUMINANCE &&
+		   prm.affect == BPS_AFFECT_INSIDE_THRESHOLDS &&
+		   std::fabs(prm.cycleDegrees) < 1.0e-6f;
+}
+
+template <typename T>
+static void SortLinesLuminance(PF_EffectWorld *inP, PF_EffectWorld *outP,
+							   const BitonicSorterParams &prm,
+							   A_long frameW,
+							   A_long frameH) {
+	const bool	horizontal = (prm.direction == BPS_DIR_HORIZONTAL);
+	const bool	ascending  = (prm.ascending != 0);
+	const float	tmin = prm.thresholdMin;
+	const float	tmax = prm.thresholdMax;
+
+	const A_long outW = outP->width;
+	const A_long outH = outP->height;
+	const A_long outLeft = outP->origin_x;
+	const A_long outTop = outP->origin_y;
+	const A_long outRight = outLeft + outW;
+	const A_long outBottom = outTop + outH;
+
+	const A_long lineStart = horizontal ? MaxLong(0, outTop)
+										: MaxLong(0, outLeft);
+	const A_long lineEnd = horizontal ? MinLong(frameH, outBottom)
+									  : MinLong(frameW, outRight);
+	const A_long lineLen = horizontal ? frameW : frameH;
+	const A_long writeStart = horizontal ? MaxLong(0, outLeft)
+										 : MaxLong(0, outTop);
+	const A_long writeEnd = horizontal ? MinLong(frameW, outRight)
+									   : MinLong(frameH, outBottom);
+
+	const A_long lineCount = lineEnd - lineStart;
+	if (lineCount <= 0 || lineLen <= 0 || writeEnd <= writeStart) {
+		return;
+	}
+
+	auto processLines = [&](A_long chunkStart, A_long chunkEnd) {
+		LineScratch<T> scratch;
+		scratch.sourceLine.resize(static_cast<size_t>(lineLen));
+		scratch.sortedLine.resize(static_cast<size_t>(lineLen));
+		scratch.keys.resize(static_cast<size_t>(lineLen));
+		scratch.validLine.resize(static_cast<size_t>(lineLen));
+		scratch.run.reserve(static_cast<size_t>(lineLen));
+
+		auto coord = [&](A_long k, A_long &x, A_long &y) {
+			if (horizontal) { x = k; y = 0; }
+			else            { x = 0; y = k; }
+		};
+
+		for (A_long line = chunkStart; line < chunkEnd; ++line) {
+			for (A_long k = 0; k < lineLen; ++k) {
+				A_long x, y;
+				coord(k, x, y);
+				if (horizontal) { y = line; }
+				else            { x = line; }
+
+				const size_t index = static_cast<size_t>(k);
+				if (ContainsLayerPoint(inP, x, y)) {
+					const T pixel = *PixelAtLayer<T>(inP, x, y);
+					scratch.sourceLine[index] = pixel;
+					scratch.sortedLine[index] = pixel;
+					scratch.keys[index] = LumaKeyUnit(pixel);
+					scratch.validLine[index] = 1;
+				} else {
+					scratch.sourceLine[index] = T{};
+					scratch.sortedLine[index] = T{};
+					scratch.keys[index] = -1.0f;
+					scratch.validLine[index] = 0;
+				}
+			}
+
+			A_long k = 0;
+			while (k < lineLen) {
+				const size_t keyIndex = static_cast<size_t>(k);
+				const bool inBounds = scratch.validLine[keyIndex] != 0;
+				const float key = scratch.keys[keyIndex];
+
+				if (inBounds && key >= tmin && key <= tmax) {
+					const A_long start = k;
+					scratch.run.clear();
+					while (k < lineLen) {
+						const size_t runIndex = static_cast<size_t>(k);
+						if (scratch.validLine[runIndex] == 0) break;
+						const float runKey = scratch.keys[runIndex];
+						if (runKey < tmin || runKey > tmax) break;
+						scratch.run.push_back(Entry<T>{
+							runKey, static_cast<uint32_t>(k)});
+						++k;
+					}
+
+					if (scratch.run.size() > 1u) {
+						if (ascending) {
+							std::stable_sort(scratch.run.begin(), scratch.run.end(),
+								[](const Entry<T> &a, const Entry<T> &b) { return a.key < b.key; });
+						} else {
+							std::stable_sort(scratch.run.begin(), scratch.run.end(),
+								[](const Entry<T> &a, const Entry<T> &b) { return a.key > b.key; });
+						}
+
+						for (size_t i = 0; i < scratch.run.size(); ++i) {
+							scratch.sortedLine[static_cast<size_t>(start) + i] =
+								scratch.sourceLine[static_cast<size_t>(scratch.run[i].index)];
+						}
+					}
+				} else {
+					++k;
+				}
+			}
+
+			for (A_long k = writeStart; k < writeEnd; ++k) {
+				A_long x, y;
+				coord(k, x, y);
+				if (horizontal) { y = line; }
+				else            { x = line; }
+				if (ContainsLayerPoint(outP, x, y)) {
+					*PixelAtLayer<T>(outP, x, y) = scratch.sortedLine[static_cast<size_t>(k)];
+				}
+			}
+		}
+	};
+
+	const unsigned int workerCount = WorkerCountFor(lineCount);
+	if (workerCount <= 1) {
+		processLines(lineStart, lineEnd);
+		return;
+	}
+
+	std::vector<std::thread> workers;
+	workers.reserve(workerCount);
+	for (unsigned int worker = 0; worker < workerCount; ++worker) {
+		const A_long chunkBegin = lineStart +
+			static_cast<A_long>((static_cast<long long>(lineCount) * worker) / workerCount);
+		const A_long chunkEnd = lineStart +
+			static_cast<A_long>((static_cast<long long>(lineCount) * (worker + 1)) / workerCount);
+		if (chunkBegin < chunkEnd) {
+			workers.emplace_back(processLines, chunkBegin, chunkEnd);
+		}
+	}
+
+	for (std::thread &worker : workers) {
+		worker.join();
+	}
 }
 
 // Sort each contiguous in-threshold span of every line by the selected key.
@@ -959,12 +1145,21 @@ PF_Err BPS_SortImageCPU(
 		trigger_worldP = input_worldP;
 	}
 
+	const bool axisLumaFastPath =
+		UsesAxisLumaFastPath(input_worldP, criterion_worldP, trigger_worldP, *paramsP);
+
 	switch (pixel_format) {
 	case PF_PixelFormat_ARGB128:
 		if (paramsP->mode == BPS_MODE_AXIS) {
-			SortLines<PF_PixelFloat>(input_worldP, output_worldP,
-									  criterion_worldP, trigger_worldP, *paramsP,
-									  BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
+			if (axisLumaFastPath) {
+				SortLinesLuminance<PF_PixelFloat>(
+					input_worldP, output_worldP, *paramsP,
+					BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
+			} else {
+				SortLines<PF_PixelFloat>(input_worldP, output_worldP,
+										  criterion_worldP, trigger_worldP, *paramsP,
+										  BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
+			}
 		} else if (paramsP->mappedRecords && paramsP->mappedRecordCount > 0) {
 			SortMappedPixels<PF_PixelFloat>(input_worldP, output_worldP,
 											criterion_worldP, trigger_worldP, *paramsP,
@@ -977,9 +1172,15 @@ PF_Err BPS_SortImageCPU(
 		break;
 	case PF_PixelFormat_ARGB64:
 		if (paramsP->mode == BPS_MODE_AXIS) {
-			SortLines<PF_Pixel16>(input_worldP, output_worldP,
-								   criterion_worldP, trigger_worldP, *paramsP,
-								   BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
+			if (axisLumaFastPath) {
+				SortLinesLuminance<PF_Pixel16>(
+					input_worldP, output_worldP, *paramsP,
+					BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
+			} else {
+				SortLines<PF_Pixel16>(input_worldP, output_worldP,
+									   criterion_worldP, trigger_worldP, *paramsP,
+									   BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
+			}
 		} else if (paramsP->mappedRecords && paramsP->mappedRecordCount > 0) {
 			SortMappedPixels<PF_Pixel16>(input_worldP, output_worldP,
 										 criterion_worldP, trigger_worldP, *paramsP,
@@ -992,9 +1193,15 @@ PF_Err BPS_SortImageCPU(
 		break;
 	case PF_PixelFormat_ARGB32:
 		if (paramsP->mode == BPS_MODE_AXIS) {
-			SortLines<PF_Pixel8>(input_worldP, output_worldP,
-								  criterion_worldP, trigger_worldP, *paramsP,
-								  BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
+			if (axisLumaFastPath) {
+				SortLinesLuminance<PF_Pixel8>(
+					input_worldP, output_worldP, *paramsP,
+					BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
+			} else {
+				SortLines<PF_Pixel8>(input_worldP, output_worldP,
+									  criterion_worldP, trigger_worldP, *paramsP,
+									  BPS_RenderWidth(in_data), BPS_RenderHeight(in_data));
+			}
 		} else if (paramsP->mappedRecords && paramsP->mappedRecordCount > 0) {
 			SortMappedPixels<PF_Pixel8>(input_worldP, output_worldP,
 										criterion_worldP, trigger_worldP, *paramsP,
