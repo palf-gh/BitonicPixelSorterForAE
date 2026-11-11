@@ -61,7 +61,7 @@
 //-----------------------------------------------------------------------------
 #define	MAJOR_VERSION	1
 #define	MINOR_VERSION	1
-#define	BUG_VERSION		1
+#define	BUG_VERSION		2
 #define	STAGE_VERSION	3		// PF_Stage_RELEASE (numeric, so the PiPL preprocessor needs no AE enums)
 #define	BUILD_VERSION	1
 
@@ -69,10 +69,10 @@
 // Used by the PiPL resource (AE_Effect_Version) and GlobalSetup (my_version).
 // PiPLtool's expression parser does not accept shifts or the 'L' suffix, so this
 // is a precomputed literal.
-// PF_VERSION(1,1,1,3,1):
+// PF_VERSION(1,1,2,3,1):
 //   vers<<19 | subvers<<15 | bugvers<<11 | stage<<9 | build
-//   = (1<<19)|(1<<15)|(1<<11)|(3<<9)|1 = 560641.
-#define	BPS_VERSION_PACKED	560641
+//   = (1<<19)|(1<<15)|(2<<11)|(3<<9)|1 = 562689.
+#define	BPS_VERSION_PACKED	562689
 
 //-----------------------------------------------------------------------------
 // Global out-flags (see AE_Effect.h). Written as explicit integer literals so
@@ -92,23 +92,29 @@
 // OUT_FLAGS2 base = PF_OutFlag2_SUPPORTS_SMART_RENDER (1<<10 = 1024)
 //   | PF_OutFlag2_FLOAT_COLOR_AWARE (1<<12 = 4096)
 //   | PF_OutFlag2_SUPPORTS_THREADED_RENDERING (1<<27 = 134217728)
-//   = 134222848.
+//   | PF_OutFlag2_STRINGS_ARE_UTF8 (1<<30 = 1073741824)
+//   = 1207964672.
 //
 // Threaded rendering advertises AE Multi-Frame Rendering support. PreRender and
 // SmartRender can run on non-main threads concurrently with the UI, so render
 // code must remain per-call/stateless or explicitly synchronised.
 //
+// STRINGS_ARE_UTF8 makes AE 27+ decode parameter names and popup items as
+// UTF-8. GlobalSetup() must set the same bit at runtime and call
+// AELocalise::SetUTF8FlagDeclared(true); AE 26 predates the flag and always
+// takes UTF-8, older hosts keep the locale encoding.
+//
 // Precomputed literals only: Rez must not see addition expressions, or PiPL
 // and GlobalSetup can disagree and AE reports a version mismatch (84601).
 #if defined(BPS_HAS_HLSL)
-	// base (134222848) | GPU (1<<25 = 33554432) | DirectX (1<<29 = 536870912)
-	// = 704648192.
-	#define OUT_FLAGS2		704648192
+	// base (1207964672) | GPU (1<<25 = 33554432) | DirectX (1<<29 = 536870912)
+	// = 1778420736.
+	#define OUT_FLAGS2		1778420736
 #elif defined(BPS_HAS_CUDA) || defined(BPS_HAS_OPENCL) || defined(BPS_HAS_METAL)
 	// base | GPU (1<<25 = 33554432)
-	#define OUT_FLAGS2		167777280
+	#define OUT_FLAGS2		1241519104
 #else
-	#define OUT_FLAGS2		134222848
+	#define OUT_FLAGS2		1207964672
 #endif
 
 #endif // BITONIC_PIXEL_SORTER_TARGET_H

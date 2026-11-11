@@ -2,7 +2,7 @@
 
 [English](#english) · [日本語](#日本語) · [中文](#中文) · [한국어](#한국어)
 
-**Current plug-in version: 1.1.1 (release)**
+**Current plug-in version: 1.1.2 (release)**
 
 ---
 
@@ -273,6 +273,10 @@ Validated:
 - v1.1.1: GPU mode dispatch aligned across CUDA, OpenCL, DirectX and Metal;
   Path GPU renders no longer acquire a redundant CPU path map each frame; Metal
   Path map failure falls back to the shared host map like other backends.
+- v1.1.2: parameter names stay UTF-8 on After Effects 26 and later. The effect
+  now declares `PF_OutFlag2_STRINGS_ARE_UTF8` in the PiPL and in global setup,
+  and the localisation helper detects the AE driver version instead of the host
+  executable version.
 
 Still pending:
 
@@ -303,7 +307,7 @@ Adobe After Effects プラグイン版フォークです。アルゴリズムと
 Effects SDK エフェクトプラグインとして再構成し、アクティブなリポジトリ構成から
 Unity プロジェクトの表層を取り除いています。
 
-**現在のプラグインバージョン: 1.1.1（リリース）**
+**現在のプラグインバージョン: 1.1.2（リリース）**
 
 ### 概要
 
@@ -552,6 +556,10 @@ GPU バックエンドの検証状況:
 - v1.1.1: CUDA / OpenCL / DirectX / Metal の GPU モード分岐を整合。Path GPU
   レンダーで毎フレーム CPU path map を取得しないよう修正。Metal の Path map
   構築失敗時も他バックエンド同様に共有ホスト map へフォールバック。
+- v1.1.2: After Effects 26 以降でパラメータ名を UTF-8 で渡すよう修正。PiPL と
+  グローバルセットアップの双方で `PF_OutFlag2_STRINGS_ARE_UTF8` を宣言し、
+  ローカライズヘルパーはホスト実行ファイルではなく AE ドライバーのバージョンで
+  文字コードを判定します。
 
 未対応:
 
@@ -579,7 +587,7 @@ GPU バックエンドの検証状況:
 Adobe After Effects 插件分支。算法与归属仍以原项目为准。本分支将代码库重组为
 自包含的 After Effects SDK 效果插件，并从当前仓库布局中移除了 Unity 项目表层。
 
-**当前插件版本：1.1.1（发布版）**
+**当前插件版本：1.1.2（发布版）**
 
 ### 概述
 
@@ -811,6 +819,9 @@ GPU 后端验证情况：
 - v1.1.1：CUDA、OpenCL、DirectX、Metal 的 GPU 模式分派已对齐；Path GPU 渲染
   不再每帧获取冗余 CPU path map；Metal Path map 构建失败时与其他后端一样回退到
   共享主机 map。
+- v1.1.2：在 After Effects 26 及更高版本中以 UTF-8 传递参数名称。在 PiPL 与
+  全局设置中同时声明 `PF_OutFlag2_STRINGS_ARE_UTF8`，本地化辅助头改为依据
+  AE 驱动版本而非宿主可执行文件版本判定字符编码。
 
 尚待完成：
 
@@ -839,7 +850,7 @@ Adobe After Effects 플러그인 포크입니다. 알고리즘과 귀속의 원�
 이펙트 플러그인으로 재구성했으며, 활성 저장소 레이아웃에서 Unity 프로젝트
 표면을 제거했습니다.
 
-**현재 플러그인 버전: 1.1.1(릴리스)**
+**현재 플러그인 버전: 1.1.2(릴리스)**
 
 ### 개요
 
@@ -1087,6 +1098,10 @@ GPU 백엔드 검증 상황:
 - v1.1.1: CUDA/OpenCL/DirectX/Metal GPU 모드 분기 정렬. Path GPU 렌더에서
   매 프레임 CPU path map을 가져오지 않도록 수정. Metal Path map 구축 실패 시
   다른 백엔드와 같이 공유 호스트 map으로 폴백.
+- v1.1.2: After Effects 26 이상에서 매개변수 이름을 UTF-8로 전달하도록 수정.
+  PiPL과 전역 설정 양쪽에서 `PF_OutFlag2_STRINGS_ARE_UTF8`을 선언하고,
+  로컬라이즈 헬퍼가 호스트 실행 파일이 아닌 AE 드라이버 버전으로 문자 인코딩을
+  판정합니다.
 
 아직 남은 항목:
 

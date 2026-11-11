@@ -189,6 +189,7 @@ set(SOURCES
 	Source/BPS_PerfDiag.h
 	Source/BPS_PerfDiag.cpp
 	Localise/AELocalise.h
+	Localise/AETextEncodingPolicy.h
 	Localise/AE_SDK.h
 	Localise/LocKeys.h
 	Localise/Strings_en_US.h

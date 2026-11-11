@@ -40,9 +40,29 @@ Summary:
    toggle `PF_PUI_INVISIBLE` via `PF_UpdateParamUI` on After Effects.
 3. **First paint:** call the same visibility update from `PF_Cmd_SEQUENCE_SETUP`
    and `PF_Cmd_SEQUENCE_RESETUP`, not only `UPDATE_PARAMS_UI`.
+4. **Expand on show:** when a hidden control becomes visible at runtime, clear
+   `PF_ParamFlag_COLLAPSE_TWIRLY` via `PF_UpdateParamUI` so the control region
+   opens expanded (Angle dial, custom arbitrary UI, etc.). Re-apply
+   `COLLAPSE_TWIRLY` when hiding again. Do not use
+   `PF_ParamFlag_SKIP_REVEAL_WHEN_UNHIDDEN` on auto-expanding controls.
 
-Removing `COLLAPSE_TWIRLY` from an initially-hidden ANGLE to “show the dial when
-revealed” reintroduces the orphan dial on first apply. Keep `COLLAPSE_TWIRLY`.
+Keep `COLLAPSE_TWIRLY` at **creation** for initially-hidden controls; only
+toggle it at runtime in `UpdateParamsUI` (or equivalent).
+
+## Localisation And UTF-8
+
+`Localise/AELocalise.h` and `Localise/AETextEncodingPolicy.h` are in-tree copies of
+`Palf_Plugins/_PalfLib` (kept self-contained). When PalfLib's copies change, port
+the same change here rather than diverging.
+
+- The effect declares `PF_OutFlag2_STRINGS_ARE_UTF8` (bit 30) in both PiPL and
+  GLOBAL_SETUP via the `OUT_FLAGS2` literals in `Source/BitonicPixelSorter_Target.h`.
+- `GlobalSetup()` must call `AELocalise::SetUTF8FlagDeclared(true)` before
+  parameters are registered, otherwise AE 27+ falls back to the locale encoding.
+- Driver major 125 and below use the locale encoding, 126 (AE 26) always uses
+  UTF-8, 127+ uses UTF-8 only with the flag declared.
+- `PF_ADD_*` labels are limited to `PF_MAX_EFFECT_PARAM_NAME_LEN` (31 bytes); keep
+  JA labels within that limit. Drawbot captions use `GetStringUTF8` instead.
 
 ## Build And Validation
 

@@ -276,6 +276,11 @@ GlobalSetup(
 	out_data->out_flags		= OUT_FLAGS;
 	out_data->out_flags2	= OUT_FLAGS2;
 
+	// OUT_FLAGS2 declares PF_OutFlag2_STRINGS_ARE_UTF8 (PiPL and GLOBAL_SETUP
+	// carry the same bit). Tell AELocalise so AE 27+ receives UTF-8 parameter
+	// names instead of the locale code page. Must run before ParamsSetup.
+	AELocalise::SetUTF8FlagDeclared(true);
+
 	// Register with AEGP so UpdateParamsUI can toggle stream visibility via
 	// AEGP_DynStreamFlag_HIDDEN (PF_PUI_INVISIBLE alone is not reliable).
 	if (in_data && in_data->pica_basicP) {

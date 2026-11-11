@@ -1,9 +1,17 @@
 // AELocalise.h
 //
 // Header-only CJK+EN (and more) localisation helper for After Effects plugins.
-// Originally derived from Palf_Plugins/_PalfLib/AELocalise.h; kept in-tree so
-// this plugin stays self-contained and only references the Adobe SDK.
+// Kept in sync with Palf_Plugins/_PalfLib/AELocalise.h and
+// AETextEncodingPolicy.h, and duplicated in-tree so this plugin stays
+// self-contained and only references the Adobe SDK.
 //
+// AE 26 (driver major 126) always receives UTF-8. AE 27+ (driver major 127+)
+// receives UTF-8 only after the effect declares PF_OutFlag2_STRINGS_ARE_UTF8 in
+// both PiPL and GLOBAL_SETUP and calls AELocalise::SetUTF8FlagDeclared(true).
+#pragma once
+#ifndef AELOCALISE_H
+#define AELOCALISE_H
+
 // このヘッダーは、プロジェクト側で以下の順序でインクルードすることで、
 // ローカライズ機能を提供します：
 //
@@ -15,17 +23,29 @@
 //      #include "Localise/Strings_ja_JP.h"   // 日本語（オプション）
 //      #include "Localise/Strings_zh_CN.h"   // 中国語(簡体字)（オプション）
 //      #include "Localise/Strings_ko_KR.h"   // 韓国語（オプション）
+//      その他の言語（DE_DE, ES_ES, FR_FR, IT_IT, PT_BR,
+//      RU_RU）も同様にオプション
 //   3. このヘッダーをインクルード
 //      #include "Localise/AELocalise.h"
 //
 // 注意：このヘッダーは、LocKey型と各言語の名前空間（EN_US, JA_JP, ZH_CN,
-// KO_KR等）が定義されていることを前提とします。定義されていない言語は英語に
-// フォールバックします。
-#pragma once
-#ifndef AELOCALISE_H
-#define AELOCALISE_H
+// KO_KR等）が
+// 定義されていることを前提とします。定義されていない言語は英語にフォールバックします。
+//
+// 対応ロケールID：
+//   - de_DE: ドイツ語 (German)
+//   - en_US: 英語 (English)
+//   - es_ES: スペイン語 (Spanish)
+//   - fr_FR: フランス語 (French)
+//   - it_IT: イタリア語 (Italian)
+//   - pt_BR: ポルトガル語(ブラジル) (Portuguese (Brazil))
+//   - ru_RU: ロシア語 (Russian)
+//   - ja_JP: 日本語 (Japanese)
+//   - ko_KR: 韓国語 (Korean)
+//   - zh_CN: 中国語(簡体字) (Chinese (Simplified))
 
 #include "AE_SDK.h"
+#include "AETextEncodingPolicy.h"
 #include <atomic>
 #include <cstring>
 #include <string>
@@ -41,7 +61,41 @@
 #include <cstdlib>
 #endif
 
+// AEFX_SuiteHelperを使用してPF_AppSuiteを取得
+// (AE_SDK.hに既に含まれている可能性があるが、明示的にインクルード)
+// AEFX_AcquireSuite と AEFX_ReleaseSuite を使用するため
+
 namespace AELocalise {
+
+namespace Internal {
+inline std::atomic<bool> utf8FlagDeclared{false};
+// AE reports 125.x, 126.x and 127.x for product versions 25, 26 and 27.
+// A failed acquisition is not cached so a later callback can retry.
+inline bool GetAEDriverMajorVersion(PF_InData *in_dataP, A_long *majorP) {
+  if (!in_dataP || !in_dataP->pica_basicP || !majorP ||
+      in_dataP->appl_id != kAppID_AfterEffects)
+    return false;
+  const AEGP_UtilitySuite6 *suite = nullptr;
+  auto *basic = in_dataP->pica_basicP;
+  const A_Err err = basic->AcquireSuite(kAEGPUtilitySuite, kAEGPUtilitySuiteVersion6,
+                                        reinterpret_cast<const void **>(&suite));
+  if (err || !suite)
+    return false;
+  A_short major = 0, minor = 0;
+  const A_Err versionErr = suite->AEGP_GetDriverImplementationVersion(&major, &minor);
+  basic->ReleaseSuite(kAEGPUtilitySuite, kAEGPUtilitySuiteVersion6);
+  if (versionErr || major <= 0)
+    return false;
+  *majorP = major;
+  return true;
+}
+} // namespace Internal
+
+// Call from GLOBAL_SETUP when this effect declares PF_OutFlag2_STRINGS_ARE_UTF8
+// in both PiPL and its runtime out_flags2. Each plug-in DLL owns its state.
+inline void SetUTF8FlagDeclared(bool declared) {
+  Internal::utf8FlagDeclared.store(declared, std::memory_order_release);
+}
 // PF_AppGetLanguage()を使用して現在のロケールIDを取得
 // 返り値はロケールID（"ja_JP", "en_US", "zh_CN"など）
 inline std::string GetCurrentLanguage(PF_InData *in_dataP) {
@@ -49,21 +103,27 @@ inline std::string GetCurrentLanguage(PF_InData *in_dataP) {
     return "en_US"; // デフォルトは英語（米国）
   }
 
+  // PF_AppGetLanguage()を使用して言語を取得
+  // AEFX_AcquireSuiteを使用してPFAppSuite6を取得
   std::string result = "en_US"; // デフォルトは英語（米国）
   A_char langTag[PF_APP_LANG_TAG_SIZE] = {0};
   PF_Err err = PF_Err_NONE;
 
+  // PFAppSuite6を取得（PF_AppGetLanguageはPFAppSuite6に含まれる）
   PFAppSuite6 *app_suiteP = NULL;
   err = AEFX_AcquireSuite(in_dataP, NULL, kPFAppSuite, kPFAppSuiteVersion6,
                           NULL, (void **)&app_suiteP);
 
   if (!err && app_suiteP) {
+    // PF_AppGetLanguage()を呼び出す
     err = app_suiteP->PF_AppGetLanguage(langTag);
 
     if (err == PF_Err_NONE && strlen(langTag) > 0) {
+      // langTagをそのままロケールIDとして使用（正規化しない）
       result = langTag;
     }
 
+    // PFAppSuite6を解放
     (void)AEFX_ReleaseSuite(in_dataP, NULL, kPFAppSuite, kPFAppSuiteVersion6,
                             NULL);
   }
@@ -282,57 +342,42 @@ inline void LogHostTextEncodingDecisionOnce(const std::wstring &executablePath,
 }
 
 inline bool HostUsesUTF8ForAEText(PF_InData *in_dataP) {
-  const bool isAfterEffects =
-      in_dataP && in_dataP->appl_id == kAppID_AfterEffects;
-  if (!isAfterEffects) {
+  if (!in_dataP || in_dataP->appl_id != kAppID_AfterEffects) {
     LogHostTextEncodingDecisionOnce(L"", false, false, false, 0, false,
-                                    "not-after-effects");
+                                   "not-after-effects");
     return false;
   }
-
-  static std::atomic<long> cachedUsesUTF8{-1};
-  long usesUTF8 = cachedUsesUTF8.load(std::memory_order_acquire);
-  if (usesUTF8 < 0) {
-    std::wstring executablePath = GetHostExecutablePath(in_dataP);
-    bool looksBeta = HostExecutablePathLooksLikeBeta(executablePath);
-    bool versionDetected = false;
+  static std::atomic<long> cachedDriverMajor{-1};
+  long major = cachedDriverMajor.load(std::memory_order_acquire);
+  if (major < 0) {
+    const auto executablePath = GetHostExecutablePath(in_dataP);
+    const bool looksBeta = HostExecutablePathLooksLikeBeta(executablePath);
     A_long detectedMajor = 0;
-    const char *reason = "legacy-version";
-
-    if (looksBeta) {
-      usesUTF8 = 1;
-      reason = "beta-path";
-    } else {
-      versionDetected =
-          GetWindowsFileMajorVersion(executablePath, &detectedMajor);
-      if (!versionDetected) {
-        LogHostTextEncodingDecisionOnce(executablePath, true, false, false, 0,
-                                        false, "version-detection-failed");
+    const char *reason = "driver-version";
+    if (!GetAEDriverMajorVersion(in_dataP, &detectedMajor)) {
+      A_long fallbackMajor = 0;
+      if (!GetWindowsFileMajorVersion(executablePath, &fallbackMajor)) {
+        LogHostTextEncodingDecisionOnce(executablePath, true, looksBeta, false, 0,
+                                       false, "version-detection-failed");
         return false;
       }
-      usesUTF8 = detectedMajor >= 26 ? 1 : 0;
-      if (usesUTF8)
-        reason = "major-version";
+      detectedMajor = fallbackMajor + 100;
+      reason = "product-version-fallback";
     }
-
     long expected = -1;
-    cachedUsesUTF8.compare_exchange_strong(
-        expected, usesUTF8, std::memory_order_release,
-        std::memory_order_relaxed);
-    usesUTF8 = cachedUsesUTF8.load(std::memory_order_acquire);
-    if (usesUTF8 < 0) {
-      LogHostTextEncodingDecisionOnce(executablePath, true, looksBeta,
-                                      versionDetected, detectedMajor, false,
-                                      "cache-not-set");
-      return false;
-    }
-
-    LogHostTextEncodingDecisionOnce(executablePath, true, looksBeta,
-                                    versionDetected, detectedMajor,
-                                    usesUTF8 != 0, reason);
+    cachedDriverMajor.compare_exchange_strong(expected, detectedMajor,
+                                             std::memory_order_release,
+                                             std::memory_order_relaxed);
+    major = cachedDriverMajor.load(std::memory_order_acquire);
+    const bool utf8 = UseUTF8ForAEDriver(
+        major, utf8FlagDeclared.load(std::memory_order_acquire));
+    LogHostTextEncodingDecisionOnce(executablePath, true, looksBeta, true,
+                                   major, utf8, reason);
   }
-
-  return usesUTF8 != 0;
+  // AE 26 predates the flag but requires UTF-8. On later hosts opt in only
+  // after the effect has declared the flag in PiPL and GLOBAL_SETUP.
+  return UseUTF8ForAEDriver(
+      major, utf8FlagDeclared.load(std::memory_order_acquire));
 }
 } // namespace Internal
 
@@ -356,15 +401,17 @@ inline std::string ConvertUTF8ToEncoding(const std::string &utf8,
   if (utf8.empty())
     return "";
 
+  // UTF-8 → ワイド文字
   int wideSize = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
   if (wideSize <= 0)
-    return utf8;
+    return utf8; // 変換失敗時は元の文字列を返す
 
   std::wstring wideStr(wideSize, 0);
   if (MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, &wideStr[0],
                           wideSize) <= 0)
     return utf8;
 
+  // ワイド文字 → 指定されたコードページ
   int ansiSize = WideCharToMultiByte(codePage, 0, wideStr.c_str(), -1, nullptr,
                                      0, nullptr, nullptr);
   if (ansiSize <= 0)
@@ -375,6 +422,7 @@ inline std::string ConvertUTF8ToEncoding(const std::string &utf8,
                           ansiSize, nullptr, nullptr) <= 0)
     return utf8;
 
+  // null終端を削除
   if (!ansiStr.empty() && ansiStr.back() == '\0')
     ansiStr.pop_back();
 
@@ -493,8 +541,7 @@ inline bool CopyHostAppVersionString(char *buffer, size_t bufferSize) {
   for (const CFStringRef key : versionKeys) {
     CFTypeRef versionValue =
         CFBundleGetValueForInfoDictionaryKey(mainBundle, key);
-    if (!versionValue ||
-        CFGetTypeID(versionValue) != CFStringGetTypeID())
+    if (!versionValue || CFGetTypeID(versionValue) != CFStringGetTypeID())
       continue;
 
     buffer[0] = '\0';
@@ -608,56 +655,42 @@ inline void LogHostTextEncodingDecisionOnce(const std::string &executablePath,
 }
 
 inline bool HostUsesUTF8ForAEText(PF_InData *in_dataP) {
-  const bool isAfterEffects =
-      in_dataP && in_dataP->appl_id == kAppID_AfterEffects;
-  if (!isAfterEffects) {
+  if (!in_dataP || in_dataP->appl_id != kAppID_AfterEffects) {
     LogHostTextEncodingDecisionOnce("", false, false, false, 0, false,
-                                    "not-after-effects");
+                                   "not-after-effects");
     return false;
   }
-
-  static std::atomic<long> cachedUsesUTF8{-1};
-  long usesUTF8 = cachedUsesUTF8.load(std::memory_order_acquire);
-  if (usesUTF8 < 0) {
-    const std::string executablePath = GetHostExecutablePath(in_dataP);
+  static std::atomic<long> cachedDriverMajor{-1};
+  long major = cachedDriverMajor.load(std::memory_order_acquire);
+  if (major < 0) {
+    const auto executablePath = GetHostExecutablePath(in_dataP);
     const bool looksBeta = HostExecutablePathLooksLikeBeta(executablePath);
-    bool versionDetected = false;
     A_long detectedMajor = 0;
-    const char *reason = "legacy-version";
-
-    if (looksBeta) {
-      usesUTF8 = 1;
-      reason = "beta-path";
-    } else {
-      versionDetected = GetMacHostAppMajorVersion(&detectedMajor);
-      if (!versionDetected) {
-        LogHostTextEncodingDecisionOnce(executablePath, true, false, false, 0,
-                                        false, "version-detection-failed");
+    const char *reason = "driver-version";
+    if (!GetAEDriverMajorVersion(in_dataP, &detectedMajor)) {
+      A_long fallbackMajor = 0;
+      if (!GetMacHostAppMajorVersion(&fallbackMajor)) {
+        LogHostTextEncodingDecisionOnce(executablePath, true, looksBeta, false, 0,
+                                       false, "version-detection-failed");
         return false;
       }
-      usesUTF8 = detectedMajor >= 26 ? 1 : 0;
-      if (usesUTF8)
-        reason = "major-version";
+      detectedMajor = fallbackMajor + 100;
+      reason = "product-version-fallback";
     }
-
     long expected = -1;
-    cachedUsesUTF8.compare_exchange_strong(
-        expected, usesUTF8, std::memory_order_release,
-        std::memory_order_relaxed);
-    usesUTF8 = cachedUsesUTF8.load(std::memory_order_acquire);
-    if (usesUTF8 < 0) {
-      LogHostTextEncodingDecisionOnce(executablePath, true, looksBeta,
-                                      versionDetected, detectedMajor, false,
-                                      "cache-not-set");
-      return false;
-    }
-
-    LogHostTextEncodingDecisionOnce(executablePath, true, looksBeta,
-                                    versionDetected, detectedMajor,
-                                    usesUTF8 != 0, reason);
+    cachedDriverMajor.compare_exchange_strong(expected, detectedMajor,
+                                             std::memory_order_release,
+                                             std::memory_order_relaxed);
+    major = cachedDriverMajor.load(std::memory_order_acquire);
+    const bool utf8 = UseUTF8ForAEDriver(
+        major, utf8FlagDeclared.load(std::memory_order_acquire));
+    LogHostTextEncodingDecisionOnce(executablePath, true, looksBeta, true,
+                                   major, utf8, reason);
   }
-
-  return usesUTF8 != 0;
+  // AE 26 predates the flag but requires UTF-8. On later hosts opt in only
+  // after the effect has declared the flag in PiPL and GLOBAL_SETUP.
+  return UseUTF8ForAEDriver(
+      major, utf8FlagDeclared.load(std::memory_order_acquire));
 }
 } // namespace Internal
 
@@ -718,10 +751,17 @@ thread_local static std::string s_tempBuffer;
 }
 
 // 内部：ロケールIDから文字列取得関数へのマッピング
+// 各言語の名前空間（EN_US, JA_JP, ZH_CN, KO_KR, DE_DE, ES_ES, FR_FR, IT_IT,
+// PT_BR, RU_RU等）が定義されていることを前提とする
 // 定義されていない言語は英語にフォールバック
+// 注意:
+// 新しい言語の名前空間が定義されていない場合は、そのロケールIDのチェックをコメントアウトするか、
+// または対応する名前空間を定義する必要があります
 template <typename LocKeyType>
 inline const char *GetStringByLanguage(LocKeyType key,
                                        const std::string &localeId) {
+  // ロケールIDから直接名前空間を選択（完全一致）
+  // 定義されていない言語は英語にフォールバック
   if (localeId == "en_US") {
 #ifdef AELOCALISE_HAS_EN_US
     return EN_US::GetString(key);
@@ -784,38 +824,38 @@ inline const char *GetStringByLanguage(LocKeyType key,
 
 // キーからローカライズ文字列を取得（UTF-8文字列）
 template <typename LocKeyType> inline const char *GetString(LocKeyType key) {
+  // デフォルトは英語を返す
   return EN_US::GetString(key);
 }
 
 // ローカライズ文字列を取得し、AEが受け付ける文字コードで返す。
-// AE BetaまたはAE 26以降ではUTF-8を返し、それ以前は言語ごとのレガシー
-// エンコーディング（Windows: コードページ、macOS: Shift-JIS 等）へ変換する。
-template <typename LocKeyType>
-inline const char *GetStringForAE(LocKeyType key, PF_InData *in_dataP) {
-  std::string localeId = GetCurrentLanguage(in_dataP);
-  const char *utf8Str = GetStringByLanguage(key, localeId);
-
-  if (!utf8Str || strlen(utf8Str) == 0) {
-    utf8Str = EN_US::GetString(key);
-    localeId = "en_US";
-  }
-
+// Driver major <=125: locale encoding; 126: UTF-8 (pre-flag host);
+// >=127: UTF-8 only when the effect declares the flag in PiPL and GLOBAL_SETUP.
+//
+// Param / popup labels fed to PF_ADD_* must also respect
+// PF_MAX_EFFECT_PARAM_NAME_LEN (31 bytes). Under AE 26+ UTF-8 that is about
+// 10 Japanese characters; longer UTF-8 names truncate mid-code-unit and
+// mojibake. Keep JA labels ≤31 UTF-8 bytes (Drawbot captions via
+// GetStringUTF8 are exempt).
+// Encode a UTF-8 C string for PF_ADD_* / param-name fields (same rules as
+// GetStringForAE). Shared helpers such as PLGradientLocalise use this so they
+// do not need a plugin LocKey enum.
+inline const char *EncodeUTF8ForAE(const char *utf8Str, PF_InData *in_dataP,
+                                   const std::string &localeIdHint = "") {
   if (!utf8Str)
     return "";
+  std::string localeId =
+      localeIdHint.empty() ? GetCurrentLanguage(in_dataP) : localeIdHint;
 
 #ifdef AE_OS_WIN
   if (Internal::HostUsesUTF8ForAEText(in_dataP)) {
     Internal::s_tempBuffer = utf8Str;
     return Internal::s_tempBuffer.c_str();
   }
-
   UINT codePage = GetCodePageForLanguage(localeId);
   Internal::s_tempBuffer = ConvertUTF8ToEncoding(utf8Str, codePage);
 #else
   if (Internal::HostUsesUTF8ForAEText(in_dataP)) {
-    Internal::s_tempBuffer = utf8Str;
-  } else if (localeId == "ko_KR") {
-    // Korean is passed through as UTF-8 because EUC-KR conversion mojibakes.
     Internal::s_tempBuffer = utf8Str;
   } else {
     CFStringEncoding encoding = GetEncodingForLanguage(localeId);
@@ -825,13 +865,26 @@ inline const char *GetStringForAE(LocKeyType key, PF_InData *in_dataP) {
   return Internal::s_tempBuffer.c_str();
 }
 
+template <typename LocKeyType>
+inline const char *GetStringForAE(LocKeyType key, PF_InData *in_dataP) {
+  std::string localeId = GetCurrentLanguage(in_dataP);
+  const char *utf8Str = GetStringByLanguage(key, localeId);
+
+  if (!utf8Str || strlen(utf8Str) == 0) {
+    // フォールバック: 英語を返す
+    utf8Str = EN_US::GetString(key);
+    localeId = "en_US"; // フォールバック時は英語のエンコーディングを使用
+  }
+
+  return EncodeUTF8ForAE(utf8Str, in_dataP, localeId);
+}
+
 // Returns the raw UTF-8 localised string for the host language, WITHOUT the
 // platform legacy-encoding conversion that GetStringForAE applies. Use this for
 // plugin-side rendering paths that expect UTF-8 and do their own UTF-16
-// conversion — e.g. the Drawbot custom UI (BPS_CopyUtf8ToDrawbotUtf16). Feeding
-// a legacy-encoded (Shift-JIS) string into a UTF-8 consumer corrupts it; that is
-// why this separate accessor exists alongside GetStringForAE (which AE needs for
-// param-name fields).
+// conversion — e.g. Drawbot custom UI. Feeding a legacy-encoded (Shift-JIS)
+// string into a UTF-8 consumer corrupts it; that is why this separate accessor
+// exists alongside GetStringForAE (which AE needs for param-name fields).
 template <typename LocKeyType>
 inline const char *GetStringUTF8(LocKeyType key, PF_InData *in_dataP) {
   std::string localeId = GetCurrentLanguage(in_dataP);
